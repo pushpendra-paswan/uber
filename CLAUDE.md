@@ -105,7 +105,8 @@ uber-clone/
 │   ├── driver/                # index.html, driver.js, driver.css
 │   └── admin/                 # index.html, admin.js, admin.css
 └── simulator/
-    └── simulator.py           # fake drivers and load script
+    ├── simulator.py           # fake drivers (M2.5); a load script is added in M4.1
+    └── requirements.txt       # httpx only
 ```
 
 ## Architecture: routers → services → repositories
@@ -182,7 +183,7 @@ docker compose up --build                 # start everything (api, postgres, red
 docker compose exec backend alembic upgrade head
 docker compose exec backend alembic revision --autogenerate -m "message"
 docker compose exec backend pytest
-python simulator/simulator.py --drivers 50
+python simulator/simulator.py --drivers 50 --admin-email ... --admin-password ...   # on the host, in a venv with simulator/requirements.txt
 ```
 
 ## Milestones

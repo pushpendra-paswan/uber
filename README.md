@@ -70,6 +70,42 @@ Matching happens inside the ride request: the server assigns the nearest online,
 4. A second rider at the same pickup gets the other driver. A third rider sees "No drivers are available nearby right now" and can request again at once.
 5. When a driver completes or a rider cancels, that driver can be matched again. A driver who stops pinging (closed tab) is not matched after 30 seconds.
 
+### Run the driver simulator (M2.5)
+
+The simulator starts N fake drivers so there is a fleet to match against. Each one registers (once), gets approved by an admin, goes online, drives around on real roads from the local OSRM, and pings its position every 3 seconds. When matching assigns a ride to a fake driver, it drives to the pickup, arrives, starts the trip, drives to the drop-off, and completes it. It runs on your machine (not in Docker), uses only the public API and the local OSRM, and never calls Nominatim or any OpenStreetMap server.
+
+Install (once; it needs only `httpx`, and an admin account made with `create_admin.py` above):
+
+```bash
+python -m venv .venv-sim
+.venv-sim/bin/pip install -r simulator/requirements.txt      # Windows: .venv-sim\Scripts\pip
+```
+
+Run (the stack must be up and OSRM prepared):
+
+```bash
+.venv-sim/bin/python simulator/simulator.py --drivers 30 --admin-email admin@example.com --admin-password 'at-least-8-chars'
+# or: export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...  and leave the two flags out
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--drivers` | 20 | Number of drivers, 1 to 200 (one process) |
+| `--admin-email`, `--admin-password` | env `SIM_ADMIN_EMAIL`, `SIM_ADMIN_PASSWORD` | An existing admin, used to approve the drivers |
+| `--api-url`, `--osrm-url` | `http://127.0.0.1:8000`, `http://127.0.0.1:5000` | Where the API and OSRM are published |
+| `--center-lat`, `--center-lng` | the city center | Center of the fleet area (give both or neither) |
+| `--radius-km` | 5 | Radius of the fleet area. Matching only looks 3 km around the pickup, so the fleet lives in a circle instead of the whole city |
+| `--speed-kmh` | 30 | Driving speed (each driver gets a random factor between 0.8 and 1.2). Use 90 to finish a trip in a couple of minutes |
+| `--seed` | none | Makes the starting points repeatable |
+
+Drivers are `sim-driver-001@sim.example.com`, `sim-driver-002@...`, and so on, with the password `sim-driver-pass`. Running it again reuses the same accounts. A driver whose position is still in Redis (stopped less than 30 seconds ago) continues from there.
+
+**Try matching by hand:** start `--drivers 30` with the default center, open `/rider/`, pick a pickup near the city center and a drop-off about 2 km away, and press **Request ride**. The ride is assigned to the nearest simulated driver within a couple of seconds, and the rider page walks through assigned, arrived, in progress, and completed on its own (with `--speed-kmh 90`, a 3.7 km trip took about 4 minutes). The rider page does not show the driver moving until M3.2. A pickup far outside the circle ends as `NO_DRIVER_FOUND`.
+
+Every 15 seconds one summary line shows drivers running, drivers on a ride, pings ok and failed, the average ping time, and rides completed. **Ctrl+C** takes every driver offline and exits within a few seconds (a driver on a ride cannot go offline; its presence expires after 30 seconds).
+
+**Do not log in to a simulated driver on the driver page while the simulator runs.** The driver page keeps pinging its own clicked position and fights the simulator over the same driver.
+
 ### Go online as a driver
 
 Once the admin has approved the driver, the driver page shows a map. Click it to set where the driver is (clicks outside the city are refused), then press **Go online**. The page keeps the driver online by sending the position every 3 seconds; closing the page lets the driver drop off after 30 seconds. Click the map again to move the driver, and press **Go offline** when done (not possible during an active ride). Online state lives in Redis only. To look at it:
