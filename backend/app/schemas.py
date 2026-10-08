@@ -1,9 +1,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
-from app.models import UserRole, VerificationStatus
+from app.models import RideStatus, UserRole, VerificationStatus
 
 
 class RegisterRequest(BaseModel):
@@ -70,3 +70,56 @@ class DriverResponse(BaseModel):
     created_at: datetime
     user: UserResponse
     vehicle: VehicleResponse | None
+
+
+class RideCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    pickup_lat: float = Field(ge=-90, le=90)
+    pickup_lng: float = Field(ge=-180, le=180)
+    pickup_address: str = Field(min_length=1, max_length=255)
+    dropoff_lat: float = Field(ge=-90, le=90)
+    dropoff_lng: float = Field(ge=-180, le=180)
+    dropoff_address: str = Field(min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def pickup_and_dropoff_differ(self) -> "RideCreate":
+        if (self.pickup_lat, self.pickup_lng) == (self.dropoff_lat, self.dropoff_lng):
+            raise ValueError("Pickup and drop-off must be different places")
+        return self
+
+
+class RideResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    rider_id: int
+    driver_id: int | None
+    pickup_lat: float
+    pickup_lng: float
+    pickup_address: str
+    dropoff_lat: float
+    dropoff_lng: float
+    dropoff_address: str
+    status: RideStatus
+    distance_m: int | None
+    duration_s: int | None
+    fare_estimate: int | None
+    final_fare: int | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+class RideEventResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    from_status: RideStatus | None
+    to_status: RideStatus
+    actor_user_id: int | None
+    created_at: datetime
+
+
+class AssignDriverRequest(BaseModel):
+    driver_id: int

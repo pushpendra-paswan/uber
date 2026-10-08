@@ -24,6 +24,14 @@ Admins cannot register through the API. Create one with the script (riders and d
 docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
 ```
 
+## Run the tests
+
+```bash
+docker compose exec backend pytest
+```
+
+Tests use their own database (`<POSTGRES_DB>_test`, created automatically), so your dev data is never touched.
+
 ## Stop
 
 ```bash

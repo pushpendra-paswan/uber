@@ -32,6 +32,14 @@ class RideStatus(enum.Enum):
     NO_DRIVER_FOUND = "NO_DRIVER_FOUND"
 
 
+ACTIVE_RIDE_STATUSES = (
+    RideStatus.REQUESTED,
+    RideStatus.DRIVER_ASSIGNED,
+    RideStatus.DRIVER_ARRIVED,
+    RideStatus.IN_PROGRESS,
+)
+
+
 class PaymentMethod(enum.Enum):
     cash = "cash"
     wallet = "wallet"
@@ -109,7 +117,8 @@ class Ride(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    events: Mapped[list["RideEvent"]] = relationship(order_by="RideEvent.id")
+    # lazy="raise": events are read through the repository, never through the ride.
+    events: Mapped[list["RideEvent"]] = relationship(order_by="RideEvent.id", lazy="raise")
 
 
 class RideEvent(Base):
