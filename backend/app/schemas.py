@@ -147,10 +147,6 @@ class RideEventResponse(BaseModel):
     created_at: datetime
 
 
-class AssignDriverRequest(BaseModel):
-    driver_id: int
-
-
 class MapConfigResponse(BaseModel):
     city_name: str
     center_lat: float

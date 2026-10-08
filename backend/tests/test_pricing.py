@@ -3,7 +3,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, select
 
 from app.config import settings
-from app.models import PricingRule, Ride
+from app.models import PricingRule, Ride, RideStatus
 from app.services import routing
 from app.services.pricing import calculate_fare
 from app.services.rides import MIN_TRIP_DISTANCE_M
@@ -142,7 +142,7 @@ async def test_ride_stores_the_servers_estimate_and_ignores_the_clients(client, 
 
     assert response.status_code == 201
     ride = response.json()
-    assert ride["status"] == "REQUESTED"
+    assert ride["status"] == "NO_DRIVER_FOUND"  # nobody is online in this test
     assert ride["final_fare"] is None
     assert (ride["distance_m"], ride["duration_s"], ride["fare_estimate"]) == (
         estimate["distance_m"],
@@ -155,8 +155,8 @@ async def test_ride_stores_the_servers_estimate_and_ignores_the_clients(client, 
     assert fetched.json()["fare_estimate"] == 14000
 
 
-async def test_rider_with_an_active_ride_gets_409_before_any_routing(client, rider, monkeypatch):
-    assert (await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])).status_code == 201
+async def test_rider_with_an_active_ride_gets_409_before_any_routing(client, rider, insert_ride, monkeypatch):
+    await insert_ride(rider, RideStatus.REQUESTED)
 
     async def broken_route(*points):
         raise HTTPException(status_code=502, detail="Routing is unavailable")

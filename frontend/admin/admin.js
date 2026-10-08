@@ -8,7 +8,6 @@ const state = {
   loaded: false,
   drivers: [],
   filter: "", // "" means all
-  assignResult: "",
   error: "",
   busy: false,
 };
@@ -28,9 +27,6 @@ const statusFilter = document.getElementById("status-filter");
 const refreshButton = document.getElementById("refresh-button");
 const noDrivers = document.getElementById("no-drivers");
 const driversBody = document.getElementById("drivers");
-const assignSection = document.getElementById("assign-section");
-const assignForm = document.getElementById("assign-form");
-const assignResult = document.getElementById("assign-result");
 
 async function refresh() {
   if (!state.user || state.user.role !== "admin") return;
@@ -71,9 +67,6 @@ function render() {
   if (loggedIn) wrongRoleText.textContent = `This account is a ${state.user.role}. Open /${state.user.role}/ instead.`;
 
   driversSection.hidden = !isAdmin;
-  assignSection.hidden = !isAdmin;
-  assignResult.hidden = state.assignResult === "";
-  assignResult.textContent = state.assignResult;
   noDrivers.hidden = !state.loaded || state.drivers.length > 0;
 
   // Only redraw when the data changed, so a poll cannot replace a button between mouse down and mouse up.
@@ -132,18 +125,6 @@ refreshButton.addEventListener("click", () => act(() => {}));
 driversBody.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (button) act(() => api("POST", `/admin/drivers/${button.dataset.id}/${button.dataset.action}`));
-});
-
-assignForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  const form = new FormData(assignForm);
-  const rideId = Number(form.get("ride_id"));
-  const driverId = Number(form.get("driver_id"));
-  state.assignResult = "";
-  act(async () => {
-    await api("POST", `/admin/rides/${rideId}/assign`, { driver_id: driverId });
-    state.assignResult = `Ride ${rideId} is now assigned to driver ${driverId}.`;
-  });
 });
 
 // Polling keeps the page current for now; WebSockets replace this in M3.

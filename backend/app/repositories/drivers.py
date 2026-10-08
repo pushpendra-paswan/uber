@@ -1,11 +1,11 @@
 import time
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import redis_client
-from app.models import Driver, VerificationStatus, Vehicle
+from app.models import ACTIVE_RIDE_STATUSES, Driver, Ride, VerificationStatus, Vehicle
 
 GEO_KEY = "drivers:geo"
 PRESENCE_KEY = "driver:{}:presence"
@@ -93,3 +93,32 @@ async def get_presence(driver_id: int) -> dict | None:
         return None
     lng, lat = position
     return {"lat": lat, "lng": lng, "updated_at": int(updated_at)}
+
+
+async def search_nearby(lat: float, lng: float, radius_m: int, limit: int) -> list[tuple[int, float]]:
+    # Nearest first. The GEO set can hold stale members, so the caller still has to check the presence key.
+    found = await redis_client.geosearch(
+        GEO_KEY, longitude=lng, latitude=lat, radius=radius_m, unit="m", sort="ASC", count=limit, withdist=True
+    )
+    return [(int(driver_id), distance_m) for driver_id, distance_m in found]
+
+
+async def get_online_ids(driver_ids: list[int]) -> set[int]:
+    values = await redis_client.mget([PRESENCE_KEY.format(driver_id) for driver_id in driver_ids])
+    return {driver_id for driver_id, value in zip(driver_ids, values) if value is not None}
+
+
+async def remove_from_geo(driver_ids: list[int]) -> None:
+    await redis_client.zrem(GEO_KEY, *[str(driver_id) for driver_id in driver_ids])
+
+
+async def get_available_ids(db: AsyncSession, driver_ids: list[int]) -> set[int]:
+    if not driver_ids:
+        return set()
+    has_active_ride = exists().where(Ride.driver_id == Driver.id, Ride.status.in_(ACTIVE_RIDE_STATUSES))
+    result = await db.execute(
+        select(Driver.id).where(
+            Driver.id.in_(driver_ids), Driver.verification_status == VerificationStatus.approved, ~has_active_ride
+        )
+    )
+    return set(result.scalars().all())

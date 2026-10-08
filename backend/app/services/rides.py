@@ -4,11 +4,11 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Ride, RideEvent, RideStatus, User, UserRole, VerificationStatus
+from app.models import Ride, RideEvent, RideStatus, User, UserRole
 from app.repositories import drivers as drivers_repo
 from app.repositories import rides as rides_repo
 from app.schemas import EstimateRequest, RideCreate
-from app.services import pricing, routing
+from app.services import matching, pricing, routing
 from app.utils.geo import is_inside_bounds
 
 MIN_TRIP_DISTANCE_M = 200
@@ -24,7 +24,7 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-async def change_ride_status(db: AsyncSession, ride: Ride, new_status: RideStatus, actor_user_id: int) -> None:
+async def change_ride_status(db: AsyncSession, ride: Ride, new_status: RideStatus, actor_user_id: int | None) -> None:
     """The only place that changes ride.status after creation. Does not commit."""
     old_status = ride.status
     if new_status not in ALLOWED_TRANSITIONS[old_status]:
@@ -64,6 +64,15 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
     # Not routed through change_ride_status: there is no previous status.
     ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])
     await rides_repo.add_event(db, ride.id, None, RideStatus.REQUESTED, rider.id)
+
+    # Matching runs in the same transaction, so a Redis or OSRM failure leaves no half-created ride.
+    # The system makes these changes, so the actor is null.
+    driver_id = await matching.find_driver(db, ride.pickup_lat, ride.pickup_lng)
+    if driver_id is None:
+        await change_ride_status(db, ride, RideStatus.NO_DRIVER_FOUND, actor_user_id=None)
+    else:
+        await change_ride_status(db, ride, RideStatus.DRIVER_ASSIGNED, actor_user_id=None)
+        ride.driver_id = driver_id
     await db.commit()
     return ride
 
@@ -101,22 +110,6 @@ async def get_active(db: AsyncSession, user: User) -> Ride:
         ride = await rides_repo.get_active_for_driver(db, driver.id) if driver is not None else None
     if ride is None:
         raise HTTPException(status_code=404, detail="No active ride")
-    return ride
-
-
-async def assign_driver(db: AsyncSession, admin: User, ride_id: int, driver_id: int) -> Ride:
-    ride = await load_ride_for_user(db, admin, ride_id, for_update=True)
-    driver = await drivers_repo.get_by_id(db, driver_id)
-    if driver is None:
-        raise HTTPException(status_code=404, detail="Driver not found")
-    if driver.verification_status != VerificationStatus.approved:
-        raise HTTPException(status_code=409, detail="Driver is not approved")
-    if await rides_repo.get_active_for_driver(db, driver.id) is not None:
-        raise HTTPException(status_code=409, detail="Driver already has an active ride")
-
-    await change_ride_status(db, ride, RideStatus.DRIVER_ASSIGNED, admin.id)
-    ride.driver_id = driver.id
-    await db.commit()
     return ride
 
 

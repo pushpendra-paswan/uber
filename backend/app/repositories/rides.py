@@ -40,7 +40,7 @@ async def get_active_for_driver(db: AsyncSession, driver_id: int) -> Ride | None
 
 
 async def add_event(
-    db: AsyncSession, ride_id: int, from_status: RideStatus | None, to_status: RideStatus, actor_user_id: int
+    db: AsyncSession, ride_id: int, from_status: RideStatus | None, to_status: RideStatus, actor_user_id: int | None
 ) -> RideEvent:
     event = RideEvent(ride_id=ride_id, from_status=from_status, to_status=to_status, actor_user_id=actor_user_id)
     db.add(event)

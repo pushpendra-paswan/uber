@@ -176,12 +176,12 @@ async def test_go_offline_removes_both_keys_and_works_twice(client, driver):
     assert (await client.get("/drivers/me/presence", headers=driver["headers"])).json()["online"] is False
 
 
-async def test_going_offline_is_blocked_by_an_active_ride(client, rider, driver, admin):
+async def test_going_offline_is_blocked_by_an_active_ride(client, rider, driver):
     await client.post("/drivers/me/online", json=INSIDE, headers=driver["headers"])
-    ride_id = (await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])).json()["id"]
-    await client.post(
-        f"/admin/rides/{ride_id}/assign", json={"driver_id": driver["driver"].id}, headers=admin["headers"]
-    )
+    # The ride comes from matching: the driver is the only one online and sits at the pickup.
+    ride = (await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])).json()
+    assert ride["status"] == "DRIVER_ASSIGNED"
+    ride_id = ride["id"]
 
     blocked = await client.post("/drivers/me/offline", headers=driver["headers"])
 

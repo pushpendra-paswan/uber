@@ -58,7 +58,17 @@ docker compose exec backend python create_admin.py --email admin@example.com --n
 
 ## Try a ride in the browser
 
-Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider, pick pickup and drop-off by searching (press Enter) or clicking the map, and request a ride. Once both points are set, the page shows the route and the estimated fare (base fare Rs 50, Rs 12 per km, Rs 2 per minute, Rs 80 minimum; the server works the fare out again when you request). Then assign it to the driver in the admin tab (copy the ride id and driver id by hand). The driver tab then moves the ride through arrived, started, and completed.
+Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider, pick pickup and drop-off by searching (press Enter) or clicking the map, and request a ride. Once both points are set, the page shows the route and the estimated fare (base fare Rs 50, Rs 12 per km, Rs 2 per minute, Rs 80 minimum; the server works the fare out again when you request). The request is matched at once (see below). The driver tab then moves the ride through arrived, started, and completed.
+
+### Try matching by hand (M2.4)
+
+Matching happens inside the ride request: the server assigns the nearest online, approved driver without an active ride within 3 km of the pickup (straight-line distance), or the ride ends as `NO_DRIVER_FOUND`. The driver has no say yet.
+
+1. In the admin tab, approve two drivers.
+2. In two driver tabs (one account each), click the map at different distances from where the rider will pick up (for example 1 km and 2 km away) and press **Go online**.
+3. In a rider tab, choose a pickup and drop-off and press **Request ride**. The ride shows "A driver has been assigned" with the nearer driver's id, and that driver's tab shows the ride within 3 seconds.
+4. A second rider at the same pickup gets the other driver. A third rider sees "No drivers are available nearby right now" and can request again at once.
+5. When a driver completes or a rider cancels, that driver can be matched again. A driver who stops pinging (closed tab) is not matched after 30 seconds.
 
 ### Go online as a driver
 

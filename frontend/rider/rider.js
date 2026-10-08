@@ -1,13 +1,13 @@
 import { api, clearSession, getSession, saveSession } from "/shared/api.js";
 
 const STATUS_TEXT = {
-  REQUESTED: "Waiting for a driver to be assigned",
-  DRIVER_ASSIGNED: "A driver is assigned and on the way",
+  REQUESTED: "Looking for a driver",
+  DRIVER_ASSIGNED: "A driver has been assigned",
   DRIVER_ARRIVED: "Your driver has arrived",
   IN_PROGRESS: "Trip in progress",
   COMPLETED: "Trip completed",
   CANCELLED: "Ride cancelled",
-  NO_DRIVER_FOUND: "No driver was found",
+  NO_DRIVER_FOUND: "No drivers are available nearby right now. Please try again in a moment.",
 };
 const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
@@ -410,16 +410,19 @@ for (const kind of KINDS) {
 
 requestButton.addEventListener("click", () => {
   const { pickup, dropoff } = state.points;
-  act(() =>
-    api("POST", "/rides", {
+  act(async () => {
+    // Matching happens inside this request. A ride that found no driver is already over, so /rides/active
+    // would answer 404 for it: remember the ride from this answer instead.
+    state.ride = await api("POST", "/rides", {
       pickup_address: pickup.address,
       pickup_lat: pickup.lat,
       pickup_lng: pickup.lng,
       dropoff_address: dropoff.address,
       dropoff_lat: dropoff.lat,
       dropoff_lng: dropoff.lng,
-    })
-  );
+    });
+    state.rideId = state.ride.id;
+  });
 });
 
 cancelButton.addEventListener("click", () => {

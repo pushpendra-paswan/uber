@@ -16,7 +16,7 @@ os.environ["REDIS_DB"] = str(TEST_REDIS_DB)
 from app.config import settings  # noqa: E402
 from app.database import Base, get_db, redis_client  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Driver, PricingRule, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
+from app.models import Driver, PricingRule, Ride, RideStatus, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
 from app.security import create_access_token  # noqa: E402
 from app.services import routing  # noqa: E402
 
@@ -136,3 +136,37 @@ async def driver(make_user):
 @pytest_asyncio.fixture
 async def admin(make_user):
     return await make_user("admin")
+
+
+@pytest_asyncio.fixture
+async def put_online(client):
+    """Returns a function that puts a driver (from make_user or the driver fixture) online through the real API."""
+
+    async def go_online(who: dict, lat: float, lng: float) -> None:
+        response = await client.post("/drivers/me/online", json={"lat": lat, "lng": lng}, headers=who["headers"])
+        assert response.status_code == 200
+
+    return go_online
+
+
+@pytest_asyncio.fixture
+async def insert_ride(db: AsyncSession):
+    """Returns a function that inserts a ride straight into the database in the given status, with no matching."""
+
+    async def create(rider: dict, status: RideStatus, driver: dict | None = None) -> Ride:
+        ride = Ride(
+            rider_id=rider["user"].id,
+            driver_id=driver["driver"].id if driver else None,
+            status=status,
+            pickup_lat=settings.city_center_lat,
+            pickup_lng=settings.city_center_lng,
+            pickup_address="MG Road",
+            dropoff_lat=(settings.city_center_lat + settings.city_south) / 2,
+            dropoff_lng=(settings.city_center_lng + settings.city_east) / 2,
+            dropoff_address="Koramangala",
+        )
+        db.add(ride)
+        await db.commit()
+        return ride
+
+    return create
