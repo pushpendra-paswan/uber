@@ -176,6 +176,7 @@ REQUESTED → NO_DRIVER_FOUND
 - One `state` object per page and one `render()` function that updates the DOM from it.
 - Call `fetch` through `shared/api.js` (it adds the JWT header). Use the browser `WebSocket` directly.
 - On WebSocket reconnect, re-fetch the current ride state from the REST API.
+- The rider page opens one WebSocket at login (the `auth` message goes first). Socket handlers only update `state` and call `render()`. The driver marker is moved by `requestAnimationFrame` outside `render()`. `openSocket`, `applyDriverLocation`, and `animateDriver` are the allowed functions besides `act()`.
 - Keep HTML semantic and CSS simple. No CSS frameworks.
 
 ## Commands

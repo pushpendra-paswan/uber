@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Ride, RideEvent, RideStatus, User
-from app.schemas import EstimateRequest, EstimateResponse, RideCreate, RideEventResponse, RideResponse
+from app.schemas import EstimateRequest, EstimateResponse, RideCreate, RideDriverResponse, RideEventResponse, RideResponse
 from app.security import get_current_user, require_role
 from app.services import rides as rides_service
 
@@ -33,6 +33,13 @@ async def get_active_ride(user: User = Depends(require_role("rider", "driver")),
 @router.get("/{ride_id}", response_model=RideResponse)
 async def get_ride(ride_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> Ride:
     return await rides_service.get_ride(db, user, ride_id)
+
+
+@router.get("/{ride_id}/driver", response_model=RideDriverResponse)
+async def get_ride_driver(
+    ride_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
+) -> RideDriverResponse:
+    return await rides_service.get_ride_driver(db, user, ride_id)
 
 
 @router.get("/{ride_id}/events", response_model=list[RideEventResponse])

@@ -21,6 +21,11 @@ const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">Op
 const MAX_ZOOM = 19;
 const MIN_ZOOM = 10;
 const MARKER_COLOR = "#1a56db";
+const RIDE_KINDS = ["pickup", "dropoff"];
+// Leaflet renders tooltips as HTML, so they only ever get these fixed strings, never an address.
+const RIDE_MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
+const RIDE_MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
+const FIT_PADDING = [40, 40];
 
 const session = getSession();
 const state = {
@@ -32,6 +37,8 @@ const state = {
   presence: null, // from GET /drivers/me/presence or the last location ping
   map: null,
   marker: null,
+  rideMarkers: { pickup: null, dropoff: null },
+  fittedRideId: null, // the map is fitted to a ride once, never on every poll
   ride: null,
   rideId: null, // remembered so a finished ride can still be shown after /rides/active returns 404
   events: [],
@@ -215,6 +222,41 @@ function render() {
         .addTo(state.map);
     } else if (state.position !== null) {
       state.marker.setLatLng([state.position.lat, state.position.lng]);
+    }
+
+    // Pickup and drop-off of the active ride. Not interactive, so a click on them still moves the driver.
+    const wanted = hasActiveRide
+      ? {
+          pickup: { lat: state.ride.pickup_lat, lng: state.ride.pickup_lng },
+          dropoff: { lat: state.ride.dropoff_lat, lng: state.ride.dropoff_lng },
+        }
+      : { pickup: null, dropoff: null };
+    for (const kind of RIDE_KINDS) {
+      const point = wanted[kind];
+      const rideMarker = state.rideMarkers[kind];
+      if (point === null && rideMarker !== null) {
+        rideMarker.remove();
+        state.rideMarkers[kind] = null;
+      } else if (point !== null && rideMarker === null) {
+        state.rideMarkers[kind] = L.circleMarker([point.lat, point.lng], {
+          radius: 9,
+          color: RIDE_MARKER_COLOR[kind],
+          fillColor: RIDE_MARKER_COLOR[kind],
+          fillOpacity: 1,
+          interactive: false,
+        })
+          .bindTooltip(RIDE_MARKER_LABEL[kind], { permanent: true, direction: "top", offset: [0, -9] })
+          .addTo(state.map)
+          .bringToBack(); // below the driver's own marker
+      } else if (point !== null) {
+        rideMarker.setLatLng([point.lat, point.lng]);
+      }
+    }
+    if (hasActiveRide && state.fittedRideId !== state.ride.id) {
+      const points = [[state.ride.pickup_lat, state.ride.pickup_lng], [state.ride.dropoff_lat, state.ride.dropoff_lng]];
+      if (state.position !== null) points.push([state.position.lat, state.position.lng]);
+      state.map.fitBounds(points, { padding: FIT_PADDING, animate: false });
+      state.fittedRideId = state.ride.id;
     }
 
     presenceStatus.textContent = online

@@ -4,10 +4,10 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Ride, RideEvent, RideStatus, User, UserRole
+from app.models import ACTIVE_RIDE_STATUSES, Ride, RideEvent, RideStatus, User, UserRole
 from app.repositories import drivers as drivers_repo
 from app.repositories import rides as rides_repo
-from app.schemas import EstimateRequest, RideCreate
+from app.schemas import DriverLocation, EstimateRequest, RideCreate, RideDriverResponse, VehicleResponse
 from app.services import matching, pricing, routing
 from app.utils.geo import is_inside_bounds
 
@@ -95,6 +95,22 @@ async def load_ride_for_user(db: AsyncSession, user: User, ride_id: int, for_upd
 
 async def get_ride(db: AsyncSession, user: User, ride_id: int) -> Ride:
     return await load_ride_for_user(db, user, ride_id)
+
+
+async def get_ride_driver(db: AsyncSession, user: User, ride_id: int) -> RideDriverResponse:
+    ride = await load_ride_for_user(db, user, ride_id)
+    if ride.driver_id is None:
+        raise HTTPException(status_code=404, detail="No driver assigned to this ride")
+
+    driver = await drivers_repo.get_by_id(db, ride.driver_id)
+    # A finished ride never shows where the driver is now, even if the driver is online for another ride.
+    presence = await drivers_repo.get_presence(driver.id) if ride.status in ACTIVE_RIDE_STATUSES else None
+    return RideDriverResponse(
+        driver_id=driver.id,
+        name=driver.user.name,
+        vehicle=VehicleResponse.model_validate(driver.vehicle) if driver.vehicle is not None else None,
+        location=DriverLocation(**presence) if presence is not None else None,
+    )
 
 
 async def get_events(db: AsyncSession, user: User, ride_id: int) -> list[RideEvent]:

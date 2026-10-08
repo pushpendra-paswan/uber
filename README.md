@@ -100,11 +100,23 @@ Run (the stack must be up and OSRM prepared):
 
 Drivers are `sim-driver-001@sim.example.com`, `sim-driver-002@...`, and so on, with the password `sim-driver-pass`. Running it again reuses the same accounts. A driver whose position is still in Redis (stopped less than 30 seconds ago) continues from there.
 
-**Try matching by hand:** start `--drivers 30` with the default center, open `/rider/`, pick a pickup near the city center and a drop-off about 2 km away, and press **Request ride**. The ride is assigned to the nearest simulated driver within a couple of seconds, and the rider page walks through assigned, arrived, in progress, and completed on its own (with `--speed-kmh 90`, a 3.7 km trip took about 4 minutes). The rider page does not show the driver moving until M3.2. A pickup far outside the circle ends as `NO_DRIVER_FOUND`.
+**Try matching by hand:** start `--drivers 30` with the default center, open `/rider/`, pick a pickup near the city center and a drop-off about 2 km away, and press **Request ride**. The ride is assigned to the nearest simulated driver within a couple of seconds, and the rider page walks through assigned, arrived, in progress, and completed on its own (with `--speed-kmh 90`, a 3.7 km trip took about 4 minutes). The rider page shows the driver moving (see live tracking below). A pickup far outside the circle ends as `NO_DRIVER_FOUND`.
 
 Every 15 seconds one summary line shows drivers running, drivers on a ride, pings ok and failed, the average ping time, and rides completed. **Ctrl+C** takes every driver offline and exits within a few seconds (a driver on a ride cannot go offline; its presence expires after 30 seconds).
 
 **Do not log in to a simulated driver on the driver page while the simulator runs.** The driver page keeps pinging its own clicked position and fights the simulator over the same driver.
+
+### Watch live tracking (M3.2)
+
+While a ride is assigned, arrived, or in progress, the rider page shows a **Your driver** section (name, vehicle, "Live tracking: connected") and a blue **Driver** marker on the map that glides as the driver's location updates. The driver page shows the pickup (green) and drop-off (red) markers of its ride.
+
+1. Start the simulator: `.venv-sim/bin/python simulator/simulator.py --drivers 20 --speed-kmh 30 ...` (30 km/h is slow enough to watch).
+2. Open `/rider/`, log in, click a pickup near the city center and a drop-off about 2 km away, and press **Request ride**.
+3. The marker appears and moves toward the pickup. The map fits pickup, drop-off, and driver once; after that it never moves by itself, so you can zoom and pan freely.
+4. Open DevTools, Network, WS, click the `/ws` connection, and watch the Messages: a `driver_location` frame arrives about every 3 seconds (`{"type":"driver_location","data":{"ride_id":..,"lat":..,"lng":..,"updated_at":..}}`, the first frame you send is `auth`).
+5. Without the simulator: log in as an approved driver on `/driver/`, click the map, press **Go online**, then request a ride near that point as a rider. The marker sits still and "Last location update" moves forward every 3 seconds. Clicking far away on the driver map makes the rider's marker jump there (moves over 500 m are not animated).
+
+The marker lags the real position by up to about 3 seconds on purpose (it glides between updates). If the socket closes (for example the backend restarts), the page says "Live tracking: disconnected" and you must reload the page; reconnecting by itself comes in M3.4. Check the details endpoint by hand with `curl localhost:8000/rides/<ride_id>/driver -H "Authorization: Bearer $RIDER"`.
 
 ### Go online as a driver
 
@@ -120,7 +132,7 @@ The driver id is shown at the top of the driver page. The GEO set can keep a sta
 
 ## WebSockets (M3.1)
 
-The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes events to logged-in users. Nothing in the app uses it yet: the pages and the simulator still poll. Driver locations (M3.2) and ride offers (M3.3) are sent on top of it.
+The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes events to logged-in users. Since M3.2 the rider page opens one socket after login and receives `driver_location` events on it; everything else (ride status, the driver and admin pages, the simulator) still polls. Ride offers (M3.3) will be sent on top of it too.
 
 **Flow:** connect, then send the token as the FIRST message (never in the URL). If it is valid, the server answers `auth_ok`. Every message, in both directions, is a JSON text frame `{"type": "<string>", "data": {...}}`.
 
@@ -131,6 +143,7 @@ The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes
 | server to client | `auth_ok` | `{user_id, role}` | Authenticated |
 | server to client | `pong` | `{}` | Reply to `ping` |
 | server to client | `error` | `{detail}` | Unknown message type (the socket stays open) |
+| server to client | `driver_location` | `{ride_id, lat, lng, updated_at}` | M3.2: sent to the rider of a ride each time its driver pings (`updated_at` is epoch seconds). No other data about the driver |
 | server to client | anything else | anything | An event published for this user. `auth_ok`, `pong`, and `error` are reserved |
 
 | Close code | Meaning |

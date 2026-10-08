@@ -84,6 +84,21 @@ class PresenceResponse(BaseModel):
     updated_at: int | None = None  # epoch seconds of the last update
 
 
+class DriverLocation(BaseModel):
+    lat: float
+    lng: float
+    updated_at: int  # epoch seconds of the last update
+
+
+# What a rider (or the assigned driver, or an admin) may know about the driver of a ride:
+# no email, phone, license number, or verification status.
+class RideDriverResponse(BaseModel):
+    driver_id: int
+    name: str
+    vehicle: VehicleResponse | None
+    location: DriverLocation | None
+
+
 class EstimateRequest(BaseModel):
     pickup_lat: float = Field(ge=-90, le=90)
     pickup_lng: float = Field(ge=-180, le=180)

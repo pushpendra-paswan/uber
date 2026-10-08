@@ -11,7 +11,12 @@ const STATUS_TEXT = {
 };
 const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
+const TRACKING = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS"]; // the driver's position is shown only in these
 const POLL_MS = 3000;
+const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
+const ANIMATION_MS = 3000; // equal to the drivers' ping interval, so one glide ends as the next update arrives
+const SNAP_DISTANCE_M = 500; // a bigger jump (the driver was moved by hand) is shown at once, not flown over the map
+const DRIVER_COLOR = "#1a56db";
 const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 const MAX_ZOOM = 19;
@@ -46,10 +51,19 @@ const state = {
   routeRideId: null, // the ride whose route was asked for; set before the call so a failure is not retried every poll
   routeLine: null, // Leaflet polyline
   drawnPath: null, // the path routeLine shows, so polling neither redraws nor refits it
+  socketStatus: "closed", // "connecting", "open", "closed"
+  socketCode: null, // close code once closed
+  driver: null, // answer of GET /rides/{id}/driver
+  driverLocation: null, // {lat, lng, updated_at} of the newest accepted update
+  driverKey: null, // "rideId:driverId" the details were asked for; set before the call so a failure is not retried every poll
   error: "",
   busy: false,
 };
 let refreshing = false;
+let socket = null; // the current WebSocket; handlers of any other socket are ignored
+let driverMarker = null; // Leaflet marker, moved by animateDriver, never by render()
+let animation = null; // {from, to, start} of the glide in progress
+let animationFrame = null; // requestAnimationFrame id while the loop runs
 const shownResults = { pickup: null, dropoff: null }; // which results object is in the DOM, so polling does not rebuild it
 
 const message = document.getElementById("message");
@@ -76,6 +90,11 @@ const ridePickup = document.getElementById("ride-pickup");
 const rideDropoff = document.getElementById("ride-dropoff");
 const rideDriverRow = document.getElementById("ride-driver-row");
 const rideDriver = document.getElementById("ride-driver");
+const driverSection = document.getElementById("driver-section");
+const driverName = document.getElementById("driver-name");
+const driverVehicle = document.getElementById("driver-vehicle");
+const driverTracking = document.getElementById("driver-tracking");
+const driverUpdated = document.getElementById("driver-updated");
 const cancelButton = document.getElementById("cancel-button");
 const newRideButton = document.getElementById("new-ride-button");
 const eventsBody = document.getElementById("events");
@@ -100,6 +119,70 @@ async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
   saveSession(data.access_token, data.user);
   state.user = data.user;
+  openSocket();
+}
+
+// Every handler first checks that its socket is still the current one, so an old socket can never change state.
+// No reconnect yet (M3.4): once it closes, tracking stops until the page is reloaded.
+function openSocket() {
+  if (state.user.role !== "rider") return;
+  const ws = new WebSocket(WS_URL);
+  socket = ws;
+  state.socketStatus = "connecting";
+  state.socketCode = null;
+  ws.onopen = () => {
+    if (socket === ws) ws.send(JSON.stringify({ type: "auth", data: { token: getSession().token } }));
+  };
+  ws.onmessage = (event) => {
+    if (socket !== ws) return;
+    const { type, data } = JSON.parse(event.data);
+    if (type === "auth_ok") {
+      state.socketStatus = "open";
+      render();
+    } else if (type === "driver_location") {
+      const valid = [data.lat, data.lng, data.updated_at].every(Number.isFinite);
+      if (state.ride === null || data.ride_id !== state.ride.id || !valid) return;
+      applyDriverLocation(data);
+      render();
+    }
+  };
+  ws.onclose = (event) => {
+    if (socket !== ws) return;
+    state.socketStatus = "closed";
+    state.socketCode = event.code;
+    render();
+  };
+}
+
+// Used by the details fetch and by the socket. Only stores the position and starts a glide;
+// the marker itself is created by render() and moved by animateDriver().
+function applyDriverLocation(location) {
+  // A slow REST answer must not overwrite a newer update from the socket.
+  if (state.driverLocation !== null && location.updated_at < state.driverLocation.updated_at) return;
+  state.driverLocation = { lat: location.lat, lng: location.lng, updated_at: location.updated_at };
+  if (driverMarker === null) return;
+
+  // Start from where the marker is drawn now, not from the previous target.
+  const from = driverMarker.getLatLng();
+  const to = L.latLng(location.lat, location.lng);
+  if (state.map.distance(from, to) > SNAP_DISTANCE_M || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    driverMarker.setLatLng(to);
+    animation = null;
+    return;
+  }
+  animation = { from, to, start: performance.now() };
+  if (animationFrame === null) animationFrame = requestAnimationFrame(animateDriver);
+}
+
+// Time-based, so a background tab (where frames pause) is at the right place as soon as it returns.
+// CSS transitions are not used: they fight Leaflet's own zoom and pan transforms and do nothing for SVG circles.
+function animateDriver(now) {
+  animationFrame = null;
+  if (animation === null || driverMarker === null) return;
+  const t = Math.min(1, (now - animation.start) / ANIMATION_MS);
+  const { from, to } = animation;
+  driverMarker.setLatLng([from.lat + (to.lat - from.lat) * t, from.lng + (to.lng - from.lng) * t]);
+  if (t < 1) animationFrame = requestAnimationFrame(animateDriver);
 }
 
 async function refresh() {
@@ -131,6 +214,18 @@ async function refresh() {
         dropoff_lng: state.ride.dropoff_lng,
       });
       state.ridePath = route.path;
+    }
+
+    // The position comes from here once per ride, so a reloaded page has one at once; the socket gives the updates.
+    if (state.ride && state.ride.driver_id !== null) {
+      const key = `${state.ride.id}:${state.ride.driver_id}`;
+      if (state.driverKey !== key) {
+        state.driverKey = key;
+        state.driver = await api("GET", `/rides/${state.ride.id}/driver`);
+        if (state.driver.location !== null) applyDriverLocation(state.driver.location);
+      }
+    } else {
+      state.driver = null;
     }
   } catch (err) {
     state.error = err.message;
@@ -294,6 +389,32 @@ function render() {
     }
   }
 
+  // Created and removed here; only animateDriver and applyDriverLocation move it. The tooltip is a fixed string.
+  const tracking = showRide && TRACKING.includes(state.ride.status) && state.driverLocation !== null;
+  if (!tracking && driverMarker !== null) {
+    cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+    animation = null;
+    driverMarker.remove();
+    driverMarker = null;
+  } else if (tracking && showMap && driverMarker === null) {
+    const { lat, lng } = state.driverLocation;
+    driverMarker = L.circleMarker([lat, lng], {
+      radius: 10,
+      color: DRIVER_COLOR,
+      fillColor: DRIVER_COLOR,
+      fillOpacity: 1,
+      interactive: false,
+    })
+      .bindTooltip("Driver", { permanent: true, direction: "top", offset: [0, -10] })
+      .addTo(state.map);
+    // Once, when the marker first appears. After that nothing moves or zooms the map.
+    state.map.fitBounds(
+      [[state.ride.pickup_lat, state.ride.pickup_lng], [state.ride.dropoff_lat, state.ride.dropoff_lng], [lat, lng]],
+      { padding: FIT_PADDING, animate: false }
+    );
+  }
+
   for (const kind of KINDS) {
     const result = state.results[kind];
     if (result === shownResults[kind]) continue; // unchanged: rebuilding would swallow a click made during a poll
@@ -346,6 +467,23 @@ function render() {
     rideFare.textContent = state.ride.fare_estimate === null ? "-" : money.format(state.ride.fare_estimate / 100);
     rideDriverRow.hidden = state.ride.driver_id === null;
     rideDriver.textContent = state.ride.driver_id;
+    driverSection.hidden = state.driver === null;
+    if (state.driver !== null) {
+      const vehicle = state.driver.vehicle;
+      driverName.textContent = state.driver.name;
+      driverVehicle.textContent = vehicle === null ? "-" : `${vehicle.color} ${vehicle.model}, plate ${vehicle.plate_number}`;
+      const live = TRACKING.includes(state.ride.status);
+      driverTracking.hidden = !live;
+      driverUpdated.hidden = !live || state.driverLocation === null;
+      if (state.socketStatus === "connecting") driverTracking.textContent = "Live tracking: connecting...";
+      if (state.socketStatus === "open") driverTracking.textContent = "Live tracking: connected";
+      if (state.socketStatus === "closed") {
+        driverTracking.textContent = `Live tracking: disconnected (code ${state.socketCode}). Reload the page to reconnect.`;
+      }
+      if (state.driverLocation !== null) {
+        driverUpdated.textContent = `Last location update: ${new Date(state.driverLocation.updated_at * 1000).toLocaleTimeString()}`;
+      }
+    }
     cancelButton.hidden = !CANCELLABLE.includes(state.ride.status);
     newRideButton.hidden = !FINISHED.includes(state.ride.status);
 
@@ -388,6 +526,13 @@ registerForm.addEventListener("submit", (event) => {
 });
 
 logoutButton.addEventListener("click", () => {
+  const old = socket;
+  socket = null; // its handlers now ignore everything
+  if (old !== null) old.close();
+  state.driver = null;
+  state.driverLocation = null;
+  state.driverKey = null;
+  render(); // removes the driver marker
   clearSession();
   location.reload();
 });
@@ -441,6 +586,9 @@ newRideButton.addEventListener("click", () => {
     state.estimateRequest++; // an answer still on its way must not show up
     state.ridePath = null;
     state.routeRideId = null;
+    state.driver = null;
+    state.driverLocation = null;
+    state.driverKey = null;
     for (const kind of KINDS) inputs[kind].value = "";
     pickRadios.pickup.checked = true;
   });
@@ -455,5 +603,6 @@ setInterval(async () => {
   render();
 }, POLL_MS);
 
+if (state.user !== null) openSocket();
 render();
 refresh().then(render);

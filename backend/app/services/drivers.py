@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models import Driver, User, VerificationStatus
 from app.repositories import drivers as drivers_repo
+from app.repositories import events
 from app.repositories import rides as rides_repo
 from app.schemas import DriverProfileCreate, LocationUpdate, PresenceResponse, VehicleCreate
 from app.utils.geo import is_inside_bounds
@@ -111,6 +112,13 @@ async def update_location(db: AsyncSession, user: User, data: LocationUpdate) ->
     updated_at = await drivers_repo.refresh_location(driver.id, data.lat, data.lng)
     if updated_at is None:
         raise HTTPException(status_code=409, detail="You are offline. Go online first.")
+
+    # An active ride always has a driver, so the rider can be told where the driver is.
+    ride = await rides_repo.get_active_for_driver(db, driver.id)
+    if ride is not None:
+        await events.publish(
+            ride.rider_id, "driver_location", {"ride_id": ride.id, "lat": data.lat, "lng": data.lng, "updated_at": updated_at}
+        )
     return PresenceResponse(online=True, lat=data.lat, lng=data.lng, updated_at=updated_at)
 
 
