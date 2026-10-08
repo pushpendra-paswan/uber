@@ -12,9 +12,17 @@ docker compose up --build
 docker compose exec backend alembic upgrade head    # create the tables (first time, and after a reset)
 ```
 
-- API: http://localhost:8000
+- API: http://localhost:8000 (Swagger UI at `/docs`)
 - Health check: http://localhost:8000/health
 - Postgres: `localhost:5432`, Redis: `localhost:6379`
+
+## Create an admin
+
+Admins cannot register through the API. Create one with the script (riders and drivers use `POST /auth/register`):
+
+```bash
+docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
+```
 
 ## Stop
 

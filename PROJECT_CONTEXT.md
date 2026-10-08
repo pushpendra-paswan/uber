@@ -8,9 +8,9 @@ Uber-like ride-hailing web app for learning. FastAPI + PostgreSQL/PostGIS + Redi
 
 ## Current status
 
-- Current phase: 0 (Foundations) complete; Phase 1 next
-- Last completed milestone: M0.2 Database layer (2026-10-08)
-- Next milestone: M1.1 Authentication
+- Current phase: 1 (Auth, Roles, Ride State Machine), in progress
+- Last completed milestone: M1.1 Authentication (2026-10-08)
+- Next milestone: M1.2 Driver onboarding
 - Last updated: 2026-10-08
 
 ## Milestone tracker
@@ -21,7 +21,7 @@ Status values: Not started, In progress, Done.
 |---|---|---|---|
 | M0.1 | Repo and infra | Done | 2026-10-08 |
 | M0.2 | Database layer | Done | 2026-10-08 |
-| M1.1 | Authentication | Not started | |
+| M1.1 | Authentication | Done | 2026-10-08 |
 | M1.2 | Driver onboarding | Not started | |
 | M1.3 | Ride state machine | Not started | |
 | M1.4 | Frontend skeleton | Not started | |
@@ -62,9 +62,15 @@ Status values: Not started, In progress, Done.
   - `ratings`: ride_id, from_user_id, to_user_id (FKs), score (check 1 to 5), comment. Unique (ride_id, from_user_id)
   - `pricing_rules`: vehicle_type (unique), base_fare, per_km, per_min, min_fare, surge_cap (float, default 2.0)
   - Only relationship so far: `Ride.events` (ordered by id). Enums are Python enums in `models.py` (`UserRole`, `VerificationStatus`, `RideStatus`, `PaymentMethod`, `PaymentStatus`)
-- **Endpoints:** `GET /health` (200 `{"status","postgres","redis"}` all "ok"; 503 with the failing one "error")
+- **Endpoints:**
+  - `GET /health`: 200 `{"status","postgres","redis"}` all "ok"; 503 with the failing one "error"
+  - `POST /auth/register`: JSON `{name, email, phone?, password (min 8), role: rider|driver}`; 201 `UserResponse`; 409 if email or phone exists; 422 for role `admin`, short password, bad email
+  - `POST /auth/login`: JSON `{email, password}`; 200 `{access_token, token_type: "bearer", user}`; 401 `Invalid email or password` for both wrong email and wrong password
+  - `GET /auth/me`: needs `Authorization: Bearer <token>`; 200 `UserResponse`; 401 otherwise
+- **JWT:** HS256, signed with `JWT_SECRET`. Claims: `sub` (user id as string), `role`, `exp` (`ACCESS_TOKEN_EXPIRE_MINUTES`, default 60). `get_current_user` returns 401 + `WWW-Authenticate: Bearer` for a missing, malformed, tampered, or expired token, or a user that no longer exists. `require_role("rider", ...)` returns 403 for other roles.
+- **Admin creation (script only):** `docker compose exec backend python create_admin.py --email ... --name ... --password ...` (prints the id; does nothing if the email exists)
 - **Static files:** `frontend/` is mounted at `/` after the API routes (folders are empty placeholders)
-- **Backend files:** `app/config.py` (settings from env), `app/database.py` (`Base` with constraint naming convention, async engine, `async_session`, `get_db` dependency, Redis client), `app/models.py` (all models), `app/main.py`; `alembic.ini` and `alembic/` (async template; `env.py` takes the URL from settings); empty `routers/ services/ repositories/ utils/` packages
+- **Backend files:** `app/config.py` (settings from env), `app/database.py` (`Base` with constraint naming convention, async engine, `async_session`, `get_db` dependency, Redis client), `app/models.py` (all models), `app/main.py`; `app/schemas.py`, `app/security.py` (argon2 hashing, JWT, `get_current_user`, `require_role`), `app/routers/auth.py`, `app/services/auth.py`, `app/repositories/users.py`, `backend/create_admin.py`; `alembic.ini` and `alembic/` (async template; `env.py` takes the URL from settings); `utils/` is still an empty package
 - **Redis keys:** none yet
 - **WebSocket messages:** none yet
 - **Frontend pages:** none yet
@@ -86,6 +92,14 @@ One line per decision: milestone, what was chosen, what was rejected, why.
 | M0.2 | `MetaData` naming convention (`ix_`, `uq_`, `ck_`, `fk_`, `pk_` prefixes) | Postgres auto-generated names | Predictable constraint names for later migrations |
 | M0.2 | Alembic `include_object` ignores any database table that is not one of our models | Default autogenerate | The PostGIS image ships `spatial_ref_sys`, `tiger.*`, `topology.*`; unfiltered, autogenerate wrote `drop_table` for ~40 of them |
 | M0.2 | Migration ids are manual and readable (`0001`, file `0001_initial_schema.py`) via `--rev-id`; downgrade leaves the postgis extension | Hash-only ids | Readable ordering |
+| M1.1 | JSON body for `/auth/login` | OAuth2 password form | Frontends send JSON everywhere; Swagger's Authorize still works via `HTTPBearer` (paste a token) |
+| M1.1 | Admins are created only by `create_admin.py` | An admin role on `/auth/register`, a bootstrap endpoint | No API path can ever create an admin; `RegisterRequest.role` is `Literal["rider","driver"]` |
+| M1.1 | Only rider and driver can self-register | Any role | Same reason as above |
+| M1.1 | `get_current_user` calls `repositories/users.py` directly | Routing it through a service | Dependency with no business rule; a service would be a pass-through. Exception applies only there |
+| M1.1 | Wrong email and wrong password return the same 401 body; unknown email still runs an argon2 verify against a dummy hash | Different messages, or returning early for unknown email | Attacker cannot tell which part failed, by message or by response time |
+| M1.1 | `HTTPBearer(auto_error=False)` and our own 401 | Default `auto_error` | One 401 response with `WWW-Authenticate: Bearer` for every auth failure, including a missing header; Swagger still shows Authorize |
+| M1.1 | Added `get_by_phone` to the users repository | Catching the unique-constraint error | Needed for the 409 on duplicate phone; explicit check keeps the error message clear |
+| M1.1 | Pinned: PyJWT 2.15.1, argon2-cffi 25.1.0, email-validator 2.3.0 | Unpinned | Current stable at 2026-10-08 |
 | M0.1 | Pinned: fastapi 0.142.4, uvicorn 0.54.0, sqlalchemy 2.1.4, asyncpg 0.32.0, redis 8.1.0, pydantic-settings 2.15.0 (M0.2 added alembic 1.20.0) | Unpinned | Current stable at 2026-10-08 |
 
 ## Bugs hit
@@ -96,7 +110,9 @@ One entry per notable bug: milestone, symptom, root cause, fix.
 
 ## Open issues and TODOs
 
-None yet.
+- argon2 hashing is synchronous and blocks the event loop (about 100 ms per login or register). Revisit during the M7.2 load test (for example `run_in_executor`).
+- Register has a check-then-insert race: two simultaneous requests with the same email can both pass the check, and the second hits the unique constraint and returns 500 instead of 409. Rare; revisit if it ever matters.
+- Swagger Authorize was not clicked through in a browser during M1.1 (no browser tool); the OpenAPI schema declares the `HTTPBearer` scheme on `/auth/me`.
 
 ## How to run and test
 
@@ -114,8 +130,19 @@ docker compose exec backend alembic upgrade head                              # 
 docker compose exec backend alembic downgrade base                            # remove all tables (postgis stays)
 docker compose exec --user $(id -u):$(id -g) backend alembic revision --autogenerate -m "message" --rev-id 0002
 docker compose exec db psql -U uber -d uber -c '\dt'                          # inspect tables
+
+# auth (M1.1)
+docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
+curl -X POST localhost:8000/auth/register -H 'Content-Type: application/json' \
+  -d '{"name":"Rita","email":"rita@example.com","password":"rider-pass-1","role":"rider"}'
+curl -X POST localhost:8000/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"rita@example.com","password":"rider-pass-1"}'          # returns access_token
+curl localhost:8000/auth/me -H "Authorization: Bearer $TOKEN"
+# Swagger: http://localhost:8000/docs -> Authorize -> paste the access_token
 ```
+
+After changing `requirements.txt`, rebuild: `docker compose up -d --build backend`.
 
 Run `alembic revision` with `--user $(id -u):$(id -g)` so the new file on the host is not owned by root. Review every autogenerated migration by hand; a "check" autogenerate right after `upgrade head` should be empty.
 
-No automated tests yet (first ones arrive with the state machine, M1.3).
+No automated tests yet (first ones arrive with the state machine, M1.3). M1.1 was verified by hand with curl and psql.
