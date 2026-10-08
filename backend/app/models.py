@@ -68,12 +68,16 @@ class Driver(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # lazy="raise": async cannot lazy load, so a forgotten eager load fails loudly.
+    user: Mapped["User"] = relationship(lazy="raise")
+    vehicle: Mapped["Vehicle | None"] = relationship(lazy="raise")
+
 
 class Vehicle(Base):
     __tablename__ = "vehicles"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id"))
+    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id"), unique=True)
     plate_number: Mapped[str] = mapped_column(String(20), unique=True)
     model: Mapped[str] = mapped_column(String(50))
     color: Mapped[str] = mapped_column(String(30))
