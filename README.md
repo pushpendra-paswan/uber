@@ -12,6 +12,9 @@ docker compose up --build
 docker compose exec backend alembic upgrade head    # create the tables (first time, and after a reset)
 ```
 
+- Rider app: http://localhost:8000/rider/
+- Driver app: http://localhost:8000/driver/
+- Admin app: http://localhost:8000/admin/ (log in with an admin created below)
 - API: http://localhost:8000 (Swagger UI at `/docs`)
 - Health check: http://localhost:8000/health
 - Postgres: `localhost:5432`, Redis: `localhost:6379`
@@ -23,6 +26,10 @@ Admins cannot register through the API. Create one with the script (riders and d
 ```bash
 docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
 ```
+
+## Try a ride in the browser
+
+Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider and request a ride, then assign it to the driver in the admin tab (copy the ride id and driver id by hand). The driver tab then moves the ride through arrived, started, and completed.
 
 ## Run the tests
 

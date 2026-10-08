@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin</title>
+  <link rel="stylesheet" href="/shared/base.css">
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Admin</h1>
+      <p id="user-bar" hidden>
+        <span id="user-name"></span>
+        <button id="logout-button" type="button">Log out</button>
+      </p>
+    </header>
+
+    <p id="message" class="message" role="alert" hidden></p>
+
+    <section id="login-section" hidden>
+      <h2>Log in</h2>
+      <form id="login-form">
+        <label for="login-email">Email</label>
+        <input id="login-email" name="email" type="email" autocomplete="username" required>
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">Log in</button>
+      </form>
+    </section>
+
+    <section id="wrong-role-section" hidden>
+      <p id="wrong-role-text"></p>
+    </section>
+
+    <section id="drivers-section" hidden>
+      <h2>Drivers</h2>
+      <label for="status-filter">Status</label>
+      <select id="status-filter">
+        <option value="">All</option>
+        <option value="pending">Pending</option>
+        <option value="approved">Approved</option>
+        <option value="rejected">Rejected</option>
+      </select>
+      <button id="refresh-button" type="button">Refresh</button>
+
+      <p id="no-drivers" hidden>No drivers found.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Driver id</th>
+              <th>Name</th>
+              <th>Email</th>
+              <th>License</th>
+              <th>Plate</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="drivers"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="assign-section" hidden>
+      <h2>Assign a ride</h2>
+      <p class="note">Temporary stand-in for matching (replaced in M2.4). Copy the ride id from the rider tab and the driver id from the driver tab.</p>
+      <form id="assign-form">
+        <label for="assign-ride-id">Ride id</label>
+        <input id="assign-ride-id" name="ride_id" type="number" min="1" step="1" required>
+        <label for="assign-driver-id">Driver id</label>
+        <input id="assign-driver-id" name="driver_id" type="number" min="1" step="1" required>
+        <button type="submit">Assign</button>
+      </form>
+      <p id="assign-result" hidden></p>
+    </section>
+  </main>
+
+  <script type="module" src="admin.js"></script>
+</body>
+</html>

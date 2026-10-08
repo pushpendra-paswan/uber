@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Driver</title>
+  <link rel="stylesheet" href="/shared/base.css">
+  <link rel="stylesheet" href="driver.css">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Driver</h1>
+      <p id="user-bar" hidden>
+        <span id="user-name"></span>
+        <button id="logout-button" type="button">Log out</button>
+      </p>
+    </header>
+
+    <p id="message" class="message" role="alert" hidden></p>
+
+    <section id="login-section" hidden>
+      <h2>Log in</h2>
+      <form id="login-form">
+        <label for="login-email">Email</label>
+        <input id="login-email" name="email" type="email" autocomplete="username" required>
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">Log in</button>
+      </form>
+
+      <h2>Register</h2>
+      <form id="register-form">
+        <label for="register-name">Name</label>
+        <input id="register-name" name="name" type="text" maxlength="100" required>
+        <label for="register-email">Email</label>
+        <input id="register-email" name="email" type="email" autocomplete="username" required>
+        <label for="register-phone">Phone (optional)</label>
+        <input id="register-phone" name="phone" type="tel" maxlength="20">
+        <label for="register-password">Password (at least 8 characters)</label>
+        <input id="register-password" name="password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+        <button type="submit">Register</button>
+      </form>
+    </section>
+
+    <section id="wrong-role-section" hidden>
+      <p id="wrong-role-text"></p>
+    </section>
+
+    <section id="driver-id-section" hidden>
+      <p class="driver-id">Your driver id: <strong id="driver-id"></strong></p>
+      <p class="note">Give this id to the admin so they can assign rides to you.</p>
+      <p id="verification-text" hidden></p>
+    </section>
+
+    <section id="profile-section" hidden>
+      <h2>Create your driver profile</h2>
+      <form id="profile-form">
+        <label for="license-number">License number (5 to 30 characters)</label>
+        <input id="license-number" name="license_number" type="text" minlength="5" maxlength="30" required>
+        <button type="submit">Save profile</button>
+      </form>
+    </section>
+
+    <section id="vehicle-section" hidden>
+      <h2>Add your vehicle</h2>
+      <form id="vehicle-form">
+        <label for="vehicle-plate">Plate number</label>
+        <input id="vehicle-plate" name="plate_number" type="text" maxlength="20" required>
+        <label for="vehicle-model">Model</label>
+        <input id="vehicle-model" name="model" type="text" maxlength="50" required>
+        <label for="vehicle-color">Color</label>
+        <input id="vehicle-color" name="color" type="text" maxlength="30" required>
+        <button type="submit">Save vehicle</button>
+      </form>
+    </section>
+
+    <section id="no-ride-section" hidden>
+      <p>No ride assigned yet.</p>
+    </section>
+
+    <section id="ride-section" hidden>
+      <h2>Ride #<span id="ride-id"></span></h2>
+      <p><span id="ride-status" class="badge"></span> <span id="ride-status-text"></span></p>
+      <dl>
+        <div>
+          <dt>Pickup</dt>
+          <dd id="ride-pickup"></dd>
+        </div>
+        <div>
+          <dt>Drop-off</dt>
+          <dd id="ride-dropoff"></dd>
+        </div>
+      </dl>
+      <button id="arrive-button" type="button" hidden>I have arrived</button>
+      <button id="start-button" type="button" hidden>Start trip</button>
+      <button id="complete-button" type="button" hidden>Complete trip</button>
+      <button id="cancel-button" type="button" hidden>Cancel ride</button>
+      <button id="done-button" type="button" hidden>Wait for a new ride</button>
+
+      <h3>Timeline</h3>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>From</th><th>To</th><th>Time</th></tr>
+          </thead>
+          <tbody id="events"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="driver.js"></script>
+</body>
+</html>

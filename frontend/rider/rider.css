@@ -1,0 +1,11 @@
+dt {
+  font-weight: 600;
+}
+
+dd {
+  margin: 0 0 0.5rem;
+}
+
+#cancel-button {
+  background: #b42318;
+}

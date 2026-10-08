@@ -8,9 +8,9 @@ Uber-like ride-hailing web app for learning. FastAPI + PostgreSQL/PostGIS + Redi
 
 ## Current status
 
-- Current phase: 1 (Auth, Roles, Ride State Machine), in progress
-- Last completed milestone: M1.3 Ride state machine (2026-10-08)
-- Next milestone: M1.4 Frontend skeleton
+- Current phase: 1 (Auth, Roles, Ride State Machine) is complete. Phase 2 (Maps, Geo, Fare Estimate, Matching) is next
+- Last completed milestone: M1.4 Frontend skeleton (2026-10-08)
+- Next milestone: M2.1 Map UI
 - Last updated: 2026-10-08
 
 ## Milestone tracker
@@ -24,7 +24,7 @@ Status values: Not started, In progress, Done.
 | M1.1 | Authentication | Done | 2026-10-08 |
 | M1.2 | Driver onboarding | Done | 2026-10-08 |
 | M1.3 | Ride state machine | Done | 2026-10-08 |
-| M1.4 | Frontend skeleton | Not started | |
+| M1.4 | Frontend skeleton | Done | 2026-10-08 |
 | M2.1 | Map UI | Not started | |
 | M2.2 | Routing and estimate | Not started | |
 | M2.3 | Driver presence | Not started | |
@@ -94,11 +94,16 @@ Status values: Not started, In progress, Done.
 - **Tests:** `docker compose exec backend pytest` (69 tests, about 12 s). They run on a separate database `<POSTGRES_DB>_test` (created if missing; tables dropped and created from the models at session start, every table truncated with `RESTART IDENTITY CASCADE` before each test). `conftest.py` refuses to import unless the database name ends with `_test`, uses `NullPool` so simultaneous requests get separate connections, and overrides `get_db`. Fixtures: `client`, `db`, `rider`, `driver` (approved, with vehicle), `admin`, and `make_user(role, approved=True)` for more users. Users get a token directly from `create_access_token` (no login). `test_rides.py` covers: all 49 status pairs against a hand-written list of legal pairs, happy path with events, cancel rules, one active ride per rider, 404/403 access rules, assign rules, two simultaneous cancels, `/rides/active`, ride body validation. `pytest.ini`: `asyncio_mode = auto`, session-scoped event loop, `pythonpath = .`
 - **JWT:** HS256, signed with `JWT_SECRET`. Claims: `sub` (user id as string), `role`, `exp` (`ACCESS_TOKEN_EXPIRE_MINUTES`, default 60). `get_current_user` returns 401 + `WWW-Authenticate: Bearer` for a missing, malformed, tampered, or expired token, or a user that no longer exists. `require_role("rider", ...)` returns 403 for other roles.
 - **Admin creation (script only):** `docker compose exec backend python create_admin.py --email ... --name ... --password ...` (prints the id; does nothing if the email exists)
-- **Static files:** `frontend/` is mounted at `/` after the API routes (folders are empty placeholders)
+- **Static files:** `frontend/` is mounted at `/` with `html=True` after the API routes, so `/rider/` serves `rider/index.html` (`/rider` redirects to `/rider/`)
 - **Backend files:** `app/config.py` (settings from env), `app/database.py` (`Base` with constraint naming convention, async engine, `async_session`, `get_db` dependency, Redis client), `app/models.py` (all models), `app/main.py`; `app/schemas.py`, `app/security.py` (argon2 hashing, JWT, `get_current_user`, `require_role`), `app/routers/auth.py`, `app/routers/drivers.py`, `app/routers/admin.py`, `app/services/auth.py`, `app/services/drivers.py`, `app/routers/rides.py`, `app/services/rides.py`, `app/repositories/users.py`, `app/repositories/drivers.py`, `app/repositories/rides.py`, `backend/create_admin.py`, `backend/pytest.ini`, `backend/tests/conftest.py`, `backend/tests/test_rides.py`; `alembic.ini` and `alembic/` (async template; `env.py` takes the URL from settings); `utils/` is still an empty package
 - **Redis keys:** none yet
 - **WebSocket messages:** none yet
-- **Frontend pages:** none yet
+- **Frontend pages** (plain HTML/CSS/ES modules, no libraries; each app is one page with its login form inside; all poll every 3 s):
+  - `/rider/` (`rider.js`): log in or register (role rider, phone sent only if filled). Logged in as another role: "This account is a X. Open /X/ instead." Rider: request form with placeholder coordinates (MG Road to Koramangala, typed by hand until M2.1) calls `POST /rides`. Active ride shows id, status text, addresses, driver id once assigned, and the events timeline; Cancel (with `confirm()`) in REQUESTED / DRIVER_ASSIGNED / DRIVER_ARRIVED. A finished ride stays on screen (fetched once with `GET /rides/{id}` after `/rides/active` turns 404) with a "Request a new ride" button
+  - `/driver/` (`driver.js`): same login/register with role driver. Shows the driver id, then walks profile form, vehicle form, and the verification text (pending / rejected / approved). When approved: "No ride assigned yet." or the ride with buttons by status (arrived, start, complete, cancel) and the same finished-ride behavior
+  - `/admin/` (`admin.js`): login only (admins come from `create_admin.py`). Drivers table with status filter, Refresh, Approve and Reject on every row (backend errors show in the message area). Assign form (ride id, driver id) labelled as a temporary stand-in for matching. Minimal on purpose; the real dashboard is M6.2
+  - `shared/api.js`: `api(method, path, body)`, `saveSession`, `getSession`, `clearSession`. Session lives in `sessionStorage` under the key `session` (`{token, user}`). Thrown errors carry `.status` and a readable message (`detail`, or `field: message` for a 422). A 401 with a token clears the session and reloads; a 401 without a token (wrong password) just throws. `shared/base.css` is the common stylesheet; each app has one small CSS file
+  - Each page has one `state` object, one `render()` (shows/hides sections, sets `textContent`, never touches inputs), one `refresh()`, and one `act(fn)` used by every button
 
 ## Decisions log
 
@@ -142,12 +147,22 @@ One line per decision: milestone, what was chosen, what was rejected, why.
 | M1.3 | Tests skip trivial CRUD and the M1.1 / M1.2 endpoints | Full coverage | Per the working agreement: test state machine, matching, concurrency, payments |
 | M1.3 | Deliberately no protection against one driver on two rides or one rider with two rides under simultaneous requests: only the plain check in `assign_driver` / `create_ride` | A lock or unique index now | M4.1 reproduces the driver double-assignment on purpose |
 | M1.3 | Pinned test packages: pytest 9.1.1, pytest-asyncio 1.4.0, httpx 0.28.1 | Unpinned | Current stable at 2026-10-08 |
+| M1.4 | Session in `sessionStorage` (per tab) | `localStorage` | Rider, driver, and admin can be logged in at once in three tabs of one browser |
+| M1.4 | Poll every 3 s with `setInterval` (skipped while a previous refresh or a button action is running; not paused in background tabs) | WebSockets now | WebSockets come in M3; polling lets a ride be clicked through today. Background tabs keep polling because several tabs are used for testing |
+| M1.4 | Minimal admin page (drivers table, approve/reject, assign form) built now | Waiting for M6.2, or using curl | Without it, drivers cannot be approved and rides cannot be assigned in the browser |
+| M1.4 | API data goes into the page with `textContent` or `createElement` only, never `innerHTML` | `innerHTML` templates | Names and addresses are user input (checked with a rider and driver named `<img src=x onerror=alert(1)>`) |
+| M1.4 | `render()` never touches inputs; forms are only reset by their submit handler after a successful login or register | Re-rendering whole sections | Polling re-renders every 3 s and would erase what the user is typing (checked: 10 s of polling keeps a half-filled form) |
+| M1.4 | Ride coordinates are typed by hand (prefilled placeholders) | A map or geocoder | Map and Nominatim arrive in M2.1 |
+| M1.4 | Admin table is only redrawn when its data changed | Redrawing on every poll | A redraw between mouse down and mouse up on Approve would swallow the click |
+| M1.4 | Thrown API errors carry `.status` | Matching on message text | Pages need to tell a 404 (no ride, no profile) from a real failure |
+| M1.4 | No backend change: `main.py` already mounted `frontend/` with `html=True` | Editing the mount | Nothing to fix |
 | M0.1 | Pinned: fastapi 0.142.4, uvicorn 0.54.0, sqlalchemy 2.1.4, asyncpg 0.32.0, redis 8.1.0, pydantic-settings 2.15.0 (M0.2 added alembic 1.20.0) | Unpinned | Current stable at 2026-10-08 |
 
 ## Bugs hit
 
 One entry per notable bug: milestone, symptom, root cause, fix.
 
+- **M1.4:** none in the frontend. The browser click-through passed on its first full run. Expect red 404 lines in the browser console while polling: they are `/rides/active` and `/drivers/me` answering "nothing yet", which the pages treat as normal.
 - **M1.3:** the first version of the 49-pair transition test used the app's own `ALLOWED_TRANSITIONS` as the expected answer, so a deliberate wrong change to the dict (REQUESTED to COMPLETED) still passed all 69 tests. The mutation check caught it. Fix: the test now has its own hand-written list of legal pairs. Also: `pytest` could not import `app` until `pythonpath = .` was added to `pytest.ini`.
 - **M1.2:** none. Note for later: a failed insert (lost race) still consumes an id from the sequence, so ids are not gapless (a race test skipped driver id 4).
 - **M0.2:** `alembic revision --autogenerate` produced a migration that dropped ~40 PostGIS tables (`tiger.*`, `topology.*`, `spatial_ref_sys`). Cause: the `postgis/postgis` image creates them, so Alembic sees them as tables missing from our models. Fix: `include_object` filter in `alembic/env.py`.
@@ -162,7 +177,12 @@ One entry per notable bug: milestone, symptom, root cause, fix.
 - OTP is not checked on `/start` until M3.5.
 - Decide whether to keep `POST /admin/rides/{id}/assign` after matching exists (M2.4).
 - A driver who is cancelled out of a ride stays on `rides.driver_id` (the history keeps who was assigned), so that driver still gets 409, not 404, on further actions for that ride.
-- Dev database contains leftover rides and users from the M1.3 manual check (curl walkthrough).
+- Dev database contains leftover rides, users, and drivers from the M1.3 and M1.4 manual checks (curl walkthrough and browser click-through).
+- JWT in `sessionStorage` is readable by any script on the page. Acceptable for a learning project because no third-party scripts are loaded (Leaflet is the only one planned, in M2.1).
+- The admin assign page: remove it or keep it after M2.4 matching exists.
+- The admin page cannot list rides, so assigning needs the ride id and driver id copied by hand from the other tabs.
+- The pages poll, so a status change can take up to 3 s to appear. A failed poll leaves its error message up until the next button press. WebSockets replace polling in M3.
+- The M1.4 browser click-through lives only as a throwaway script outside the repo (no automated frontend tests, by decision). Rerun it by hand with the 12-step list if the pages change a lot.
 - Swagger Authorize has not been clicked through in a browser in M1.1 or M1.2 (no browser tool). `/docs` serves 200 and the OpenAPI schema declares `HTTPBearer` on `/auth/me` and on all six M1.2 routes and all nine M1.3 routes (`/docs` served 200 in M1.3).
 
 ## How to run and test
@@ -200,6 +220,11 @@ curl -X POST localhost:8000/rides/1/cancel   -H "Authorization: Bearer $RIDER"
 curl localhost:8000/rides/active -H "Authorization: Bearer $RIDER"
 curl localhost:8000/rides/1/events -H "Authorization: Bearer $RIDER"
 
+# frontend (M1.4): open each in its own tab; every tab keeps its own login
+#   http://localhost:8000/admin/    (log in with an admin made by create_admin.py)
+#   http://localhost:8000/driver/   (register, profile, vehicle, wait for approval)
+#   http://localhost:8000/rider/    (register, request a ride; the admin assigns it by hand)
+
 # auth (M1.1)
 docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
 curl -X POST localhost:8000/auth/register -H 'Content-Type: application/json' \
@@ -214,4 +239,4 @@ After changing `requirements.txt`, rebuild: `docker compose up -d --build backen
 
 Run `alembic revision` with `--user $(id -u):$(id -g)` so the new file on the host is not owned by root. Review every autogenerated migration by hand; a "check" autogenerate right after `upgrade head` should be empty.
 
-Automated tests exist for the ride state machine (M1.3). M1.1 and M1.2 were verified by hand with curl and psql.
+Automated tests exist for the ride state machine (M1.3). M1.1 and M1.2 were verified by hand with curl and psql. M1.4 was verified with curl for every call the pages make, and with a headless Chrome click-through of the full flow in three tabs.

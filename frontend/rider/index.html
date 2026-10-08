@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rider</title>
+  <link rel="stylesheet" href="/shared/base.css">
+  <link rel="stylesheet" href="rider.css">
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Rider</h1>
+      <p id="user-bar" hidden>
+        <span id="user-name"></span>
+        <button id="logout-button" type="button">Log out</button>
+      </p>
+    </header>
+
+    <p id="message" class="message" role="alert" hidden></p>
+
+    <section id="login-section" hidden>
+      <h2>Log in</h2>
+      <form id="login-form">
+        <label for="login-email">Email</label>
+        <input id="login-email" name="email" type="email" autocomplete="username" required>
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">Log in</button>
+      </form>
+
+      <h2>Register</h2>
+      <form id="register-form">
+        <label for="register-name">Name</label>
+        <input id="register-name" name="name" type="text" maxlength="100" required>
+        <label for="register-email">Email</label>
+        <input id="register-email" name="email" type="email" autocomplete="username" required>
+        <label for="register-phone">Phone (optional)</label>
+        <input id="register-phone" name="phone" type="tel" maxlength="20">
+        <label for="register-password">Password (at least 8 characters)</label>
+        <input id="register-password" name="password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+        <button type="submit">Register</button>
+      </form>
+    </section>
+
+    <section id="wrong-role-section" hidden>
+      <p id="wrong-role-text"></p>
+    </section>
+
+    <section id="request-section" hidden>
+      <h2>Request a ride</h2>
+      <p class="note">These coordinates are placeholders until the map arrives in M2.1. Edit them by hand if you like.</p>
+      <form id="request-form">
+        <label for="pickup-address">Pickup address</label>
+        <input id="pickup-address" name="pickup_address" type="text" maxlength="255" value="MG Road, Bengaluru" required>
+        <label for="pickup-lat">Pickup latitude</label>
+        <input id="pickup-lat" name="pickup_lat" type="number" step="any" min="-90" max="90" value="12.9757" required>
+        <label for="pickup-lng">Pickup longitude</label>
+        <input id="pickup-lng" name="pickup_lng" type="number" step="any" min="-180" max="180" value="77.6063" required>
+
+        <label for="dropoff-address">Drop-off address</label>
+        <input id="dropoff-address" name="dropoff_address" type="text" maxlength="255" value="Koramangala, Bengaluru" required>
+        <label for="dropoff-lat">Drop-off latitude</label>
+        <input id="dropoff-lat" name="dropoff_lat" type="number" step="any" min="-90" max="90" value="12.9352" required>
+        <label for="dropoff-lng">Drop-off longitude</label>
+        <input id="dropoff-lng" name="dropoff_lng" type="number" step="any" min="-180" max="180" value="77.6245" required>
+
+        <button type="submit">Request ride</button>
+      </form>
+    </section>
+
+    <section id="ride-section" hidden>
+      <h2>Ride #<span id="ride-id"></span></h2>
+      <p><span id="ride-status" class="badge"></span> <span id="ride-status-text"></span></p>
+      <dl>
+        <div>
+          <dt>Pickup</dt>
+          <dd id="ride-pickup"></dd>
+        </div>
+        <div>
+          <dt>Drop-off</dt>
+          <dd id="ride-dropoff"></dd>
+        </div>
+        <div id="ride-driver-row" hidden>
+          <dt>Driver id</dt>
+          <dd id="ride-driver"></dd>
+        </div>
+      </dl>
+      <button id="cancel-button" type="button" hidden>Cancel ride</button>
+      <button id="new-ride-button" type="button" hidden>Request a new ride</button>
+
+      <h3>Timeline</h3>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>From</th><th>To</th><th>Time</th></tr>
+          </thead>
+          <tbody id="events"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="rider.js"></script>
+</body>
+</html>

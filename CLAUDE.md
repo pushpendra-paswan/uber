@@ -190,7 +190,7 @@ Done when: `docker compose up` gives a running API with migrated tables.
 - **M1.1 Authentication:** register/login, password hashing, JWT, role guards (rider, driver, admin)
 - **M1.2 Driver onboarding:** driver profile and vehicle, admin approve endpoint (no real document checks)
 - **M1.3 Ride state machine:** all states and transitions enforced in `change_ride_status()`, every change logged to `ride_events`
-- **M1.4 Frontend skeleton:** `shared/api.js`, login pages, bare rider and driver pages that call the endpoints
+- **M1.4 Frontend skeleton:** `shared/api.js`, login pages, bare rider, driver, and minimal admin pages that call the endpoints
 
 Done when: tests prove illegal transitions are rejected, and a ride can be clicked through each state manually.
 
