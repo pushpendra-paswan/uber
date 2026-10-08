@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.database import engine, redis_client
-from app.routers import admin, auth, drivers, rides
+from app.routers import admin, auth, drivers, places, rides
 
 app = FastAPI(title="Uber Clone")
 
@@ -34,6 +34,7 @@ app.include_router(auth.router)
 app.include_router(drivers.router)
 app.include_router(admin.router)
 app.include_router(rides.router)
+app.include_router(places.router)
 
 # Mounted last so it does not shadow the API routes above.
 app.mount("/", StaticFiles(directory="/frontend", html=True), name="frontend")

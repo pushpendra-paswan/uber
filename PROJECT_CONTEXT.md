@@ -8,9 +8,9 @@ Uber-like ride-hailing web app for learning. FastAPI + PostgreSQL/PostGIS + Redi
 
 ## Current status
 
-- Current phase: 1 (Auth, Roles, Ride State Machine) is complete. Phase 2 (Maps, Geo, Fare Estimate, Matching) is next
-- Last completed milestone: M1.4 Frontend skeleton (2026-10-08)
-- Next milestone: M2.1 Map UI
+- Current phase: 2 (Maps, Geo, Fare Estimate, Matching) is in progress. Phases 0 and 1 are complete
+- Last completed milestone: M2.1 Map UI (2026-10-08)
+- Next milestone: M2.2 Routing and estimate
 - Last updated: 2026-10-08
 
 ## Milestone tracker
@@ -25,7 +25,7 @@ Status values: Not started, In progress, Done.
 | M1.2 | Driver onboarding | Done | 2026-10-08 |
 | M1.3 | Ride state machine | Done | 2026-10-08 |
 | M1.4 | Frontend skeleton | Done | 2026-10-08 |
-| M2.1 | Map UI | Not started | |
+| M2.1 | Map UI | Done | 2026-10-08 |
 | M2.2 | Routing and estimate | Not started | |
 | M2.3 | Driver presence | Not started | |
 | M2.4 | Matching v1 | Not started | |
@@ -78,6 +78,9 @@ Status values: Not started, In progress, Done.
   - `POST /rides/{ride_id}/arrive`, `/start`, `/complete`: role driver (403 otherwise), must be the assigned driver (404 otherwise); 200 `RideResponse`; 409 `Cannot change ride from X to Y` if the transition is not allowed. `/start` sets `started_at` and does not check an OTP yet; `/complete` sets `completed_at` and leaves `final_fare` null
   - `POST /rides/{ride_id}/cancel`: role rider or driver; the rider from REQUESTED / DRIVER_ASSIGNED / DRIVER_ARRIVED, the assigned driver from DRIVER_ASSIGNED / DRIVER_ARRIVED; 409 after IN_PROGRESS or when already ended. Cancelling ends the ride
   - `POST /admin/rides/{ride_id}/assign`: role admin; JSON `{driver_id}`; 200 `RideResponse` with `DRIVER_ASSIGNED`; 404 unknown driver; 409 if the driver is not approved, already has an active ride, or the ride is not REQUESTED. Temporary stand-in for matching (M2.4)
+  - `GET /places/map-config`: any logged-in user; 200 `MapConfigResponse` (`city_name, center_lat, center_lng, zoom, south, west, north, east`) built from the `CITY_*` and `MAP_ZOOM` settings
+  - `GET /places/search?q=`: any logged-in user; `q` 3 to 200 chars (422 otherwise, also when it is shorter than 3 after trimming and collapsing spaces); 200 list of `PlaceResponse` (`display_name, lat, lng`, floats), up to 5, limited to the city box. 429 `Place search is busy, try again in a second` with `Retry-After: 1` when another uncached Nominatim call ran in the last 1.1 s; 502 `Place search is unavailable` when Nominatim fails or answers non-200
+  - `GET /places/reverse?lat=&lng=`: any logged-in user; 200 `PlaceResponse` with the requested coordinates and Nominatim's address; 422 outside the city box (or lat/lng out of range); 404 `No address found for this location`; 429 and 502 as for search
   - `RideResponse`: `id, rider_id, driver_id, pickup_*/dropoff_* (lat, lng, address), status, distance_m, duration_s, fare_estimate, final_fare, created_at, started_at, completed_at`. No `otp`. `RideEventResponse`: `id, from_status, to_status, actor_user_id, created_at`
   - `DriverResponse`: `id, license_number, verification_status, created_at, user (UserResponse), vehicle (id, plate_number, model, color, vehicle_type, or null)`
 - **Ride state machine** (`ALLOWED_TRANSITIONS` and `change_ride_status()` in `services/rides.py`; the only code that sets `ride.status` after creation, apart from `create_ride`, which inserts REQUESTED and writes the first event with `from_status` null):
@@ -95,11 +98,12 @@ Status values: Not started, In progress, Done.
 - **JWT:** HS256, signed with `JWT_SECRET`. Claims: `sub` (user id as string), `role`, `exp` (`ACCESS_TOKEN_EXPIRE_MINUTES`, default 60). `get_current_user` returns 401 + `WWW-Authenticate: Bearer` for a missing, malformed, tampered, or expired token, or a user that no longer exists. `require_role("rider", ...)` returns 403 for other roles.
 - **Admin creation (script only):** `docker compose exec backend python create_admin.py --email ... --name ... --password ...` (prints the id; does nothing if the email exists)
 - **Static files:** `frontend/` is mounted at `/` with `html=True` after the API routes, so `/rider/` serves `rider/index.html` (`/rider` redirects to `/rider/`)
-- **Backend files:** `app/config.py` (settings from env), `app/database.py` (`Base` with constraint naming convention, async engine, `async_session`, `get_db` dependency, Redis client), `app/models.py` (all models), `app/main.py`; `app/schemas.py`, `app/security.py` (argon2 hashing, JWT, `get_current_user`, `require_role`), `app/routers/auth.py`, `app/routers/drivers.py`, `app/routers/admin.py`, `app/services/auth.py`, `app/services/drivers.py`, `app/routers/rides.py`, `app/services/rides.py`, `app/repositories/users.py`, `app/repositories/drivers.py`, `app/repositories/rides.py`, `backend/create_admin.py`, `backend/pytest.ini`, `backend/tests/conftest.py`, `backend/tests/test_rides.py`; `alembic.ini` and `alembic/` (async template; `env.py` takes the URL from settings); `utils/` is still an empty package
-- **Redis keys:** none yet
+- **Backend files:** `app/config.py` (settings from env), `app/database.py` (`Base` with constraint naming convention, async engine, `async_session`, `get_db` dependency, Redis client), `app/models.py` (all models), `app/main.py`; `app/schemas.py`, `app/security.py` (argon2 hashing, JWT, `get_current_user`, `require_role`), `app/routers/auth.py`, `app/routers/drivers.py`, `app/routers/admin.py`, `app/services/auth.py`, `app/services/drivers.py`, `app/routers/rides.py`, `app/services/rides.py`, `app/repositories/users.py`, `app/repositories/drivers.py`, `app/repositories/rides.py`, `app/routers/places.py`, `app/services/places.py`, `app/repositories/places.py`, `backend/create_admin.py`, `backend/pytest.ini`, `backend/tests/conftest.py`, `backend/tests/test_rides.py`; `alembic.ini` and `alembic/` (async template; `env.py` takes the URL from settings); `utils/` is still an empty package
+- **Settings (`.env`, all required, read in `config.py`):** `NOMINATIM_URL`, `NOMINATIM_USER_AGENT`, `CITY_NAME`, `CITY_CENTER_LAT`, `CITY_CENTER_LNG`, `MAP_ZOOM`, `CITY_SOUTH`, `CITY_WEST`, `CITY_NORTH`, `CITY_EAST` (floats except `MAP_ZOOM`). Compose reads `.env` only when a container is created, so run `docker compose up -d` after editing it
+- **Redis keys:** `places:search:<normalized query>` (JSON list of places, TTL 24 h, empty list cached too), `places:reverse:<lat 4 decimals>:<lng 4 decimals>` (JSON `{display_name}`, TTL 24 h), `places:slot` (`SET NX PX 1100`, the 1-request-per-second limiter). Failures (429, 502, 404 no address) are never cached
 - **WebSocket messages:** none yet
-- **Frontend pages** (plain HTML/CSS/ES modules, no libraries; each app is one page with its login form inside; all poll every 3 s):
-  - `/rider/` (`rider.js`): log in or register (role rider, phone sent only if filled). Logged in as another role: "This account is a X. Open /X/ instead." Rider: request form with placeholder coordinates (MG Road to Koramangala, typed by hand until M2.1) calls `POST /rides`. Active ride shows id, status text, addresses, driver id once assigned, and the events timeline; Cancel (with `confirm()`) in REQUESTED / DRIVER_ASSIGNED / DRIVER_ARRIVED. A finished ride stays on screen (fetched once with `GET /rides/{id}` after `/rides/active` turns 404) with a "Request a new ride" button
+- **Frontend pages** (plain HTML/CSS/ES modules, no libraries except Leaflet on the rider page; each app is one page with its login form inside; all poll every 3 s):
+  - `/rider/` (`rider.js`): log in or register (role rider, phone sent only if filled). Logged in as another role: "This account is a X. Open /X/ instead." Rider: after login it fetches `/places/map-config` once and shows a Leaflet 1.9.4 map (OSM tiles, attribution, zoom 10 to 19, locked to the city box). With no ride, the rider picks Pickup and Drop-off by typing a place and pressing Enter or Search (results are buttons; one request per search, none while typing, under 3 characters shows a message with no request), or by clicking the map (the "Next map click sets" radio picks which point; it switches to the empty one automatically). A click outside the city shows a message; a click calls `/places/reverse` and falls back to `lat, lng` (5 decimals) if there is no address. Markers are green (Pickup) and red (Drop-off) circle markers with fixed-text tooltips. Request ride is disabled until both points are set and calls `POST /rides` with those points. With a ride, the form is hidden, the map is view-only with the ride's two markers and fits to them once per ride id (polling never moves the map). Active ride shows id, status text, addresses, driver id once assigned, and the events timeline; Cancel (with `confirm()`) in REQUESTED / DRIVER_ASSIGNED / DRIVER_ARRIVED. A finished ride stays on screen (fetched once with `GET /rides/{id}` after `/rides/active` turns 404) with its markers and a "Request a new ride" button, which clears the selection, inputs, results lists, and markers
   - `/driver/` (`driver.js`): same login/register with role driver. Shows the driver id, then walks profile form, vehicle form, and the verification text (pending / rejected / approved). When approved: "No ride assigned yet." or the ride with buttons by status (arrived, start, complete, cancel) and the same finished-ride behavior
   - `/admin/` (`admin.js`): login only (admins come from `create_admin.py`). Drivers table with status filter, Refresh, Approve and Reject on every row (backend errors show in the message area). Assign form (ride id, driver id) labelled as a temporary stand-in for matching. Minimal on purpose; the real dashboard is M6.2
   - `shared/api.js`: `api(method, path, body)`, `saveSession`, `getSession`, `clearSession`. Session lives in `sessionStorage` under the key `session` (`{token, user}`). Thrown errors carry `.status` and a readable message (`detail`, or `field: message` for a 422). A 401 with a token clears the session and reloads; a 401 without a token (wrong password) just throws. `shared/base.css` is the common stylesheet; each app has one small CSS file
@@ -152,16 +156,31 @@ One line per decision: milestone, what was chosen, what was rejected, why.
 | M1.4 | Minimal admin page (drivers table, approve/reject, assign form) built now | Waiting for M6.2, or using curl | Without it, drivers cannot be approved and rides cannot be assigned in the browser |
 | M1.4 | API data goes into the page with `textContent` or `createElement` only, never `innerHTML` | `innerHTML` templates | Names and addresses are user input (checked with a rider and driver named `<img src=x onerror=alert(1)>`) |
 | M1.4 | `render()` never touches inputs; forms are only reset by their submit handler after a successful login or register | Re-rendering whole sections | Polling re-renders every 3 s and would erase what the user is typing (checked: 10 s of polling keeps a half-filled form) |
-| M1.4 | Ride coordinates are typed by hand (prefilled placeholders) | A map or geocoder | Map and Nominatim arrive in M2.1 |
+| M1.4 | Ride coordinates were typed by hand (prefilled placeholders). Replaced by the map and place search in M2.1 | A map or geocoder | Map and Nominatim arrived in M2.1 |
 | M1.4 | Admin table is only redrawn when its data changed | Redrawing on every poll | A redraw between mouse down and mouse up on Approve would swallow the click |
 | M1.4 | Thrown API errors carry `.status` | Matching on message text | Pages need to tell a 404 (no ride, no profile) from a real failure |
 | M1.4 | No backend change: `main.py` already mounted `frontend/` with `html=True` | Editing the mount | Nothing to fix |
+| M2.1 | Backend proxy for Nominatim: the browser never calls it; the backend sends our User-Agent, caches, and rate-limits | Browser calling Nominatim directly | The public server requires an identifying User-Agent, caching, and 1 request per second, none of which can be enforced from many browsers |
+| M2.1 | Search runs only on Enter or the Search button (one request per search) | Search-as-you-type, autocomplete | The public Nominatim usage policy forbids autocomplete |
+| M2.1 | 1 request per second limiter is a Redis `SET places:slot 1 NX PX 1100`; a busy slot returns 429 with `Retry-After: 1` | Queueing or sleeping until the slot frees | Simple, no request is held open, and the rider just presses Search again. 1100 ms leaves a margin over 1 s. Only uncached calls take the slot |
+| M2.1 | 24-hour cache for search (normalized: trimmed, lowercased, spaces collapsed) and reverse (key = coordinates rounded to 4 decimals, about 11 m). Empty search results are cached; failures and "no address" are not | Shorter or no TTL, caching failures | Addresses rarely change; repeats cost nothing and do not use the limiter. A failure cached for a day would hide a recovered server |
+| M2.1 | Reverse returns the clicked coordinates, not Nominatim's snapped ones, and only the address text is cached | Returning (and caching) the snapped point | The marker must sit where the rider clicked; two clicks 1 m apart share one cache entry but each keep their own coordinates |
+| M2.1 | Search is `bounded=1` to the city viewbox; reverse rejects points outside the box with 422 before any call | Unbounded world-wide search | One city only; saves calls and keeps results usable |
+| M2.1 | City, center, zoom, and bounding box live in `.env` and are served to the frontend through `/places/map-config` | Constants duplicated in JS and Python | One source of truth; changing city is an `.env` edit |
+| M2.1 | `call_nominatim(path, params)` is the one allowed private helper: search and reverse both need the slot check, the request, and the error mapping. It holds the service's only try/except (network failures are legitimate) and a new `httpx.AsyncClient` per call | Inlining it twice; a shared client | Used in two places, calls no other helper. A per-call client is fine at 1 request per second |
+| M2.1 | Markers are `L.circleMarker` with fixed-string tooltips ("Pickup", "Drop-off"); no address or API data is ever passed to Leaflet | Default pin markers with popups showing the address | Leaflet renders tooltip and popup content as HTML, and addresses come from OpenStreetMap and from users. Default pins also need image files from the CDN |
+| M2.1 | Leaflet 1.9.4 from unpkg with SRI hashes (`integrity` + `crossorigin`), script before the module script | Unpinned CDN, a vendored copy, npm | Pinned and verified, with no build step. The leafletjs.com quick-start page now documents 2.0 alpha and no longer lists the 1.9.4 hashes, so the hashes come from Leaflet's docs at the "Update docs release 1.9.4" commit (`7c0f675`) and equal what we computed from the files on unpkg and jsdelivr |
+| M2.1 | The map is created the first time its section is visible, then `invalidateSize()` once; markers are created, moved, and removed in `render()` by comparing against the wanted points; fit-to-ride happens once per ride id | Creating the map at page load, fitting on every poll | Leaflet cannot size a hidden container. Polling must never move the map or the rider's view |
+| M2.1 | Search results are rebuilt only when their state object changes (identity check); search inputs and the radio are written by event handlers, never by `render()` | Rebuilding results on every poll | Same lesson as the M1.4 admin table: a redraw between mouse down and mouse up swallows the click, and polling must not wipe typing |
+| M2.1 | The ride request sends the address stored with the chosen point (cut to 255 characters), not whatever is typed in the input afterwards | Sending the input text | The input may hold a half-typed new search; Nominatim `display_name` can exceed the 255-character limit on `POST /rides` |
+| M2.1 | No automated tests for the places code or the page | Mocked Nominatim tests | Per the working agreement (tests are for state machine, matching, concurrency, payments). Verified by hand with curl and a Playwright click-through kept outside the repo |
 | M0.1 | Pinned: fastapi 0.142.4, uvicorn 0.54.0, sqlalchemy 2.1.4, asyncpg 0.32.0, redis 8.1.0, pydantic-settings 2.15.0 (M0.2 added alembic 1.20.0) | Unpinned | Current stable at 2026-10-08 |
 
 ## Bugs hit
 
 One entry per notable bug: milestone, symptom, root cause, fix.
 
+- **M2.1:** no bug in the app code. Two things worth knowing: (1) the leafletjs.com quick-start page no longer shows Leaflet 1.9.4 (it documents 2.0 alpha), so the integrity hashes could not be copied from it; they were checked against Leaflet's docs at the 1.9.4 release commit instead (see the decisions log). (2) The click-through script first failed on its own checks: Leaflet snaps the map center to whole pixels (about 1e-5 degrees off) and a third zoom-out click hits the disabled button at min zoom 10. Both were test mistakes, not app bugs.
 - **M1.4:** none in the frontend. The browser click-through passed on its first full run. Expect red 404 lines in the browser console while polling: they are `/rides/active` and `/drivers/me` answering "nothing yet", which the pages treat as normal.
 - **M1.3:** the first version of the 49-pair transition test used the app's own `ALLOWED_TRANSITIONS` as the expected answer, so a deliberate wrong change to the dict (REQUESTED to COMPLETED) still passed all 69 tests. The mutation check caught it. Fix: the test now has its own hand-written list of legal pairs. Also: `pytest` could not import `app` until `pythonpath = .` was added to `pytest.ini`.
 - **M1.2:** none. Note for later: a failed insert (lost race) still consumes an id from the sequence, so ids are not gapless (a race test skipped driver id 4).
@@ -177,12 +196,19 @@ One entry per notable bug: milestone, symptom, root cause, fix.
 - OTP is not checked on `/start` until M3.5.
 - Decide whether to keep `POST /admin/rides/{id}/assign` after matching exists (M2.4).
 - A driver who is cancelled out of a ride stays on `rides.driver_id` (the history keeps who was assigned), so that driver still gets 409, not 404, on further actions for that ride.
-- Dev database contains leftover rides, users, and drivers from the M1.3 and M1.4 manual checks (curl walkthrough and browser click-through).
-- JWT in `sessionStorage` is readable by any script on the page. Acceptable for a learning project because no third-party scripts are loaded (Leaflet is the only one planned, in M2.1).
+- Dev database contains leftover rides, users, and drivers from the M1.3, M1.4, and M2.1 manual checks (curl walkthrough and browser click-throughs; M2.1 left an admin `m21admin@example.com`, several `m21*` riders and drivers, and a few rides). Dev Redis holds cached places for a day.
+- JWT in `sessionStorage` is readable by any script on the page. Acceptable for a learning project: Leaflet is the only third-party script, loaded from unpkg at a pinned version with an SRI hash (M2.1).
 - The admin assign page: remove it or keep it after M2.4 matching exists.
 - The admin page cannot list rides, so assigning needs the ride id and driver id copied by hand from the other tabs.
 - The pages poll, so a status change can take up to 3 s to appear. A failed poll leaves its error message up until the next button press. WebSockets replace polling in M3.
 - The M1.4 browser click-through lives only as a throwaway script outside the repo (no automated frontend tests, by decision). Rerun it by hand with the 12-step list if the pages change a lot.
+- The public OSM tile and Nominatim servers are for light use only. The M2.5 simulator and the M7.2 load test must never call them: use OSRM and fixed coordinates.
+- `POST /rides` does not check that pickup and drop-off are inside the city box (only the map UI does). Handle it in M2.2 together with routing.
+- `CITY_*` in `.env` are Bengaluru placeholders and must match the OSRM map extract chosen in M2.2. Set `NOMINATIM_USER_AGENT` to your own contact email (the default text still says "replace with your contact email").
+- `places` makes a new `httpx.AsyncClient` per uncached call. Fine at 1 request per second; share one client if this grows.
+- The "no address" 404 path was not seen against the real Nominatim: Bengaluru has no open water, and a lake centre still resolved to a nearby building. It is verified against a local stub that returns `{"error": ...}`.
+- The busy (429) message was seen in the browser from the real limiter once, right after a reverse call; it depends on timing, so a faster or slower network can miss the 1.1 s window.
+- The page has no automated frontend tests. The M2.1 Playwright script lives outside the repo (scratchpad) and uses mocks for the failure paths.
 - Swagger Authorize has not been clicked through in a browser in M1.1 or M1.2 (no browser tool). `/docs` serves 200 and the OpenAPI schema declares `HTTPBearer` on `/auth/me` and on all six M1.2 routes and all nine M1.3 routes (`/docs` served 200 in M1.3).
 
 ## How to run and test
@@ -220,10 +246,17 @@ curl -X POST localhost:8000/rides/1/cancel   -H "Authorization: Bearer $RIDER"
 curl localhost:8000/rides/active -H "Authorization: Bearer $RIDER"
 curl localhost:8000/rides/1/events -H "Authorization: Bearer $RIDER"
 
-# frontend (M1.4): open each in its own tab; every tab keeps its own login
+# places (M2.1): needs NOMINATIM_USER_AGENT with your contact email and the CITY_* values in .env, then `docker compose up -d`
+# Never script or loop these: the public Nominatim server allows 1 request per second and light use only
+curl localhost:8000/places/map-config -H "Authorization: Bearer $RIDER"
+curl "localhost:8000/places/search?q=mg%20road" -H "Authorization: Bearer $RIDER"
+curl "localhost:8000/places/reverse?lat=12.9757&lng=77.6063" -H "Authorization: Bearer $RIDER"
+docker compose exec redis redis-cli keys 'places:*'
+
+# frontend (M1.4, map added in M2.1): open each in its own tab; every tab keeps its own login
 #   http://localhost:8000/admin/    (log in with an admin made by create_admin.py)
 #   http://localhost:8000/driver/   (register, profile, vehicle, wait for approval)
-#   http://localhost:8000/rider/    (register, request a ride; the admin assigns it by hand)
+#   http://localhost:8000/rider/    (register, pick two points on the map or by search, request a ride; the admin assigns it by hand)
 
 # auth (M1.1)
 docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
@@ -239,4 +272,4 @@ After changing `requirements.txt`, rebuild: `docker compose up -d --build backen
 
 Run `alembic revision` with `--user $(id -u):$(id -g)` so the new file on the host is not owned by root. Review every autogenerated migration by hand; a "check" autogenerate right after `upgrade head` should be empty.
 
-Automated tests exist for the ride state machine (M1.3). M1.1 and M1.2 were verified by hand with curl and psql. M1.4 was verified with curl for every call the pages make, and with a headless Chrome click-through of the full flow in three tabs.
+Automated tests exist for the ride state machine (M1.3). M1.1 and M1.2 were verified by hand with curl and psql. M1.4 was verified with curl for every call the pages make, and with a headless Chrome click-through of the full flow in three tabs. M2.1 was verified with curl (auth, validation, caching, limiter, failure paths, about 9 real Nominatim calls in total) and a headless Chrome (Playwright) click-through of the rider page covering search, map clicks, markers, fit-to-ride, polling not moving the map or wiping typing, the full ride, the XSS address, and phone width.

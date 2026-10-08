@@ -74,6 +74,7 @@ uber-clone/
 │   │   │   ├── drivers.py
 │   │   │   ├── rides.py
 │   │   │   ├── payments.py
+│   │   │   ├── places.py
 │   │   │   ├── admin.py
 │   │   │   └── websocket.py
 │   │   ├── services/          # business logic
@@ -82,12 +83,14 @@ uber-clone/
 │   │   │   ├── rides.py       # ride lifecycle and state machine
 │   │   │   ├── matching.py
 │   │   │   ├── pricing.py     # fare estimate, final fare, surge
-│   │   │   └── payments.py
+│   │   │   ├── payments.py
+│   │   │   └── places.py      # Nominatim search/reverse proxy, map config
 │   │   ├── repositories/      # all database and Redis access
 │   │   │   ├── users.py
 │   │   │   ├── drivers.py     # includes driver locations in Redis GEO
 │   │   │   ├── rides.py
 │   │   │   ├── payments.py
+│   │   │   ├── places.py      # Redis cache and rate-limit slot for Nominatim
 │   │   │   └── ratings.py
 │   │   └── utils/             # small generic pure functions (geo.py, money.py, ...)
 │   └── tests/

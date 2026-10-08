@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rider</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <link rel="stylesheet" href="/shared/base.css">
   <link rel="stylesheet" href="rider.css">
 </head>
@@ -47,26 +48,39 @@
       <p id="wrong-role-text"></p>
     </section>
 
+    <section id="map-section" hidden>
+      <div id="map"></div>
+    </section>
+
     <section id="request-section" hidden>
       <h2>Request a ride</h2>
-      <p class="note">These coordinates are placeholders until the map arrives in M2.1. Edit them by hand if you like.</p>
-      <form id="request-form">
-        <label for="pickup-address">Pickup address</label>
-        <input id="pickup-address" name="pickup_address" type="text" maxlength="255" value="MG Road, Bengaluru" required>
-        <label for="pickup-lat">Pickup latitude</label>
-        <input id="pickup-lat" name="pickup_lat" type="number" step="any" min="-90" max="90" value="12.9757" required>
-        <label for="pickup-lng">Pickup longitude</label>
-        <input id="pickup-lng" name="pickup_lng" type="number" step="any" min="-180" max="180" value="77.6063" required>
+      <p class="note">Search for a place and press Enter, or click the map.</p>
 
-        <label for="dropoff-address">Drop-off address</label>
-        <input id="dropoff-address" name="dropoff_address" type="text" maxlength="255" value="Koramangala, Bengaluru" required>
-        <label for="dropoff-lat">Drop-off latitude</label>
-        <input id="dropoff-lat" name="dropoff_lat" type="number" step="any" min="-90" max="90" value="12.9352" required>
-        <label for="dropoff-lng">Drop-off longitude</label>
-        <input id="dropoff-lng" name="dropoff_lng" type="number" step="any" min="-180" max="180" value="77.6245" required>
-
-        <button type="submit">Request ride</button>
+      <form id="pickup-form" class="search-form">
+        <label for="pickup-input">Pickup</label>
+        <div class="search-row">
+          <input id="pickup-input" type="text" maxlength="200" autocomplete="off">
+          <button type="submit">Search</button>
+        </div>
+        <ul id="pickup-results" class="results"></ul>
       </form>
+
+      <form id="dropoff-form" class="search-form">
+        <label for="dropoff-input">Drop-off</label>
+        <div class="search-row">
+          <input id="dropoff-input" type="text" maxlength="200" autocomplete="off">
+          <button type="submit">Search</button>
+        </div>
+        <ul id="dropoff-results" class="results"></ul>
+      </form>
+
+      <fieldset>
+        <legend>Next map click sets:</legend>
+        <label class="radio"><input type="radio" name="pick" value="pickup" checked> Pickup</label>
+        <label class="radio"><input type="radio" name="pick" value="dropoff"> Drop-off</label>
+      </fieldset>
+
+      <button id="request-button" type="button" disabled>Request ride</button>
     </section>
 
     <section id="ride-section" hidden>
@@ -101,6 +115,8 @@
     </section>
   </main>
 
+  <!-- Before the module script, so L is defined when rider.js runs. -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script type="module" src="rider.js"></script>
 </body>
 </html>

@@ -12,6 +12,16 @@ class Settings(BaseSettings):
     jwt_secret: str
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+    nominatim_url: str
+    nominatim_user_agent: str
+    city_name: str
+    city_center_lat: float
+    city_center_lng: float
+    map_zoom: int
+    city_south: float
+    city_west: float
+    city_north: float
+    city_east: float
 
     @property
     def postgres_url(self) -> str:

@@ -9,3 +9,68 @@ dd {
 #cancel-button {
   background: #b42318;
 }
+
+#map {
+  height: 55vh;
+  min-height: 280px;
+  border-radius: 0.25rem;
+}
+
+#map-section {
+  padding: 0.5rem;
+}
+
+.search-form button {
+  margin-top: 0;
+}
+
+.search-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.results {
+  margin: 0.25rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.results li {
+  margin-bottom: 0.25rem;
+}
+
+.results .note {
+  margin: 0;
+}
+
+.results button {
+  width: 100%;
+  margin: 0;
+  color: inherit;
+  text-align: left;
+  background: #fff;
+  border: 1px solid #aab0b8;
+}
+
+fieldset {
+  margin: 0.75rem 0 0;
+  padding: 0.25rem 0.75rem 0.75rem;
+  border: 1px solid #d0d4d9;
+  border-radius: 0.25rem;
+}
+
+input[type="radio"] {
+  width: auto;
+}
+
+.radio {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+  margin-right: 1rem;
+  font-weight: normal;
+}
+
+#request-button {
+  margin-top: 1rem;
+}

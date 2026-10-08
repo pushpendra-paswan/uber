@@ -123,3 +123,20 @@ class RideEventResponse(BaseModel):
 
 class AssignDriverRequest(BaseModel):
     driver_id: int
+
+
+class MapConfigResponse(BaseModel):
+    city_name: str
+    center_lat: float
+    center_lng: float
+    zoom: int
+    south: float
+    west: float
+    north: float
+    east: float
+
+
+class PlaceResponse(BaseModel):
+    display_name: str
+    lat: float
+    lng: float

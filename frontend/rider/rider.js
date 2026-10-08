@@ -12,6 +12,16 @@ const STATUS_TEXT = {
 const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const POLL_MS = 3000;
+const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const MAX_ZOOM = 19;
+const MIN_ZOOM = 10;
+const PLACE_ZOOM = 16;
+const ADDRESS_MAX_LENGTH = 255; // the limit on pickup_address and dropoff_address in POST /rides
+const KINDS = ["pickup", "dropoff"];
+// Leaflet renders tooltips as HTML, so they only ever get these fixed strings, never an address.
+const MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
+const MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
 
 const session = getSession();
 const state = {
@@ -20,10 +30,17 @@ const state = {
   ride: null,
   rideId: null, // remembered so a finished ride can still be shown after /rides/active returns 404
   events: [],
+  config: null, // from GET /places/map-config
+  points: { pickup: null, dropoff: null }, // each {lat, lng, address} once chosen
+  results: { pickup: null, dropoff: null }, // each {items, notice}; a new object every time it changes
+  map: null,
+  markers: { pickup: null, dropoff: null },
+  fittedRideId: null, // the map is fitted to a ride's markers once, never on every poll
   error: "",
   busy: false,
 };
 let refreshing = false;
+const shownResults = { pickup: null, dropoff: null }; // which results object is in the DOM, so polling does not rebuild it
 
 const message = document.getElementById("message");
 const userBar = document.getElementById("user-bar");
@@ -34,8 +51,13 @@ const loginForm = document.getElementById("login-form");
 const registerForm = document.getElementById("register-form");
 const wrongRoleSection = document.getElementById("wrong-role-section");
 const wrongRoleText = document.getElementById("wrong-role-text");
+const mapSection = document.getElementById("map-section");
 const requestSection = document.getElementById("request-section");
-const requestForm = document.getElementById("request-form");
+const forms = { pickup: document.getElementById("pickup-form"), dropoff: document.getElementById("dropoff-form") };
+const inputs = { pickup: document.getElementById("pickup-input"), dropoff: document.getElementById("dropoff-input") };
+const resultLists = { pickup: document.getElementById("pickup-results"), dropoff: document.getElementById("dropoff-results") };
+const pickRadios = { pickup: document.querySelector('input[name="pick"][value="pickup"]'), dropoff: document.querySelector('input[name="pick"][value="dropoff"]') };
+const requestButton = document.getElementById("request-button");
 const rideSection = document.getElementById("ride-section");
 const rideId = document.getElementById("ride-id");
 const rideStatus = document.getElementById("ride-status");
@@ -57,6 +79,7 @@ async function login(email, password) {
 async function refresh() {
   if (!state.user || state.user.role !== "rider") return;
   try {
+    if (state.config === null) state.config = await api("GET", "/places/map-config");
     const active = await api("GET", "/rides/active").catch((err) => {
       if (err.status === 404) return null;
       throw err;
@@ -89,11 +112,39 @@ async function act(fn) {
   render();
 }
 
-// Never touches form inputs, because polling calls this every few seconds while the user types.
+// Used by a search result click and a map click. Writing the input here, not in render(), keeps polling away from the user's typing.
+function setPoint(kind, lat, lng, address) {
+  const other = kind === "pickup" ? "dropoff" : "pickup";
+  state.points[kind] = { lat, lng, address: address.slice(0, ADDRESS_MAX_LENGTH) };
+  inputs[kind].value = state.points[kind].address;
+  state.results[kind] = null;
+  if (state.points[other] === null) pickRadios[other].checked = true;
+}
+
+function onMapClick(event) {
+  if (state.ride !== null || state.busy) return; // view-only with a ride, and one click at a time
+  act(async () => {
+    const { lat, lng } = event.latlng;
+    const c = state.config;
+    if (lat < c.south || lat > c.north || lng < c.west || lng > c.east) {
+      state.error = `That location is outside ${c.city_name}`;
+      return;
+    }
+    const kind = document.querySelector('input[name="pick"]:checked').value;
+    const place = await api("GET", `/places/reverse?lat=${lat}&lng=${lng}`).catch((err) => {
+      if (err.status === 404) return null;
+      throw err;
+    });
+    setPoint(kind, lat, lng, place ? place.display_name : `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
+  });
+}
+
+// Never touches the search inputs, because polling calls this every few seconds while the user types.
 function render() {
   const loggedIn = state.user !== null;
   const isRider = loggedIn && state.user.role === "rider";
   const showRide = isRider && state.ride !== null;
+  const showMap = isRider && state.loaded && state.config !== null;
 
   message.hidden = state.error === "";
   message.textContent = state.error;
@@ -106,6 +157,90 @@ function render() {
 
   requestSection.hidden = !isRider || !state.loaded || showRide;
   rideSection.hidden = !showRide;
+  mapSection.hidden = !showMap;
+
+  if (showMap) {
+    const c = state.config;
+    // Created the first time the section is visible: Leaflet cannot measure a hidden container.
+    if (state.map === null) {
+      state.map = L.map("map", {
+        center: [c.center_lat, c.center_lng],
+        zoom: c.zoom,
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+        maxBounds: [[c.south, c.west], [c.north, c.east]],
+        maxBoundsViscosity: 1.0,
+      });
+      L.tileLayer(TILE_URL, { attribution: ATTRIBUTION, maxZoom: MAX_ZOOM }).addTo(state.map);
+      state.map.on("click", onMapClick);
+      state.map.invalidateSize();
+    }
+
+    // The ride's points when a ride exists, otherwise the rider's selection.
+    const wanted = state.ride
+      ? {
+          pickup: { lat: state.ride.pickup_lat, lng: state.ride.pickup_lng },
+          dropoff: { lat: state.ride.dropoff_lat, lng: state.ride.dropoff_lng },
+        }
+      : state.points;
+    for (const kind of KINDS) {
+      const point = wanted[kind];
+      const marker = state.markers[kind];
+      if (point === null && marker !== null) {
+        marker.remove();
+        state.markers[kind] = null;
+      } else if (point !== null && marker === null) {
+        state.markers[kind] = L.circleMarker([point.lat, point.lng], {
+          radius: 9,
+          color: MARKER_COLOR[kind],
+          fillColor: MARKER_COLOR[kind],
+          fillOpacity: 1,
+        })
+          .bindTooltip(MARKER_LABEL[kind], { permanent: true, direction: "top", offset: [0, -9] })
+          .addTo(state.map);
+      } else if (point !== null && (marker.getLatLng().lat !== point.lat || marker.getLatLng().lng !== point.lng)) {
+        marker.setLatLng([point.lat, point.lng]);
+      }
+    }
+
+    if (state.ride && state.fittedRideId !== state.ride.id) {
+      state.map.fitBounds(
+        [[state.ride.pickup_lat, state.ride.pickup_lng], [state.ride.dropoff_lat, state.ride.dropoff_lng]],
+        { padding: [40, 40] }
+      );
+      state.fittedRideId = state.ride.id;
+    }
+  }
+
+  for (const kind of KINDS) {
+    const result = state.results[kind];
+    if (result === shownResults[kind]) continue; // unchanged: rebuilding would swallow a click made during a poll
+    shownResults[kind] = result;
+    const rows = [];
+    if (result !== null) {
+      if (result.notice !== "") {
+        const row = document.createElement("li");
+        row.className = "note";
+        row.textContent = result.notice;
+        rows.push(row);
+      }
+      for (const place of result.items) {
+        const row = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = place.display_name;
+        button.addEventListener("click", () =>
+          act(async () => {
+            setPoint(kind, place.lat, place.lng, place.display_name);
+            state.map.setView([place.lat, place.lng], PLACE_ZOOM);
+          })
+        );
+        row.append(button);
+        rows.push(row);
+      }
+    }
+    resultLists[kind].replaceChildren(...rows);
+  }
 
   if (showRide) {
     rideId.textContent = state.ride.id;
@@ -131,6 +266,7 @@ function render() {
   }
 
   for (const button of document.querySelectorAll("button")) button.disabled = state.busy;
+  requestButton.disabled = state.busy || state.points.pickup === null || state.points.dropoff === null;
 }
 
 loginForm.addEventListener("submit", (event) => {
@@ -160,17 +296,32 @@ logoutButton.addEventListener("click", () => {
   location.reload();
 });
 
-requestForm.addEventListener("submit", (event) => {
-  event.preventDefault();
-  const form = new FormData(requestForm);
+// Pressing Enter in an input submits its form, so Enter and the Search button do the same thing.
+for (const kind of KINDS) {
+  forms[kind].addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = inputs[kind].value.trim();
+    act(async () => {
+      if (query.length < 3) {
+        state.results[kind] = { items: [], notice: "Type at least 3 characters to search" };
+        return;
+      }
+      const items = await api("GET", `/places/search?q=${encodeURIComponent(query)}`);
+      state.results[kind] = { items, notice: items.length === 0 ? `No places found in ${state.config.city_name}` : "" };
+    });
+  });
+}
+
+requestButton.addEventListener("click", () => {
+  const { pickup, dropoff } = state.points;
   act(() =>
     api("POST", "/rides", {
-      pickup_address: form.get("pickup_address"),
-      pickup_lat: Number(form.get("pickup_lat")),
-      pickup_lng: Number(form.get("pickup_lng")),
-      dropoff_address: form.get("dropoff_address"),
-      dropoff_lat: Number(form.get("dropoff_lat")),
-      dropoff_lng: Number(form.get("dropoff_lng")),
+      pickup_address: pickup.address,
+      pickup_lat: pickup.lat,
+      pickup_lng: pickup.lng,
+      dropoff_address: dropoff.address,
+      dropoff_lat: dropoff.lat,
+      dropoff_lng: dropoff.lng,
     })
   );
 });
@@ -184,6 +335,10 @@ newRideButton.addEventListener("click", () => {
     state.ride = null;
     state.rideId = null;
     state.events = [];
+    state.points = { pickup: null, dropoff: null };
+    state.results = { pickup: null, dropoff: null };
+    for (const kind of KINDS) inputs[kind].value = "";
+    pickRadios.pickup.checked = true;
   });
 });
 
