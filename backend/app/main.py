@@ -1,3 +1,7 @@
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -5,9 +9,22 @@ from redis.exceptions import RedisError
 from sqlalchemy import text
 
 from app.database import engine, redis_client
-from app.routers import admin, auth, drivers, places, rides
+from app.routers import admin, auth, drivers, places, rides, websocket
 
-app = FastAPI(title="Uber Clone")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    # Starts even when Redis is down: the listener keeps retrying in the background.
+    listener = asyncio.create_task(websocket.listen_for_events())
+    yield
+    listener.cancel()
+    try:
+        await listener
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Uber Clone", lifespan=lifespan)
 
 
 @app.exception_handler(RedisError)
@@ -41,6 +58,7 @@ app.include_router(drivers.router)
 app.include_router(admin.router)
 app.include_router(rides.router)
 app.include_router(places.router)
+app.include_router(websocket.router)
 
 # Mounted last so it does not shadow the API routes above.
 app.mount("/", StaticFiles(directory="/frontend", html=True), name="frontend")

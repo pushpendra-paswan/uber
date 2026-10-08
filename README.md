@@ -118,6 +118,49 @@ docker compose exec redis redis-cli ZCARD drivers:geo
 
 The driver id is shown at the top of the driver page. The GEO set can keep a stale member after the presence key expires; the presence key is what says whether a driver is online.
 
+## WebSockets (M3.1)
+
+The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes events to logged-in users. Nothing in the app uses it yet: the pages and the simulator still poll. Driver locations (M3.2) and ride offers (M3.3) are sent on top of it.
+
+**Flow:** connect, then send the token as the FIRST message (never in the URL). If it is valid, the server answers `auth_ok`. Every message, in both directions, is a JSON text frame `{"type": "<string>", "data": {...}}`.
+
+| Direction | type | data | Meaning |
+|---|---|---|---|
+| client to server | `auth` | `{token}` | First message, within 5 seconds |
+| client to server | `ping` | `{}` | Answered with `pong` |
+| server to client | `auth_ok` | `{user_id, role}` | Authenticated |
+| server to client | `pong` | `{}` | Reply to `ping` |
+| server to client | `error` | `{detail}` | Unknown message type (the socket stays open) |
+| server to client | anything else | anything | An event published for this user. `auth_ok`, `pong`, and `error` are reserved |
+
+| Close code | Meaning |
+|---|---|
+| 4400 | Bad message after auth (not a text frame, not a JSON object, or no string `type`) |
+| 4401 | Unauthorized (bad first message, or an invalid, expired, or unknown-user token) |
+| 4408 | No auth message within 5 seconds |
+| 4409 | Replaced by a newer connection (a user keeps at most 5 sockets; the oldest is closed) |
+
+Frames larger than 64 KB are rejected by the server (`--ws-max-size 65536`, close code 1009). Events are lost if the user is not connected at that moment; the REST API stays the source of truth.
+
+Try it with redis-cli and the browser console (log in on /rider/ first):
+
+```js
+// in the DevTools console; the token is in sessionStorage under "session"
+token = JSON.parse(sessionStorage.getItem("session")).token
+ws = new WebSocket("ws://localhost:8000/ws")
+ws.onmessage = e => console.log(e.data)
+ws.onclose = e => console.log("closed", e.code, e.reason)
+ws.onopen = () => ws.send(JSON.stringify({type: "auth", data: {token}}))
+// the console prints auth_ok with your user id and role
+```
+
+```bash
+# send an event to user 5 from a terminal (the channel name ends with the Redis database index, 0 for dev)
+docker compose exec redis redis-cli PUBLISH ws:events:0 '{"user_id": 5, "type": "test", "data": {"hello": "world"}}'
+```
+
+The reply is the number of backend processes listening (1 in dev). Backend code sends events with `repositories/events.publish(user_id, type, data)`.
+
 ## Run the tests
 
 ```bash

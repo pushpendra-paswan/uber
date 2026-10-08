@@ -89,6 +89,7 @@ uber-clone/
 │   │   ├── repositories/      # all database and Redis access
 │   │   │   ├── users.py
 │   │   │   ├── drivers.py     # includes driver locations in Redis GEO
+│   │   │   ├── events.py      # WebSocket events: Redis pub/sub publish and subscribe
 │   │   │   ├── rides.py
 │   │   │   ├── payments.py
 │   │   │   ├── places.py      # Redis cache and rate-limit slot for Nominatim
@@ -123,6 +124,8 @@ Example: `POST /rides` → `routers/rides.py` validates the body and the rider r
 
 Services raise `HTTPException` directly. No custom exception hierarchy.
 
+**WebSockets:** the WebSocket router owns the socket registry (a module-level dict) and the Redis listener task. It may open its own short database session for authentication only, never a request-scoped one (`Depends(get_db)` would hold a Postgres connection for as long as the socket stays open). Services send events to users by calling `repositories/events.publish` directly; there is no service wrapper.
+
 ## Coding style
 
 The code in this project is **simple and plain**. A beginner should be able to read any file top to bottom and follow it. The layers above are the only structure; do not add more.
@@ -145,7 +148,7 @@ The code in this project is **simple and plain**. A beginner should be able to r
 ### Allowed shared functions (used in many places)
 
 - `ALLOWED_TRANSITIONS` dict and one `change_ride_status()` function in `services/rides.py`. Every ride status change goes through it, and it writes to `ride_events`.
-- `get_current_user` and role-check dependencies in `security.py`.
+- `get_current_user` and role-check dependencies in `security.py`, and `user_from_token` (the one place a JWT becomes a user, shared by HTTP and WebSocket auth).
 - `api.js` in `frontend/shared/`, since all three frontends call the backend.
 
 ### Backend conventions

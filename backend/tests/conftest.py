@@ -1,9 +1,15 @@
+import asyncio
+import contextlib
 import os
+import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
+import jwt
 import pytest
 import pytest_asyncio
+import uvicorn
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -13,10 +19,12 @@ from sqlalchemy.pool import NullPool
 TEST_REDIS_DB = 1
 os.environ["REDIS_DB"] = str(TEST_REDIS_DB)
 
+from app import database  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.database import Base, get_db, redis_client  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Driver, PricingRule, Ride, RideStatus, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
+from app.routers import websocket as websocket_router  # noqa: E402
 from app.security import create_access_token  # noqa: E402
 from app.services import routing  # noqa: E402
 
@@ -170,3 +178,76 @@ async def insert_ride(db: AsyncSession):
         return ride
 
     return create
+
+
+@pytest.fixture
+def expired_token():
+    """Returns a function that makes a correctly signed token for a user that expired a minute ago."""
+
+    def make(user: User) -> str:
+        claims = {"sub": str(user.id), "role": user.role.value, "exp": datetime.now(timezone.utc) - timedelta(minutes=1)}
+        return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+    return make
+
+
+@pytest.fixture
+def tampered_token():
+    """Returns a function that makes a valid token and then changes the first character of its signature."""
+
+    def make(user: User) -> str:
+        header, payload, signature = create_access_token(user).split(".")
+        return ".".join([header, payload, ("A" if signature[0] != "A" else "B") + signature[1:]])
+
+    return make
+
+
+class QuietServer(uvicorn.Server):
+    # uvicorn would install its own SIGINT/SIGTERM handlers and break Ctrl+C for pytest.
+    @contextlib.contextmanager
+    def capture_signals(self):
+        yield
+
+
+# Written out by hand, not imported from the app, so a wrong change to the channel name fails the tests.
+TEST_CHANNEL = f"ws:events:{TEST_REDIS_DB}"
+
+
+async def wait_for_subscribers(count: int) -> None:
+    """Waits until `count` pub/sub clients are subscribed to the test channel."""
+    deadline = time.monotonic() + 5
+    while (await redis_client.pubsub_numsub(TEST_CHANNEL))[0][1] != count:
+        assert time.monotonic() < deadline, f"expected {count} subscriber(s) on {TEST_CHANNEL}"
+        await asyncio.sleep(0.02)
+
+
+@pytest_asyncio.fixture
+async def live_server(test_engine, monkeypatch):
+    """The real app under uvicorn on a free port in the test's own event loop. Returns its ws:// URL.
+
+    httpx cannot speak WebSocket, and Starlette's TestClient runs the app in another thread and loop,
+    which clashes with asyncpg and the Redis client.
+    """
+    # The socket authenticates against the _test database, not dev data.
+    monkeypatch.setattr(database, "async_session", async_sessionmaker(test_engine, expire_on_commit=False))
+    assert websocket_router.connections == {}
+
+    server = QuietServer(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", ws_max_size=65536))
+    task = asyncio.create_task(server.serve())
+    while not server.started:
+        assert not task.done(), "the test server stopped while starting"
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    await wait_for_subscribers(1)
+
+    yield f"ws://127.0.0.1:{port}/ws"
+
+    server.should_exit = True
+    await task
+    await wait_for_subscribers(0)
+
+
+@pytest.fixture
+def wait_for_listener():
+    """Returns the function that waits until `count` pub/sub clients are subscribed to the test channel."""
+    return wait_for_subscribers

@@ -34,7 +34,22 @@ def create_access_token(user: User) -> str:
     return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
-# Exception to the layering rule: a dependency with no business rule may call the repository directly.
+# Exception to the layering rule: auth code with no business rule may call the repository directly.
+# Shared by HTTP (get_current_user) and the WebSocket router. Returns None for any problem with the token.
+async def user_from_token(db: AsyncSession, token: str) -> User | None:
+    try:
+        claims = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[settings.jwt_algorithm],
+            options={"require": ["sub", "exp"]},
+        )
+        user_id = int(claims["sub"])
+    except (jwt.InvalidTokenError, ValueError):
+        return None
+    return await users_repo.get_by_id(db, user_id)
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
@@ -44,17 +59,7 @@ async def get_current_user(
     )
     if credentials is None:
         raise unauthorized
-    try:
-        claims = jwt.decode(
-            credentials.credentials,
-            settings.jwt_secret,
-            algorithms=[settings.jwt_algorithm],
-            options={"require": ["sub", "exp"]},
-        )
-        user_id = int(claims["sub"])
-    except (jwt.InvalidTokenError, ValueError):
-        raise unauthorized
-    user = await users_repo.get_by_id(db, user_id)
+    user = await user_from_token(db, credentials.credentials)
     if user is None:
         raise unauthorized
     return user
