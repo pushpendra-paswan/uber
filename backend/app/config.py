@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60
     nominatim_url: str
     nominatim_user_agent: str
+    osrm_url: str
     city_name: str
     city_center_lat: float
     city_center_lng: float

@@ -5,15 +5,17 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from app.config import settings
 from app.models import Ride, RideEvent, RideStatus
 from app.services.rides import change_ride_status
 
+# Both points are derived from the configured city, so they are inside it whichever city .env names.
 RIDE_BODY = {
-    "pickup_lat": 12.9716,
-    "pickup_lng": 77.5946,
+    "pickup_lat": settings.city_center_lat,
+    "pickup_lng": settings.city_center_lng,
     "pickup_address": "MG Road",
-    "dropoff_lat": 12.9352,
-    "dropoff_lng": 77.6245,
+    "dropoff_lat": (settings.city_center_lat + settings.city_south) / 2,
+    "dropoff_lng": (settings.city_center_lng + settings.city_east) / 2,
     "dropoff_address": "Koramangala",
 }
 

@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from app.config import settings
 from app.repositories import places as places_repo
 from app.schemas import MapConfigResponse, PlaceResponse
+from app.utils.geo import is_inside_bounds
 
 CACHE_TTL_SECONDS = 86400
 RESULT_LIMIT = 5
@@ -73,7 +74,7 @@ async def search(query: str) -> list[PlaceResponse]:
 
 
 async def reverse(lat: float, lng: float) -> PlaceResponse:
-    if not (settings.city_south <= lat <= settings.city_north and settings.city_west <= lng <= settings.city_east):
+    if not is_inside_bounds(lat, lng, settings.city_south, settings.city_west, settings.city_north, settings.city_east):
         raise HTTPException(status_code=422, detail="Location is outside the service area")
 
     # 4 decimals is about 11 m, so clicks next to each other share one cache entry.

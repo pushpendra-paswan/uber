@@ -3,10 +3,15 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models import Ride, RideEvent, RideStatus, User, UserRole, VerificationStatus
 from app.repositories import drivers as drivers_repo
 from app.repositories import rides as rides_repo
-from app.schemas import RideCreate
+from app.schemas import EstimateRequest, RideCreate
+from app.services import pricing, routing
+from app.utils.geo import is_inside_bounds
+
+MIN_TRIP_DISTANCE_M = 200
 
 ALLOWED_TRANSITIONS = {
     RideStatus.REQUESTED: {RideStatus.DRIVER_ASSIGNED, RideStatus.CANCELLED, RideStatus.NO_DRIVER_FOUND},
@@ -33,12 +38,31 @@ async def change_ride_status(db: AsyncSession, ride: Ride, new_status: RideStatu
     await rides_repo.add_event(db, ride.id, old_status, new_status, actor_user_id)
 
 
+async def estimate_ride(db: AsyncSession, data: EstimateRequest) -> dict:
+    bounds = (settings.city_south, settings.city_west, settings.city_north, settings.city_east)
+    if not is_inside_bounds(data.pickup_lat, data.pickup_lng, *bounds):
+        raise HTTPException(status_code=422, detail="Pickup is outside the service area")
+    if not is_inside_bounds(data.dropoff_lat, data.dropoff_lng, *bounds):
+        raise HTTPException(status_code=422, detail="Drop-off is outside the service area")
+
+    route = await routing.get_route(data.pickup_lat, data.pickup_lng, data.dropoff_lat, data.dropoff_lng)
+    if route["distance_m"] < MIN_TRIP_DISTANCE_M:
+        raise HTTPException(status_code=422, detail="Pickup and drop-off are too close for a ride")
+
+    fare = await pricing.calculate_fare(db, route["distance_m"], route["duration_s"])
+    return {**route, **fare}
+
+
 async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
+    # Checked first, so a rider who already has a ride never costs a routing call.
     if await rides_repo.get_active_for_rider(db, rider.id) is not None:
         raise HTTPException(status_code=409, detail="You already have an active ride")
 
+    # The client never sends distance, time, or fare: the server always works them out itself.
+    estimate = await estimate_ride(db, data)
+
     # Not routed through change_ride_status: there is no previous status.
-    ride = await rides_repo.create(db, rider.id, data)
+    ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])
     await rides_repo.add_event(db, ride.id, None, RideStatus.REQUESTED, rider.id)
     await db.commit()
     return ride

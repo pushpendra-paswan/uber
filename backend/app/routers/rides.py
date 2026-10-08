@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Ride, RideEvent, RideStatus, User
-from app.schemas import RideCreate, RideEventResponse, RideResponse
+from app.schemas import EstimateRequest, EstimateResponse, RideCreate, RideEventResponse, RideResponse
 from app.security import get_current_user, require_role
 from app.services import rides as rides_service
 
@@ -17,7 +17,14 @@ async def create_ride(
     return await rides_service.create_ride(db, user, data)
 
 
-# Declared before /{ride_id}, otherwise "active" would be read as a ride id.
+# Declared before /{ride_id}, otherwise "estimate" and "active" would be read as a ride id.
+@router.post("/estimate", response_model=EstimateResponse)
+async def estimate_ride(
+    data: EstimateRequest, user: User = Depends(require_role("rider")), db: AsyncSession = Depends(get_db)
+) -> dict:
+    return await rides_service.estimate_ride(db, data)
+
+
 @router.get("/active", response_model=RideResponse)
 async def get_active_ride(user: User = Depends(require_role("rider", "driver")), db: AsyncSession = Depends(get_db)) -> Ride:
     return await rides_service.get_active(db, user)

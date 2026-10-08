@@ -72,21 +72,35 @@ class DriverResponse(BaseModel):
     vehicle: VehicleResponse | None
 
 
-class RideCreate(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
+class EstimateRequest(BaseModel):
     pickup_lat: float = Field(ge=-90, le=90)
     pickup_lng: float = Field(ge=-180, le=180)
-    pickup_address: str = Field(min_length=1, max_length=255)
     dropoff_lat: float = Field(ge=-90, le=90)
     dropoff_lng: float = Field(ge=-180, le=180)
-    dropoff_address: str = Field(min_length=1, max_length=255)
 
     @model_validator(mode="after")
-    def pickup_and_dropoff_differ(self) -> "RideCreate":
+    def pickup_and_dropoff_differ(self) -> "EstimateRequest":
         if (self.pickup_lat, self.pickup_lng) == (self.dropoff_lat, self.dropoff_lng):
             raise ValueError("Pickup and drop-off must be different places")
         return self
+
+
+class EstimateResponse(BaseModel):
+    distance_m: int
+    duration_s: int
+    fare_estimate: int  # paise
+    base_fare: int
+    distance_fare: int
+    time_fare: int
+    minimum_fare_applied: bool
+    path: list[list[float]]  # [lat, lng] pairs
+
+
+class RideCreate(EstimateRequest):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    pickup_address: str = Field(min_length=1, max_length=255)
+    dropoff_address: str = Field(min_length=1, max_length=255)
 
 
 class RideResponse(BaseModel):

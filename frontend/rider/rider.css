@@ -74,3 +74,14 @@ input[type="radio"] {
 #request-button {
   margin-top: 1rem;
 }
+
+#estimate-section {
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.75rem;
+  background: #f5f6f8;
+}
+
+.breakdown {
+  margin: 0;
+  padding-left: 1.25rem;
+}

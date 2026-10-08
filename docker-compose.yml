@@ -25,6 +25,16 @@ services:
       timeout: 3s
       retries: 10
 
+  # No healthcheck (the image has no curl) and not in the backend's depends_on: the backend
+  # must start without it. Run osrm/prepare.sh once first, otherwise this container exits.
+  osrm:
+    image: ghcr.io/project-osrm/osrm-backend:v26.10.0-debian
+    command: osrm-routed --algorithm mld /data/city.osrm
+    volumes:
+      - ./osrm/data:/data:ro
+    ports:
+      - "127.0.0.1:5000:5000"
+
   backend:
     build: ./backend
     env_file: .env

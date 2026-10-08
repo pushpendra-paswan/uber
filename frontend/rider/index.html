@@ -80,6 +80,20 @@
         <label class="radio"><input type="radio" name="pick" value="dropoff"> Drop-off</label>
       </fieldset>
 
+      <p id="estimate-loading" class="note" hidden>Estimating route...</p>
+
+      <section id="estimate-section" hidden>
+        <h3>Trip estimate</h3>
+        <p id="estimate-trip"></p>
+        <p>Estimated fare: <strong id="estimate-fare"></strong></p>
+        <ul class="breakdown">
+          <li>Base fare: <span id="estimate-base"></span></li>
+          <li>Distance: <span id="estimate-distance-fare"></span></li>
+          <li>Time: <span id="estimate-time-fare"></span></li>
+        </ul>
+        <p id="estimate-minimum" class="note" hidden>Minimum fare applies</p>
+      </section>
+
       <button id="request-button" type="button" disabled>Request ride</button>
     </section>
 
@@ -94,6 +108,14 @@
         <div>
           <dt>Drop-off</dt>
           <dd id="ride-dropoff"></dd>
+        </div>
+        <div>
+          <dt>Distance and time</dt>
+          <dd id="ride-trip"></dd>
+        </div>
+        <div>
+          <dt>Estimated fare</dt>
+          <dd id="ride-fare"></dd>
         </div>
         <div id="ride-driver-row" hidden>
           <dt>Driver id</dt>

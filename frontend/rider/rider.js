@@ -22,6 +22,9 @@ const KINDS = ["pickup", "dropoff"];
 // Leaflet renders tooltips as HTML, so they only ever get these fixed strings, never an address.
 const MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
 const MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
+const ROUTE_WEIGHT = 5;
+const FIT_PADDING = [40, 40];
+const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
 const session = getSession();
 const state = {
@@ -36,6 +39,13 @@ const state = {
   map: null,
   markers: { pickup: null, dropoff: null },
   fittedRideId: null, // the map is fitted to a ride's markers once, never on every poll
+  estimate: null, // answer of POST /rides/estimate for the chosen points; null while there is none
+  estimating: false,
+  estimateRequest: 0, // counts estimate calls, so a slow old answer can never replace a newer one
+  ridePath: null, // route of the current ride, asked for once per ride
+  routeRideId: null, // the ride whose route was asked for; set before the call so a failure is not retried every poll
+  routeLine: null, // Leaflet polyline
+  drawnPath: null, // the path routeLine shows, so polling neither redraws nor refits it
   error: "",
   busy: false,
 };
@@ -69,6 +79,22 @@ const rideDriver = document.getElementById("ride-driver");
 const cancelButton = document.getElementById("cancel-button");
 const newRideButton = document.getElementById("new-ride-button");
 const eventsBody = document.getElementById("events");
+const estimateLoading = document.getElementById("estimate-loading");
+const estimateSection = document.getElementById("estimate-section");
+const estimateTrip = document.getElementById("estimate-trip");
+const estimateFare = document.getElementById("estimate-fare");
+const estimateBase = document.getElementById("estimate-base");
+const estimateDistanceFare = document.getElementById("estimate-distance-fare");
+const estimateTimeFare = document.getElementById("estimate-time-fare");
+const estimateMinimum = document.getElementById("estimate-minimum");
+const rideTrip = document.getElementById("ride-trip");
+const rideFare = document.getElementById("ride-fare");
+
+// "5.2 km, 14 min". Used by the estimate panel and the ride view. Old rides have null values.
+function formatTrip(distanceM, durationS) {
+  if (distanceM === null || durationS === null) return "-";
+  return `${(distanceM / 1000).toFixed(1)} km, ${Math.max(1, Math.round(durationS / 60))} min`;
+}
 
 async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
@@ -93,6 +119,19 @@ async function refresh() {
     }
     state.events = state.ride ? await api("GET", `/rides/${state.ride.id}/events`) : [];
     state.loaded = true;
+
+    // The path is not stored on the ride, so ask for it once per ride.
+    if (state.ride && state.routeRideId !== state.ride.id) {
+      state.routeRideId = state.ride.id;
+      state.ridePath = null;
+      const route = await api("POST", "/rides/estimate", {
+        pickup_lat: state.ride.pickup_lat,
+        pickup_lng: state.ride.pickup_lng,
+        dropoff_lat: state.ride.dropoff_lat,
+        dropoff_lng: state.ride.dropoff_lng,
+      });
+      state.ridePath = route.path;
+    }
   } catch (err) {
     state.error = err.message;
   }
@@ -119,6 +158,31 @@ function setPoint(kind, lat, lng, address) {
   inputs[kind].value = state.points[kind].address;
   state.results[kind] = null;
   if (state.points[other] === null) pickRadios[other].checked = true;
+
+  // A new point makes the old route and estimate wrong, so drop them now. Only the latest answer is applied.
+  state.estimate = null;
+  const requestNumber = ++state.estimateRequest;
+  const { pickup, dropoff } = state.points;
+  state.estimating = pickup !== null && dropoff !== null;
+  if (state.estimating) {
+    api("POST", "/rides/estimate", {
+      pickup_lat: pickup.lat,
+      pickup_lng: pickup.lng,
+      dropoff_lat: dropoff.lat,
+      dropoff_lng: dropoff.lng,
+    })
+      .then((estimate) => {
+        if (requestNumber === state.estimateRequest) state.estimate = estimate;
+      })
+      .catch((err) => {
+        if (requestNumber === state.estimateRequest) state.error = err.message;
+      })
+      .finally(() => {
+        if (requestNumber === state.estimateRequest) state.estimating = false;
+        render();
+      });
+  }
+  render();
 }
 
 function onMapClick(event) {
@@ -206,9 +270,27 @@ function render() {
     if (state.ride && state.fittedRideId !== state.ride.id) {
       state.map.fitBounds(
         [[state.ride.pickup_lat, state.ride.pickup_lng], [state.ride.dropoff_lat, state.ride.dropoff_lng]],
-        { padding: [40, 40] }
+        { padding: FIT_PADDING, animate: false }
       );
       state.fittedRideId = state.ride.id;
+    }
+
+    // The ride's route when there is a ride, otherwise the estimate for the chosen points.
+    let path = state.ridePath;
+    if (!state.ride) path = state.estimate === null ? null : state.estimate.path;
+    if (path === null && state.routeLine !== null) {
+      state.routeLine.remove();
+      state.routeLine = null;
+      state.drawnPath = null;
+    } else if (path !== null && path !== state.drawnPath) {
+      if (state.routeLine === null) state.routeLine = L.polyline(path, { weight: ROUTE_WEIGHT }).addTo(state.map);
+      else state.routeLine.setLatLngs(path);
+      state.routeLine.bringToBack(); // below the pickup and drop-off markers
+      state.drawnPath = path;
+      // Once per new path, never on a poll. Not animated, here and in the other view changes from code:
+      // Leaflet silently ignores a view change that arrives during a zoom animation, so an animated
+      // search-result zoom or ride fit would swallow this one.
+      state.map.fitBounds(state.routeLine.getBounds(), { padding: FIT_PADDING, animate: false });
     }
   }
 
@@ -232,7 +314,7 @@ function render() {
         button.addEventListener("click", () =>
           act(async () => {
             setPoint(kind, place.lat, place.lng, place.display_name);
-            state.map.setView([place.lat, place.lng], PLACE_ZOOM);
+            state.map.setView([place.lat, place.lng], PLACE_ZOOM, { animate: false });
           })
         );
         row.append(button);
@@ -242,12 +324,26 @@ function render() {
     resultLists[kind].replaceChildren(...rows);
   }
 
+  estimateLoading.hidden = !state.estimating;
+  estimateSection.hidden = state.estimate === null;
+  if (state.estimate !== null) {
+    const estimate = state.estimate;
+    estimateTrip.textContent = formatTrip(estimate.distance_m, estimate.duration_s);
+    estimateFare.textContent = money.format(estimate.fare_estimate / 100);
+    estimateBase.textContent = money.format(estimate.base_fare / 100);
+    estimateDistanceFare.textContent = money.format(estimate.distance_fare / 100);
+    estimateTimeFare.textContent = money.format(estimate.time_fare / 100);
+    estimateMinimum.hidden = !estimate.minimum_fare_applied;
+  }
+
   if (showRide) {
     rideId.textContent = state.ride.id;
     rideStatus.textContent = state.ride.status;
     rideStatusText.textContent = STATUS_TEXT[state.ride.status];
     ridePickup.textContent = state.ride.pickup_address;
     rideDropoff.textContent = state.ride.dropoff_address;
+    rideTrip.textContent = formatTrip(state.ride.distance_m, state.ride.duration_s);
+    rideFare.textContent = state.ride.fare_estimate === null ? "-" : money.format(state.ride.fare_estimate / 100);
     rideDriverRow.hidden = state.ride.driver_id === null;
     rideDriver.textContent = state.ride.driver_id;
     cancelButton.hidden = !CANCELLABLE.includes(state.ride.status);
@@ -266,7 +362,7 @@ function render() {
   }
 
   for (const button of document.querySelectorAll("button")) button.disabled = state.busy;
-  requestButton.disabled = state.busy || state.points.pickup === null || state.points.dropoff === null;
+  requestButton.disabled = state.busy || state.points.pickup === null || state.points.dropoff === null || state.estimate === null;
 }
 
 loginForm.addEventListener("submit", (event) => {
@@ -337,6 +433,11 @@ newRideButton.addEventListener("click", () => {
     state.events = [];
     state.points = { pickup: null, dropoff: null };
     state.results = { pickup: null, dropoff: null };
+    state.estimate = null;
+    state.estimating = false;
+    state.estimateRequest++; // an answer still on its way must not show up
+    state.ridePath = null;
+    state.routeRideId = null;
     for (const kind of KINDS) inputs[kind].value = "";
     pickRadios.pickup.checked = true;
   });

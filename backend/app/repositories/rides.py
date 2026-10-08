@@ -5,8 +5,17 @@ from app.models import ACTIVE_RIDE_STATUSES, Ride, RideEvent, RideStatus
 from app.schemas import RideCreate
 
 
-async def create(db: AsyncSession, rider_id: int, data: RideCreate) -> Ride:
-    ride = Ride(rider_id=rider_id, status=RideStatus.REQUESTED, **data.model_dump())
+async def create(
+    db: AsyncSession, rider_id: int, data: RideCreate, distance_m: int, duration_s: int, fare_estimate: int
+) -> Ride:
+    ride = Ride(
+        rider_id=rider_id,
+        status=RideStatus.REQUESTED,
+        distance_m=distance_m,
+        duration_s=duration_s,
+        fare_estimate=fare_estimate,
+        **data.model_dump(),
+    )
     db.add(ride)
     await db.flush()
     return ride

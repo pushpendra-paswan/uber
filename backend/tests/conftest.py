@@ -1,6 +1,7 @@
 import uuid
 
 import httpx
+import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -10,8 +11,9 @@ from sqlalchemy.pool import NullPool
 from app.config import settings
 from app.database import Base, get_db
 from app.main import app
-from app.models import Driver, User, UserRole, Vehicle, VerificationStatus
+from app.models import Driver, PricingRule, User, UserRole, Vehicle, VerificationStatus
 from app.security import create_access_token
+from app.services import routing
 
 # Tests never touch the dev database: they use a copy of its name with a _test suffix.
 TEST_DB_URL = make_url(settings.postgres_url).set(database=settings.postgres_db + "_test")
@@ -45,6 +47,22 @@ async def test_engine():
 async def clean_tables(test_engine):
     async with test_engine.begin() as connection:
         await connection.execute(text(f"TRUNCATE {ALL_TABLES} RESTART IDENTITY CASCADE"))
+        # Same values as the seed migration (paise). TRUNCATE removed the migration's row, so put it back.
+        await connection.execute(
+            PricingRule.__table__.insert().values(
+                vehicle_type="economy", base_fare=5000, per_km=1200, per_min=200, min_fare=8000, surge_cap=2.0
+            )
+        )
+
+
+@pytest.fixture(autouse=True)
+def fake_route(monkeypatch):
+    """No test talks to a real OSRM. A test that needs another route replaces get_route again."""
+
+    async def get_route(pickup_lat, pickup_lng, dropoff_lat, dropoff_lng):
+        return {"distance_m": 5000, "duration_s": 900, "path": [[pickup_lat, pickup_lng], [dropoff_lat, dropoff_lng]]}
+
+    monkeypatch.setattr(routing, "get_route", get_route)
 
 
 @pytest_asyncio.fixture
