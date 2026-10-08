@@ -8,9 +8,9 @@ Uber-like ride-hailing web app for learning. FastAPI + PostgreSQL/PostGIS + Redi
 
 ## Current status
 
-- Current phase: 0 (Foundations)
-- Last completed milestone: M0.1 Repo and infra (2026-10-08)
-- Next milestone: M0.2 Database layer
+- Current phase: 0 (Foundations) complete; Phase 1 next
+- Last completed milestone: M0.2 Database layer (2026-10-08)
+- Next milestone: M1.1 Authentication
 - Last updated: 2026-10-08
 
 ## Milestone tracker
@@ -20,7 +20,7 @@ Status values: Not started, In progress, Done.
 | ID | Milestone | Status | Date done |
 |---|---|---|---|
 | M0.1 | Repo and infra | Done | 2026-10-08 |
-| M0.2 | Database layer | Not started | |
+| M0.2 | Database layer | Done | 2026-10-08 |
 | M1.1 | Authentication | Not started | |
 | M1.2 | Driver onboarding | Not started | |
 | M1.3 | Ride state machine | Not started | |
@@ -52,10 +52,19 @@ Status values: Not started, In progress, Done.
 ## What exists now
 
 - **Services (Docker Compose):** `db` (postgis/postgis:16-3.4, volume `postgres_data`, port 5432), `redis` (redis:7-alpine, port 6379), `backend` (FastAPI, port 8000, uvicorn --reload). Backend waits for db and redis to be healthy.
-- **Tables:** none yet (M0.2)
+- **Tables** (one migration, `0001_initial_schema`; ids are integer PKs, all `created_at` are timestamptz default `now()`, money is integer paise):
+  - `users`: role (rider/driver/admin), name, email (unique), phone (unique, nullable), password_hash
+  - `drivers`: user_id (FK users, unique), license_number, verification_status (pending/approved/rejected, default pending)
+  - `vehicles`: driver_id (FK drivers), plate_number (unique), model, color, vehicle_type (default economy)
+  - `rides`: rider_id (FK users), driver_id (FK drivers, nullable), pickup/dropoff lat, lng, address, status (default REQUESTED), distance_m, duration_s, fare_estimate, final_fare, otp, started_at, completed_at. Indexed: status, rider_id, driver_id
+  - `ride_events`: ride_id (FK, indexed), from_status (nullable), to_status, actor_user_id (FK users, nullable)
+  - `payments`: ride_id (FK, indexed), amount, method (cash/wallet/card), status (pending/succeeded/failed/refunded), idempotency_key (unique), gateway_ref (unique, nullable)
+  - `ratings`: ride_id, from_user_id, to_user_id (FKs), score (check 1 to 5), comment. Unique (ride_id, from_user_id)
+  - `pricing_rules`: vehicle_type (unique), base_fare, per_km, per_min, min_fare, surge_cap (float, default 2.0)
+  - Only relationship so far: `Ride.events` (ordered by id). Enums are Python enums in `models.py` (`UserRole`, `VerificationStatus`, `RideStatus`, `PaymentMethod`, `PaymentStatus`)
 - **Endpoints:** `GET /health` (200 `{"status","postgres","redis"}` all "ok"; 503 with the failing one "error")
 - **Static files:** `frontend/` is mounted at `/` after the API routes (folders are empty placeholders)
-- **Backend files:** `app/config.py` (settings from env), `app/database.py` (async engine and Redis client only), `app/main.py`; empty `routers/ services/ repositories/ utils/` packages
+- **Backend files:** `app/config.py` (settings from env), `app/database.py` (`Base` with constraint naming convention, async engine, `async_session`, `get_db` dependency, Redis client), `app/models.py` (all models), `app/main.py`; `alembic.ini` and `alembic/` (async template; `env.py` takes the URL from settings); empty `routers/ services/ repositories/ utils/` packages
 - **Redis keys:** none yet
 - **WebSocket messages:** none yet
 - **Frontend pages:** none yet
@@ -71,13 +80,19 @@ One line per decision: milestone, what was chosen, what was rejected, why.
 | M0.1 | `postgis/postgis:16-3.4`, `redis:7-alpine`, `python:3.12-slim` | `latest` tags | Reproducible builds |
 | M0.1 | Compose mounts `./backend` at `/app` and `./frontend` at `/frontend`; `main.py` serves `/frontend` | Serving `../frontend` by relative path | Container only sees mounted paths; same code works in the container |
 | M0.1 | `/health` checks each dependency in its own try/except and returns `status: "error"` plus 503 if either fails | Failing on the first error | Reports both dependencies even when one is down |
-| M0.1 | Pinned: fastapi 0.142.4, uvicorn 0.54.0, sqlalchemy 2.1.4, asyncpg 0.32.0, redis 8.1.0, pydantic-settings 2.15.0 | Unpinned | Current stable at 2026-10-08 |
+| M0.2 | Lat/lng are plain `Float` columns; PostGIS extension is enabled by the migration but unused | `geometry` columns, geoalchemy2 | Driver locations live in Redis GEO and distances are computed in Python/Redis; avoids a dependency |
+| M0.2 | Enums are Python enums stored as `VARCHAR` (`native_enum=False`); enum names equal values | Native Postgres enum types | Adding a value later needs no enum-type migration |
+| M0.2 | Money columns are `Integer` in minor units (paise) | Float, Numeric | No rounding errors; matches the project rule |
+| M0.2 | `MetaData` naming convention (`ix_`, `uq_`, `ck_`, `fk_`, `pk_` prefixes) | Postgres auto-generated names | Predictable constraint names for later migrations |
+| M0.2 | Alembic `include_object` ignores any database table that is not one of our models | Default autogenerate | The PostGIS image ships `spatial_ref_sys`, `tiger.*`, `topology.*`; unfiltered, autogenerate wrote `drop_table` for ~40 of them |
+| M0.2 | Migration ids are manual and readable (`0001`, file `0001_initial_schema.py`) via `--rev-id`; downgrade leaves the postgis extension | Hash-only ids | Readable ordering |
+| M0.1 | Pinned: fastapi 0.142.4, uvicorn 0.54.0, sqlalchemy 2.1.4, asyncpg 0.32.0, redis 8.1.0, pydantic-settings 2.15.0 (M0.2 added alembic 1.20.0) | Unpinned | Current stable at 2026-10-08 |
 
 ## Bugs hit
 
 One entry per notable bug: milestone, symptom, root cause, fix.
 
-None yet.
+- **M0.2:** `alembic revision --autogenerate` produced a migration that dropped ~40 PostGIS tables (`tiger.*`, `topology.*`, `spatial_ref_sys`). Cause: the `postgis/postgis` image creates them, so Alembic sees them as tables missing from our models. Fix: `include_object` filter in `alembic/env.py`.
 
 ## Open issues and TODOs
 
@@ -93,6 +108,14 @@ docker compose stop redis             # /health now returns 503 with redis "erro
 docker compose start redis
 docker compose down                   # stop
 docker compose down -v                # stop and delete the database volume (full reset)
+
+# database migrations (run after every fresh database)
+docker compose exec backend alembic upgrade head                              # create/update all tables
+docker compose exec backend alembic downgrade base                            # remove all tables (postgis stays)
+docker compose exec --user $(id -u):$(id -g) backend alembic revision --autogenerate -m "message" --rev-id 0002
+docker compose exec db psql -U uber -d uber -c '\dt'                          # inspect tables
 ```
+
+Run `alembic revision` with `--user $(id -u):$(id -g)` so the new file on the host is not owned by root. Review every autogenerated migration by hand; a "check" autogenerate right after `upgrade head` should be empty.
 
 No automated tests yet (first ones arrive with the state machine, M1.3).

@@ -9,6 +9,7 @@ See `CLAUDE.md` for the architecture and milestones, and `PROJECT_CONTEXT.md` fo
 ```bash
 cp .env.example .env        # first time only
 docker compose up --build
+docker compose exec backend alembic upgrade head    # create the tables (first time, and after a reset)
 ```
 
 - API: http://localhost:8000
@@ -26,4 +27,5 @@ docker compose down
 ```bash
 docker compose down -v
 docker compose up --build
+docker compose exec backend alembic upgrade head
 ```
