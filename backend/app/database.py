@@ -23,7 +23,7 @@ class Base(DeclarativeBase):
 
 engine = create_async_engine(settings.postgres_url)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
-redis_client = Redis(host=settings.redis_host, port=settings.redis_port, decode_responses=True)
+redis_client = Redis(host=settings.redis_host, port=settings.redis_port, db=settings.redis_db, decode_responses=True)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

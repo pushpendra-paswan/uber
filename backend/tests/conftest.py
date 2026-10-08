@@ -1,3 +1,4 @@
+import os
 import uuid
 
 import httpx
@@ -8,12 +9,16 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.config import settings
-from app.database import Base, get_db
-from app.main import app
-from app.models import Driver, PricingRule, User, UserRole, Vehicle, VerificationStatus
-from app.security import create_access_token
-from app.services import routing
+# Before any app module is imported: tests use their own Redis database, so they never touch dev data.
+TEST_REDIS_DB = 1
+os.environ["REDIS_DB"] = str(TEST_REDIS_DB)
+
+from app.config import settings  # noqa: E402
+from app.database import Base, get_db, redis_client  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models import Driver, PricingRule, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
+from app.security import create_access_token  # noqa: E402
+from app.services import routing  # noqa: E402
 
 # Tests never touch the dev database: they use a copy of its name with a _test suffix.
 TEST_DB_URL = make_url(settings.postgres_url).set(database=settings.postgres_db + "_test")
@@ -53,6 +58,14 @@ async def clean_tables(test_engine):
                 vehicle_type="economy", base_fare=5000, per_km=1200, per_min=200, min_fare=8000, surge_cap=2.0
             )
         )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def clean_redis():
+    # FLUSHDB wipes the whole connected database, so check that it is the test one first.
+    assert settings.redis_db == TEST_REDIS_DB
+    assert (await redis_client.client_info())["db"] == TEST_REDIS_DB, "Refusing to flush a Redis database that is not the test one"
+    await redis_client.flushdb()
 
 
 @pytest.fixture(autouse=True)

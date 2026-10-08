@@ -16,12 +16,22 @@ const VERIFICATION_TEXT = {
 };
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const POLL_MS = 3000;
+const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const MAX_ZOOM = 19;
+const MIN_ZOOM = 10;
+const MARKER_COLOR = "#1a56db";
 
 const session = getSession();
 const state = {
   user: session ? session.user : null,
   loaded: false, // true after the first successful refresh, so the forms do not flash before the profile shows
   driver: null,
+  config: null, // from GET /places/map-config
+  position: null, // {lat, lng}, chosen by clicking the map
+  presence: null, // from GET /drivers/me/presence or the last location ping
+  map: null,
+  marker: null,
   ride: null,
   rideId: null, // remembered so a finished ride can still be shown after /rides/active returns 404
   events: [],
@@ -46,6 +56,11 @@ const profileSection = document.getElementById("profile-section");
 const profileForm = document.getElementById("profile-form");
 const vehicleSection = document.getElementById("vehicle-section");
 const vehicleForm = document.getElementById("vehicle-form");
+const presenceSection = document.getElementById("presence-section");
+const presenceStatus = document.getElementById("presence-status");
+const onlineButton = document.getElementById("online-button");
+const offlineButton = document.getElementById("offline-button");
+const offlineNote = document.getElementById("offline-note");
 const noRideSection = document.getElementById("no-ride-section");
 const rideSection = document.getElementById("ride-section");
 const rideId = document.getElementById("ride-id");
@@ -81,6 +96,16 @@ async function refresh() {
   try {
     state.driver = await getOrNull("/drivers/me");
     if (state.driver && state.driver.verification_status === "approved") {
+      if (state.config === null) state.config = await api("GET", "/places/map-config");
+
+      // The heartbeat: a location ping every poll keeps the 30 second presence key alive.
+      state.presence = await api("GET", "/drivers/me/presence");
+      if (state.presence.online) {
+        // After a reload the position is still in Redis, so take it from there.
+        if (state.position === null) state.position = { lat: state.presence.lat, lng: state.presence.lng };
+        state.presence = await api("POST", "/drivers/me/location", state.position);
+      }
+
       const active = await getOrNull("/rides/active");
       if (active) {
         state.ride = active;
@@ -90,6 +115,8 @@ async function refresh() {
         state.ride = await api("GET", `/rides/${state.rideId}`);
       }
       state.events = state.ride ? await api("GET", `/rides/${state.ride.id}/events`) : [];
+    } else {
+      state.presence = null;
     }
     state.loaded = true;
   } catch (err) {
@@ -119,6 +146,9 @@ function render() {
   const hasVehicle = hasProfile && state.driver.vehicle !== null;
   const approved = hasVehicle && state.driver.verification_status === "approved";
   const showRide = approved && state.ride !== null;
+  const showMap = approved && state.config !== null;
+  const online = state.presence !== null && state.presence.online;
+  const hasActiveRide = state.ride !== null && !FINISHED.includes(state.ride.status);
 
   message.hidden = state.error === "";
   message.textContent = state.error;
@@ -136,8 +166,64 @@ function render() {
 
   profileSection.hidden = !isDriver || !state.loaded || hasProfile;
   vehicleSection.hidden = !hasProfile || hasVehicle;
+  presenceSection.hidden = !showMap;
   noRideSection.hidden = !approved || showRide;
   rideSection.hidden = !showRide;
+
+  if (showMap) {
+    const c = state.config;
+    // Created the first time the section is visible: Leaflet cannot measure a hidden container.
+    if (state.map === null) {
+      state.map = L.map("map", {
+        center: [c.center_lat, c.center_lng],
+        zoom: c.zoom,
+        minZoom: MIN_ZOOM,
+        maxZoom: MAX_ZOOM,
+        maxBounds: [[c.south, c.west], [c.north, c.east]],
+        maxBoundsViscosity: 1.0,
+      });
+      L.tileLayer(TILE_URL, { attribution: ATTRIBUTION, maxZoom: MAX_ZOOM }).addTo(state.map);
+      state.map.on("click", (event) => {
+        if (state.busy) return;
+        const { lat, lng } = event.latlng;
+        act(async () => {
+          if (lat < c.south || lat > c.north || lng < c.west || lng > c.east) {
+            throw new Error(`That location is outside ${c.city_name}`);
+          }
+          state.position = { lat, lng };
+          // While online, a click is also how the driver moves.
+          if (state.presence && state.presence.online) {
+            state.presence = await api("POST", "/drivers/me/location", state.position);
+          }
+        });
+      });
+      state.map.invalidateSize();
+    }
+
+    // Created, moved, and removed here from state.position. The tooltip is a fixed string, never API data.
+    if (state.position === null && state.marker !== null) {
+      state.marker.remove();
+      state.marker = null;
+    } else if (state.position !== null && state.marker === null) {
+      state.marker = L.circleMarker([state.position.lat, state.position.lng], {
+        radius: 9,
+        color: MARKER_COLOR,
+        fillColor: MARKER_COLOR,
+        fillOpacity: 1,
+      })
+        .bindTooltip("You", { permanent: true, direction: "top", offset: [0, -9] })
+        .addTo(state.map);
+    } else if (state.position !== null) {
+      state.marker.setLatLng([state.position.lat, state.position.lng]);
+    }
+
+    presenceStatus.textContent = online
+      ? `Online, last update ${new Date(state.presence.updated_at * 1000).toLocaleTimeString()}`
+      : "Offline";
+    onlineButton.hidden = online;
+    offlineButton.hidden = !online;
+    offlineNote.hidden = !online || !hasActiveRide;
+  }
 
   if (showRide) {
     const status = state.ride.status;
@@ -165,6 +251,8 @@ function render() {
   }
 
   for (const button of document.querySelectorAll("button")) button.disabled = state.busy;
+  onlineButton.disabled = state.busy || state.position === null;
+  offlineButton.disabled = state.busy || hasActiveRide;
 }
 
 loginForm.addEventListener("submit", (event) => {
@@ -210,6 +298,18 @@ vehicleForm.addEventListener("submit", (event) => {
       color: form.get("color"),
     })
   );
+});
+
+onlineButton.addEventListener("click", () => {
+  act(async () => {
+    state.presence = await api("POST", "/drivers/me/online", state.position);
+  });
+});
+
+offlineButton.addEventListener("click", () => {
+  act(async () => {
+    state.presence = await api("POST", "/drivers/me/offline");
+  });
 });
 
 arriveButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/arrive`)));

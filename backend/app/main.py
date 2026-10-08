@@ -1,12 +1,18 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from redis.exceptions import RedisError
 from sqlalchemy import text
 
 from app.database import engine, redis_client
 from app.routers import admin, auth, drivers, places, rides
 
 app = FastAPI(title="Uber Clone")
+
+
+@app.exception_handler(RedisError)
+async def redis_unavailable(request: Request, error: RedisError) -> JSONResponse:
+    return JSONResponse({"detail": "Cache is unavailable"}, status_code=503)
 
 
 @app.get("/health")

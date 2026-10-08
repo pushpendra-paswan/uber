@@ -72,6 +72,18 @@ class DriverResponse(BaseModel):
     vehicle: VehicleResponse | None
 
 
+class LocationUpdate(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class PresenceResponse(BaseModel):
+    online: bool
+    lat: float | None = None
+    lng: float | None = None
+    updated_at: int | None = None  # epoch seconds of the last update
+
+
 class EstimateRequest(BaseModel):
     pickup_lat: float = Field(ge=-90, le=90)
     pickup_lng: float = Field(ge=-180, le=180)

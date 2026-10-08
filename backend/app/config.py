@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     postgres_port: int
     redis_host: str
     redis_port: int
+    redis_db: int = 0  # tests use 1, so they never touch dev data
     jwt_secret: str
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60

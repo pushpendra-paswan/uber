@@ -14,3 +14,9 @@ dd {
 #cancel-button {
   background: #b42318;
 }
+
+#map {
+  height: 45vh;
+  min-height: 260px;
+  border-radius: 0.25rem;
+}

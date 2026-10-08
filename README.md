@@ -60,13 +60,25 @@ docker compose exec backend python create_admin.py --email admin@example.com --n
 
 Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider, pick pickup and drop-off by searching (press Enter) or clicking the map, and request a ride. Once both points are set, the page shows the route and the estimated fare (base fare Rs 50, Rs 12 per km, Rs 2 per minute, Rs 80 minimum; the server works the fare out again when you request). Then assign it to the driver in the admin tab (copy the ride id and driver id by hand). The driver tab then moves the ride through arrived, started, and completed.
 
+### Go online as a driver
+
+Once the admin has approved the driver, the driver page shows a map. Click it to set where the driver is (clicks outside the city are refused), then press **Go online**. The page keeps the driver online by sending the position every 3 seconds; closing the page lets the driver drop off after 30 seconds. Click the map again to move the driver, and press **Go offline** when done (not possible during an active ride). Online state lives in Redis only. To look at it:
+
+```bash
+docker compose exec redis redis-cli GEOPOS drivers:geo <driver_id>     # longitude first, then latitude
+docker compose exec redis redis-cli TTL driver:<driver_id>:presence    # about 30 right after an update, -2 once expired
+docker compose exec redis redis-cli ZCARD drivers:geo
+```
+
+The driver id is shown at the top of the driver page. The GEO set can keep a stale member after the presence key expires; the presence key is what says whether a driver is online.
+
 ## Run the tests
 
 ```bash
 docker compose exec backend pytest
 ```
 
-Tests use their own database (`<POSTGRES_DB>_test`, created automatically), so your dev data is never touched.
+Tests use their own Postgres database (`<POSTGRES_DB>_test`, created automatically) and their own Redis database (index 1; dev uses 0, set by `REDIS_DB`), so your dev data is never touched.
 
 ## Stop
 

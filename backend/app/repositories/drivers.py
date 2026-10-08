@@ -1,8 +1,15 @@
+import time
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.database import redis_client
 from app.models import Driver, VerificationStatus, Vehicle
+
+GEO_KEY = "drivers:geo"
+PRESENCE_KEY = "driver:{}:presence"
+PRESENCE_TTL_SECONDS = 30
 
 # populate_existing: a driver already in the session (just created, or whose vehicle was just added)
 # is refreshed, so created_at and vehicle are loaded and DriverResponse can serialize it.
@@ -48,3 +55,41 @@ async def create_vehicle(db: AsyncSession, driver_id: int, plate_number: str, mo
     db.add(vehicle)
     await db.flush()
     return vehicle
+
+
+# Redis: the presence key says who is online. The GEO set is only a spatial index and can hold stale
+# members (a driver whose key expired), so anything that reads it must check the presence key.
+# GEOADD takes longitude first, and GEOPOS returns [longitude, latitude].
+
+
+async def set_online(driver_id: int, lat: float, lng: float) -> int:
+    updated_at = int(time.time())
+    await redis_client.set(PRESENCE_KEY.format(driver_id), updated_at, ex=PRESENCE_TTL_SECONDS)
+    await redis_client.geoadd(GEO_KEY, (lng, lat, str(driver_id)))
+    return updated_at
+
+
+async def refresh_location(driver_id: int, lat: float, lng: float) -> int | None:
+    updated_at = int(time.time())
+    # XX: only written if the key exists, so check and write are one step and a stray ping cannot bring an offline driver back.
+    was_online = await redis_client.set(PRESENCE_KEY.format(driver_id), updated_at, ex=PRESENCE_TTL_SECONDS, xx=True)
+    if not was_online:
+        return None
+    await redis_client.geoadd(GEO_KEY, (lng, lat, str(driver_id)))
+    return updated_at
+
+
+async def set_offline(driver_id: int) -> None:
+    await redis_client.delete(PRESENCE_KEY.format(driver_id))
+    await redis_client.zrem(GEO_KEY, str(driver_id))
+
+
+async def get_presence(driver_id: int) -> dict | None:
+    updated_at = await redis_client.get(PRESENCE_KEY.format(driver_id))
+    if updated_at is None:
+        return None
+    position = (await redis_client.geopos(GEO_KEY, str(driver_id)))[0]
+    if position is None:
+        return None
+    lng, lat = position
+    return {"lat": lat, "lng": lng, "updated_at": int(updated_at)}

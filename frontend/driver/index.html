@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Driver</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <link rel="stylesheet" href="/shared/base.css">
   <link rel="stylesheet" href="driver.css">
 </head>
@@ -75,6 +76,16 @@
       </form>
     </section>
 
+    <section id="presence-section" hidden>
+      <h2>Your position</h2>
+      <p class="note">Click the map to set where you are.</p>
+      <div id="map"></div>
+      <p id="presence-status"></p>
+      <button id="online-button" type="button">Go online</button>
+      <button id="offline-button" type="button" hidden>Go offline</button>
+      <p id="offline-note" class="note" hidden>Finish or cancel your ride to go offline</p>
+    </section>
+
     <section id="no-ride-section" hidden>
       <p>No ride assigned yet.</p>
     </section>
@@ -110,6 +121,8 @@
     </section>
   </main>
 
+  <!-- Before the module script, so L is defined when driver.js runs. -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script type="module" src="driver.js"></script>
 </body>
 </html>
