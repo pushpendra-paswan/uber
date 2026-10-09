@@ -81,6 +81,17 @@ input[type="radio"] {
   background: #f5f6f8;
 }
 
+#fare-section {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  background: #f5f6f8;
+  border: 0;
+}
+
+#fare-section p {
+  margin: 0.25rem 0;
+}
+
 .breakdown {
   margin: 0;
   padding-left: 1.25rem;

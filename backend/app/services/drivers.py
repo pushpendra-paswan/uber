@@ -3,11 +3,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Driver, User, VerificationStatus
+from app.models import Driver, RideStatus, User, VerificationStatus
 from app.repositories import drivers as drivers_repo
 from app.repositories import events
 from app.repositories import rides as rides_repo
 from app.schemas import DriverProfileCreate, LocationUpdate, PresenceResponse, VehicleCreate
+from app.services import pricing
 from app.utils.geo import is_inside_bounds
 
 
@@ -119,6 +120,8 @@ async def update_location(db: AsyncSession, user: User, data: LocationUpdate) ->
         await events.publish(
             ride.rider_id, "driver_location", {"ride_id": ride.id, "lat": data.lat, "lng": data.lng, "updated_at": updated_at}
         )
+        if ride.status == RideStatus.IN_PROGRESS:
+            await pricing.record_trip_point(ride.id, data.lat, data.lng)
     return PresenceResponse(online=True, lat=data.lat, lng=data.lng, updated_at=updated_at)
 
 

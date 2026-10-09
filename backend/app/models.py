@@ -2,6 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import CheckConstraint, DateTime, Enum, Float, ForeignKey, Index, Integer, String, UniqueConstraint, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -131,7 +132,12 @@ class Ride(Base):
     distance_m: Mapped[int | None] = mapped_column(Integer)
     duration_s: Mapped[int | None] = mapped_column(Integer)
     fare_estimate: Mapped[int | None] = mapped_column(Integer)  # paise
+    # What the rider owes, set once when the ride is settled: the trip fare (COMPLETED) or the cancellation fee (CANCELLED).
     final_fare: Mapped[int | None] = mapped_column(Integer)  # paise
+    actual_distance_m: Mapped[int | None] = mapped_column(Integer)  # the distance that was billed
+    actual_duration_s: Mapped[int | None] = mapped_column(Integer)
+    # Amounts, not rates: a later change to the pricing rule does not touch old rides.
+    fare_breakdown: Mapped[dict | None] = mapped_column(JSONB)
     otp: Mapped[str | None] = mapped_column(String(4))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -219,4 +225,6 @@ class PricingRule(Base):
     per_min: Mapped[int] = mapped_column(Integer)  # paise
     min_fare: Mapped[int] = mapped_column(Integer)  # paise
     surge_cap: Mapped[float] = mapped_column(Float, default=2.0, server_default="2.0")
+    cancellation_fee: Mapped[int] = mapped_column(Integer, server_default="3000")  # paise
+    free_cancel_seconds: Mapped[int] = mapped_column(Integer, server_default="120")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

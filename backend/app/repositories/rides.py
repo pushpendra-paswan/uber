@@ -1,8 +1,13 @@
-from sqlalchemy import select
+from datetime import datetime
+
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import redis_client
 from app.models import ACTIVE_RIDE_STATUSES, Ride, RideEvent, RideStatus
 from app.schemas import RideCreate
+
+TRIP_KEY = "ride:{}:trip"
 
 
 async def create(
@@ -51,3 +56,33 @@ async def add_event(
 async def list_events(db: AsyncSession, ride_id: int) -> list[RideEvent]:
     result = await db.execute(select(RideEvent).where(RideEvent.ride_id == ride_id).order_by(RideEvent.id))
     return list(result.scalars().all())
+
+
+async def get_last_event_time(db: AsyncSession, ride_id: int, to_status: RideStatus) -> datetime | None:
+    result = await db.execute(
+        select(func.max(RideEvent.created_at)).where(RideEvent.ride_id == ride_id, RideEvent.to_status == to_status)
+    )
+    return result.scalar_one()
+
+
+async def get_trip(ride_id: int) -> dict | None:
+    """The distance meter of an IN_PROGRESS ride (see pricing.record_trip_point), or None when nothing was recorded."""
+    fields = await redis_client.hgetall(TRIP_KEY.format(ride_id))
+    if not fields:
+        return None
+    return {
+        "distance_m": float(fields["distance_m"]),
+        "lat": float(fields["lat"]),
+        "lng": float(fields["lng"]),
+        "ts": float(fields["ts"]),
+        "pings": int(fields["pings"]),
+        "jumps": int(fields["jumps"]),
+    }
+
+
+async def save_trip(ride_id: int, trip: dict, ttl_seconds: int) -> None:
+    key = TRIP_KEY.format(ride_id)
+    async with redis_client.pipeline(transaction=True) as pipeline:
+        pipeline.hset(key, mapping=trip)
+        pipeline.expire(key, ttl_seconds)
+        await pipeline.execute()

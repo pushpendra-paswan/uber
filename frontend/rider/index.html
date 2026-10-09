@@ -131,6 +131,27 @@
         </div>
       </dl>
 
+      <div id="fare-section" hidden>
+        <h3>Fare</h3>
+        <div id="fare-trip" hidden>
+          <p>Total fare: <strong id="fare-total"></strong></p>
+          <p>Estimated fare: <span id="fare-estimate"></span></p>
+          <p>Distance: <span id="fare-distance"></span> <span id="fare-distance-note" hidden>(estimated, tracking was not available)</span></p>
+          <p>Time: <span id="fare-time"></span></p>
+          <ul class="breakdown">
+            <li>Base fare: <span id="fare-base"></span></li>
+            <li>Distance: <span id="fare-distance-fare"></span></li>
+            <li>Time: <span id="fare-time-fare"></span></li>
+          </ul>
+          <p id="fare-minimum" class="note" hidden>Minimum fare applied</p>
+          <p id="fare-capped" class="note" hidden>Your fare was capped at 150% of the estimate.</p>
+        </div>
+        <div id="fare-cancellation" hidden>
+          <p id="fare-fee"></p>
+          <p id="fare-reason" class="note" hidden></p>
+        </div>
+      </div>
+
       <div id="driver-section" hidden>
         <h3>Your driver</h3>
         <p><strong id="driver-name"></strong></p>

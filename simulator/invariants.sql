@@ -1,4 +1,4 @@
--- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3). Read-only. One SELECT per invariant, one row per offender:
+-- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1). Read-only. One SELECT per invariant, one row per offender:
 -- an empty result means the invariant holds. Used by simulator/stress.py, and runnable by hand:
 --   docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
 -- Statuses are stored as the enum names in upper case (VARCHAR, no CHECK constraint).
@@ -63,3 +63,42 @@ WHERE r.status IN ('DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'IN_PROGRESS')
     SELECT 1 FROM ride_offers o WHERE o.ride_id = r.id AND o.driver_id = r.driver_id AND o.status = 'ACCEPTED'
   )
 ORDER BY r.id;
+
+\echo '== completed_without_fare'
+-- I8: every COMPLETED ride has its fare, distance, duration, and a trip breakdown (settlement is in the same transaction as
+-- the status change). Rides completed before M5.1 carry the marker {"kind": "legacy"} and are left out.
+SELECT id AS ride_id, final_fare, actual_distance_m, actual_duration_s, fare_breakdown->>'kind' AS kind
+FROM rides
+WHERE status = 'COMPLETED'
+  AND (fare_breakdown->>'kind') IS DISTINCT FROM 'legacy'
+  AND (final_fare IS NULL OR actual_distance_m IS NULL OR actual_duration_s IS NULL OR fare_breakdown IS NULL
+       OR (fare_breakdown->>'kind') IS DISTINCT FROM 'trip' OR final_fare < 0)
+ORDER BY id;
+
+\echo '== cancelled_without_settlement'
+-- I9: every CANCELLED ride has a cancellation fee (which may be 0) that equals the fee in its breakdown. Legacy rides are left out.
+SELECT id AS ride_id, final_fare, fare_breakdown->>'kind' AS kind, fare_breakdown->>'fee' AS fee
+FROM rides
+WHERE status = 'CANCELLED'
+  AND (fare_breakdown->>'kind') IS DISTINCT FROM 'legacy'
+  AND (final_fare IS NULL OR final_fare < 0 OR (fare_breakdown->>'kind') IS DISTINCT FROM 'cancellation'
+       OR final_fare IS DISTINCT FROM (fare_breakdown->>'fee')::int)
+ORDER BY id;
+
+\echo '== fare_on_unsettled_ride'
+-- I10: a ride that is neither COMPLETED nor CANCELLED (active, or NO_DRIVER_FOUND) has no fare, no billed distance or
+-- duration, and no breakdown.
+SELECT id AS ride_id, status, final_fare, fare_breakdown->>'kind' AS kind
+FROM rides
+WHERE status NOT IN ('COMPLETED', 'CANCELLED')
+  AND (final_fare IS NOT NULL OR actual_distance_m IS NOT NULL OR actual_duration_s IS NOT NULL OR fare_breakdown IS NOT NULL)
+ORDER BY id;
+
+\echo '== fare_over_cap'
+-- I11: a trip fare is never above 150 percent of the estimate (integer division, like the code).
+SELECT id AS ride_id, final_fare, fare_estimate
+FROM rides
+WHERE status = 'COMPLETED'
+  AND (fare_breakdown->>'kind') = 'trip'
+  AND final_fare > fare_estimate * 150 / 100
+ORDER BY id;

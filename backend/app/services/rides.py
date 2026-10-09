@@ -13,7 +13,7 @@ from app.repositories import events
 from app.repositories import offers as offers_repo
 from app.repositories import rides as rides_repo
 from app.repositories import users as users_repo
-from app.schemas import DriverLocation, EstimateRequest, OtpResponse, RideCreate, RideDriverResponse, VehicleResponse
+from app.schemas import CancellationFeeResponse, DriverLocation, EstimateRequest, OtpResponse, RideCreate, RideDriverResponse, VehicleResponse
 from app.services import matching, pricing, routing
 from app.utils.geo import is_inside_bounds
 
@@ -198,6 +198,9 @@ async def driver_set_status(
         if ride.otp is None or not secrets.compare_digest(ride.otp, otp):
             raise HTTPException(status_code=400, detail="Incorrect trip code")
     await change_ride_status(db, ride, new_status, user.id)
+    # Settled in the same transaction, under the same ride lock, so a completed ride always has its fare.
+    if new_status == RideStatus.COMPLETED:
+        await pricing.settle_completed_ride(db, ride)
     await db.commit()
 
     await notify_ride_updated(db, ride)
@@ -206,7 +209,9 @@ async def driver_set_status(
 
 async def cancel(db: AsyncSession, user: User, ride_id: int) -> Ride:
     ride = await load_ride_for_user(db, user, ride_id, for_update=True)
+    previous_status = ride.status
     await change_ride_status(db, ride, RideStatus.CANCELLED, user.id)
+    await pricing.settle_cancelled_ride(db, ride, previous_status, user.role)
     # The ride is locked, and every offer change locks the ride first, so nobody can answer this offer meanwhile.
     offer = await offers_repo.get_pending_for_ride(db, ride.id)
     if offer is not None:
@@ -221,3 +226,12 @@ async def cancel(db: AsyncSession, user: User, ride_id: int) -> Ride:
         )
     await notify_ride_updated(db, ride)
     return ride
+
+
+async def get_cancellation_fee(db: AsyncSession, user: User, ride_id: int) -> CancellationFeeResponse:
+    """What cancelling would cost the rider right now. Same function as the real cancel; no lock, nothing written."""
+    ride = await load_ride_for_user(db, user, ride_id)
+    if ride.status not in (RideStatus.REQUESTED, RideStatus.DRIVER_ASSIGNED, RideStatus.DRIVER_ARRIVED):
+        raise HTTPException(status_code=409, detail="This ride can no longer be cancelled")
+    fee, reason = await pricing.cancellation_fee(db, ride, ride.status, UserRole.rider)
+    return CancellationFeeResponse(fee=fee, reason=reason)

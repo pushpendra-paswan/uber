@@ -70,6 +70,10 @@ INVARIANTS = {
     "overdue_pending_offers": ("I5", "offers", None, ("offer_id", "ride_id", "driver_id", "expires_at")),
     "orphan_pending_offers": ("I6", "offers", None, ("offer_id", "ride_id", "driver_id", "ride_status")),
     "assigned_without_accepted_offer": ("I7", "rides", None, ("ride_id", "driver_id", "status")),
+    "completed_without_fare": ("I8", "rides", None, ("ride_id", "final_fare", "actual_distance_m", "actual_duration_s", "kind")),
+    "cancelled_without_settlement": ("I9", "rides", None, ("ride_id", "final_fare", "kind", "fee")),
+    "fare_on_unsettled_ride": ("I10", "rides", None, ("ride_id", "status", "final_fare", "kind")),
+    "fare_over_cap": ("I11", "rides", None, ("ride_id", "final_fare", "fare_estimate")),
 }
 
 log = logging.getLogger("stress")
@@ -239,7 +243,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I7 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I11 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -252,7 +256,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all seven invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all eleven invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -266,7 +270,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I7 ok"
+    return ", ".join(parts) or "I1-I11 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -627,7 +631,7 @@ async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Rando
 
 
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I7 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I11 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -723,6 +727,15 @@ async def scenario_chaos(ctx: dict) -> None:
     )
     if other[0] != "0":
         log.warning("%s offers went to drivers that are not stress drivers: other drivers are online, the run is diluted", other[0])
+    # The money of the run, read-only: settled trips and the cancellation fees that were charged.
+    money = await sql(
+        ctx,
+        "SELECT count(*) FILTER (WHERE r.status = 'COMPLETED'), COALESCE(sum(r.final_fare) FILTER (WHERE r.status = 'COMPLETED'), 0), "
+        "count(*) FILTER (WHERE r.status = 'CANCELLED' AND r.final_fare > 0), "
+        "COALESCE(sum(r.final_fare) FILTER (WHERE r.status = 'CANCELLED' AND r.final_fare > 0), 0) "
+        f"FROM rides r WHERE {mine}",
+    )
+    ctx["money"] = [int(value) for value in money[0].split("|")]
 
 
 async def main() -> int:
@@ -921,6 +934,9 @@ async def main() -> int:
                  counters["double_accepts_one_200"], counters["rejects"], counters["ignores"], counters["offline_events"])
         log.info("  riders saw their rides end as: %s", dict(sorted((k[5:], v) for k, v in counters.items() if k.startswith("ride_"))))
         log.info("  final rides by status: %s", dict(sorted(ctx["chaos"]["ride"].items())))
+        completed, fares, fees, fee_total = ctx["money"]
+        log.info("  money: %d completed rides, final fares %d paise in all; %d cancelled rides with a fee, fees %d paise in all",
+                 completed, fares, fees, fee_total)
         log.info("  final offers by status: %s", dict(sorted(ctx["chaos"]["offer"].items())))
         log.info("  5xx answers: %d, connection errors: %d%s", server_errors, counters["transport_errors"],
                  " (tolerated)" if args.tolerate_5xx else "")

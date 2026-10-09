@@ -157,6 +157,9 @@ class RideResponse(BaseModel):
     duration_s: int | None
     fare_estimate: int | None
     final_fare: int | None
+    actual_distance_m: int | None
+    actual_duration_s: int | None
+    fare_breakdown: dict | None
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
@@ -178,6 +181,11 @@ class OfferResponse(BaseModel):
     fare_estimate: int | None  # paise
     pickup_distance_m: int
     expires_in: float  # seconds left, never negative
+
+
+class CancellationFeeResponse(BaseModel):
+    fee: int  # paise
+    reason: str
 
 
 class RideEventResponse(BaseModel):

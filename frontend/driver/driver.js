@@ -111,6 +111,7 @@ const rideId = document.getElementById("ride-id");
 const rideStatus = document.getElementById("ride-status");
 const rideStatusText = document.getElementById("ride-status-text");
 const rideNote = document.getElementById("ride-note");
+const rideFare = document.getElementById("ride-fare");
 const ridePickup = document.getElementById("ride-pickup");
 const rideDropoff = document.getElementById("ride-dropoff");
 const arriveButton = document.getElementById("arrive-button");
@@ -406,14 +407,24 @@ function render() {
 
     // Who cancelled comes from the last CANCELLED event: the actor is the driver (this user), the rider, or the system.
     const cancelled = status === "CANCELLED" ? state.events.findLast((event) => event.to_status === "CANCELLED") : null;
+    // Rides finished before the fare existed have no breakdown, or only a legacy marker.
+    const breakdown = state.ride.fare_breakdown;
+    const settled = state.ride.final_fare !== null && breakdown !== null && breakdown.kind !== "legacy";
     let note = "";
     if (cancelled) {
-      if (cancelled.actor_user_id === getSession().user.id) note = "You cancelled this ride.";
+      if (cancelled.actor_user_id === getSession().user.id) note = settled ? "You cancelled this ride. The rider was not charged." : "You cancelled this ride.";
       else if (cancelled.actor_user_id === null) note = "Ride cancelled.";
-      else note = "The rider cancelled this ride.";
+      else if (!settled) note = "The rider cancelled this ride.";
+      else if (breakdown.fee > 0) note = `The rider cancelled and was charged a cancellation fee of ${money.format(breakdown.fee / 100)}.`;
+      else note = "The rider cancelled. No fee was charged.";
     }
     rideNote.hidden = note === "";
     rideNote.textContent = note;
+    const showFare = settled && status === "COMPLETED";
+    rideFare.hidden = !showFare;
+    if (showFare) {
+      rideFare.textContent = `Trip fare: ${money.format(state.ride.final_fare / 100)} (${(breakdown.distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(breakdown.duration_s / 60))} min)`;
+    }
     ridePickup.textContent = state.ride.pickup_address;
     rideDropoff.textContent = state.ride.dropoff_address;
     arriveButton.hidden = status !== "DRIVER_ASSIGNED";

@@ -102,7 +102,9 @@ async def test_happy_path(client, rider, driver, assign_ride):
     response = await client.post(f"/rides/{ride_id}/complete", headers=driver["headers"])
     assert response.json()["status"] == "COMPLETED"
     assert response.json()["completed_at"] is not None
-    assert response.json()["final_fare"] is None
+    # No pings were sent, so the estimated distance is billed (test_fares.py covers the details).
+    assert response.json()["fare_breakdown"]["kind"] == "trip"
+    assert response.json()["final_fare"] == response.json()["fare_breakdown"]["computed_fare"]
 
     response = await client.get(f"/rides/{ride_id}/events", headers=rider["headers"])
     events = [(event["from_status"], event["to_status"], event["actor_user_id"]) for event in response.json()]

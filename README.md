@@ -264,6 +264,40 @@ docker compose exec redis redis-cli PUBLISH ws:events:0 '{"user_id": 5, "type": 
 
 The reply is the number of backend processes listening (1 in dev). Backend code sends events with `repositories/events.publish(user_id, type, data)`. Since M3.3 it is best-effort: if Redis fails it logs one warning and returns 0, and the request that sent the event is not affected.
 
+## Fares and cancellation fees (M5.1)
+
+When a trip is completed the server works out the **final fare** and stores it on the ride (`final_fare`, with `actual_distance_m`, `actual_duration_s`, and a `fare_breakdown`). Nothing is charged yet (payments are M5.3). The formula is the one the estimate uses (all money in integer paise, half rounded up):
+
+```
+fare = max(base + per_km x distance + per_min x time, minimum fare)         # seed rule: 5000, 1200 per km, 200 per minute, 8000
+final fare = min(fare, 150 percent of the estimate)
+```
+
+Worked example (a real simulator trip): 2977 m and 402 s give 5000 + (1200 x 2977 + 500) // 1000 + (200 x 402 + 30) // 60 = 5000 + 3572 + 1340 = **9912** paise (Rs 99.12), against an estimate of 9696 and a cap of 14544.
+
+- **Time** is `completed_at - started_at` on the server (at least 1 s).
+- **Distance is measured from the driver's location pings while the ride is in progress.** There is no location history, so each ping adds the straight-line distance from the previous one to a counter in Redis (`ride:<id>:trip`, kept 24 hours). A ping less than 1 s after the last one is ignored, and a move faster than 45 m/s (162 km/h) is treated as a jump and adds nothing. The first and last ping interval of a trip are lost, so a tracked trip is usually a little short.
+- **When tracking is missing or unreliable the ESTIMATED distance is billed**, because it is the route the rider agreed to: no counter or fewer than 2 pings (`no_tracking`, also when Redis is down), or jumps seen and a tracked distance under 50 percent of the estimate (`unreliable_tracking`). Trips driven by hand on the driver page (clicking the map) usually bill the estimated distance; the simulator gives distance-based fares.
+- **Cap:** the rider never pays more than 150 percent of the estimate. There is no lower limit, so a shorter trip costs less.
+- If there is no pricing rule, completing answers 503 `Pricing is not configured`, the ride stays in progress, and the driver can retry.
+
+**Cancellation fee** (the amount, 3000 paise = Rs 30, and the free window, 120 s, are columns of the pricing rule; the table is code):
+
+| Who cancels | Ride status | Fee |
+|---|---|---|
+| driver | any allowed | 0 |
+| rider | REQUESTED | 0 |
+| rider | DRIVER_ASSIGNED, within the free window after the assignment | 0 |
+| rider | DRIVER_ASSIGNED, later | 3000 |
+| rider | DRIVER_ARRIVED | 3000 |
+
+Cancelling a trip in progress is not possible. The rider can ask first: `GET /rides/{id}/cancellation-fee` answers `{"fee": 3000, "reason": "driver_arrived"}` and uses the same function as the cancel (the rider page shows it in the confirm box). The fee is stored as the ride's `final_fare`; a ride that ends as NO_DRIVER_FOUND keeps `final_fare` NULL.
+
+```bash
+docker compose exec -T db psql -U uber -d uber -c "SELECT id, status, final_fare, fare_breakdown FROM rides ORDER BY id DESC LIMIT 10"
+docker compose exec redis redis-cli HGETALL ride:<id>:trip      # the distance counter while a trip is in progress
+```
+
 ## Concurrency stress test (M4.1, M4.2, M4.3)
 
 `simulator/stress.py` fires many requests at the same instant and then looks in the database for broken invariants. M4.1 used it to reproduce a real bug (the offer flow checked "is this driver free?" and wrote the offer in separate steps, with no lock in between); M4.2 fixed it with row locks in Postgres (the rider's `users` row in `POST /rides`, the driver's `drivers` row in matching and in accept; see `PROJECT_CONTEXT.md`). **Exit code 0 ("no violation observed") is the expected result for every scenario, including `chaos` (M4.3).** An exit code of 1 means a lock is missing or broken.
@@ -321,8 +355,12 @@ The container has no `pkill`; `docker compose up -d --force-recreate backend` st
 | I5 `overdue_pending_offers` | no PENDING offer more than 10 s past its deadline (the sweeper is dead or not keeping up) |
 | I6 `orphan_pending_offers` | no PENDING offer on a ride that is not REQUESTED |
 | I7 `assigned_without_accepted_offer` | every DRIVER_ASSIGNED, DRIVER_ARRIVED, or IN_PROGRESS ride has an ACCEPTED offer for its own driver |
+| I8 `completed_without_fare` | every COMPLETED ride has `final_fare`, `actual_distance_m`, `actual_duration_s`, and a `trip` breakdown (rides settled before M5.1 carry `{"kind": "legacy"}` and are left out) |
+| I9 `cancelled_without_settlement` | every CANCELLED ride has a `cancellation` breakdown and a `final_fare` (the fee, which may be 0) equal to the fee in it (legacy rides left out) |
+| I10 `fare_on_unsettled_ride` | no ride that is neither COMPLETED nor CANCELLED (active, or NO_DRIVER_FOUND) has a fare, a billed distance or duration, or a breakdown |
+| I11 `fare_over_cap` | no trip fare is above 150 percent of the ride's estimate (integer division, like the code) |
 
-I4 to I7 cannot be legitimately violated even for an instant (each pair of changes is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
+I4 to I11 cannot be legitimately violated even for an instant (each pair of changes, and each status change with its settlement, is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
 
 ```bash
 docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql

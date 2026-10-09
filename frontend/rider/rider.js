@@ -14,6 +14,13 @@ const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const TRACKING = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS"]; // the driver's position is shown only in these
 const CODE_STATUSES = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED"]; // the trip code is asked for and shown only in these
+const CANCEL_REASON_TEXT = {
+  no_driver_yet: "No driver had been assigned yet",
+  within_free_window: "You cancelled within the free cancellation window",
+  late_cancellation: "You cancelled after the free cancellation window",
+  driver_arrived: "Your driver had already arrived",
+  driver_cancelled: "The driver cancelled",
+};
 const CLOSE_REPLACED = 4409; // ws.js reports it as "closed": this account has too many tabs
 const MEANWHILE = "Updating every few seconds meanwhile.";
 const TRACKING_TEXT = {
@@ -119,6 +126,21 @@ const estimateBase = document.getElementById("estimate-base");
 const estimateDistanceFare = document.getElementById("estimate-distance-fare");
 const estimateTimeFare = document.getElementById("estimate-time-fare");
 const estimateMinimum = document.getElementById("estimate-minimum");
+const fareSection = document.getElementById("fare-section");
+const fareTrip = document.getElementById("fare-trip");
+const fareTotal = document.getElementById("fare-total");
+const fareEstimate = document.getElementById("fare-estimate");
+const fareDistance = document.getElementById("fare-distance");
+const fareDistanceNote = document.getElementById("fare-distance-note");
+const fareTime = document.getElementById("fare-time");
+const fareBase = document.getElementById("fare-base");
+const fareDistanceFare = document.getElementById("fare-distance-fare");
+const fareTimeFare = document.getElementById("fare-time-fare");
+const fareMinimum = document.getElementById("fare-minimum");
+const fareCapped = document.getElementById("fare-capped");
+const fareCancellation = document.getElementById("fare-cancellation");
+const fareFee = document.getElementById("fare-fee");
+const fareReason = document.getElementById("fare-reason");
 const rideTrip = document.getElementById("ride-trip");
 const rideFare = document.getElementById("ride-fare");
 
@@ -500,6 +522,30 @@ function render() {
     rideNote.hidden = note === "";
     rideNote.textContent = note;
 
+    // The fare is shown for a settled ride only. Rides finished before the fare existed have no amount (final_fare is null).
+    const breakdown = state.ride.fare_breakdown;
+    const settled = state.ride.final_fare !== null && breakdown !== null && breakdown.kind !== "legacy";
+    fareSection.hidden = !settled;
+    fareTrip.hidden = !settled || breakdown.kind !== "trip";
+    fareCancellation.hidden = !settled || breakdown.kind !== "cancellation";
+    if (!fareTrip.hidden) {
+      fareTotal.textContent = money.format(state.ride.final_fare / 100);
+      fareEstimate.textContent = money.format(state.ride.fare_estimate / 100);
+      fareDistance.textContent = `${(breakdown.distance_m / 1000).toFixed(1)} km`;
+      fareDistanceNote.hidden = breakdown.distance_source !== "estimate";
+      fareTime.textContent = `${Math.floor(breakdown.duration_s / 60)} min ${breakdown.duration_s % 60} s`;
+      fareBase.textContent = money.format(breakdown.base_fare / 100);
+      fareDistanceFare.textContent = money.format(breakdown.distance_fare / 100);
+      fareTimeFare.textContent = money.format(breakdown.time_fare / 100);
+      fareMinimum.hidden = !breakdown.minimum_fare_applied;
+      fareCapped.hidden = !breakdown.capped;
+    }
+    if (!fareCancellation.hidden) {
+      fareFee.textContent = breakdown.fee > 0 ? `Cancellation fee: ${money.format(breakdown.fee / 100)}` : "No cancellation fee.";
+      fareReason.hidden = breakdown.fee === 0;
+      fareReason.textContent = CANCEL_REASON_TEXT[breakdown.reason] || "";
+    }
+
     codeSection.hidden = !CODE_STATUSES.includes(state.ride.status) || state.otp === null;
     tripCode.textContent = state.otp === null ? "" : state.otp;
     ridePickup.textContent = state.ride.pickup_address;
@@ -617,8 +663,14 @@ requestButton.addEventListener("click", () => {
 
 reconnectButton.addEventListener("click", () => act(() => reconnectNow()));
 
+// The quote and the cancel are one action, so a failed quote shows its error and cancels nothing.
 cancelButton.addEventListener("click", () => {
-  if (confirm("Cancel this ride?")) act(() => api("POST", `/rides/${state.ride.id}/cancel`));
+  act(async () => {
+    const quote = await api("GET", `/rides/${state.ride.id}/cancellation-fee`);
+    const fee = quote.fee === 0 ? "There is no cancellation fee." : `You will be charged a cancellation fee of ${money.format(quote.fee / 100)}.`;
+    if (!confirm(`Cancel this ride? ${fee}`)) return;
+    await api("POST", `/rides/${state.ride.id}/cancel`);
+  });
 });
 
 newRideButton.addEventListener("click", () => {

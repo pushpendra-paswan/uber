@@ -110,8 +110,8 @@ uber-clone/
 │   └── admin/                 # index.html, admin.js, admin.css
 └── simulator/
     ├── simulator.py           # fake drivers (M2.5)
-    ├── stress.py              # fires simultaneous requests and checks seven database invariants; scenarios drivers, riders, fleet (M4.1) and chaos (M4.3)
-    ├── invariants.sql         # the seven invariants I1 to I7, read-only SQL, run by stress.py or by hand
+    ├── stress.py              # fires simultaneous requests and checks eleven database invariants; scenarios drivers, riders, fleet (M4.1) and chaos (M4.3)
+    ├── invariants.sql         # the eleven invariants I1 to I11, read-only SQL, run by stress.py or by hand
     └── requirements.txt       # httpx only
 ```
 
@@ -153,8 +153,19 @@ Three places read "is this free?" and then write: `create_ride` (the rider has n
 - **`IntegrityError` is caught narrowly, only at the three places that can hit an index**, and never becomes a 500: `create_ride` wraps the ride creation through the commit (rollback, 409 "You already have an active ride"); `matching.offer_to_next_driver` wraps the offer insert in a savepoint (`async with db.begin_nested():`), catches the error outside it, logs WARNING `offer skipped for driver <id>: <error text>` and moves to the next candidate; `accept` wraps everything from the first change through the commit (rollback, 409). The warning means a lock failed; with the locks working it never fires. Any new code that reads availability or an active-ride count and then writes gets the lock AND handles the index it can hit.
 - **The sweeper withdraws offers of vanished drivers.** `expire_due_offers` reads all PENDING offers (`offers_repo.list_pending(db, limit)`), does ONE `drivers.get_online_ids` call (never with an empty list), and closes an offer when its deadline has passed (reason `expired`) or else when its driver has no presence key (reason `driver_offline`: offline, rejected by an admin, or the page died; time wins when both apply). Each offer is handled in a new session that locks the ride, then the offer, and re-checks that it is still pending and still due. A failing offer is logged once per offer id and the pass goes on; outage errors (`RedisError`, `OSError`, `InterfaceError`, `OperationalError`) abort the pass.
 - **`offer_closed` reasons:** accepted, rejected, expired, ride_cancelled, driver_offline. Nothing may assume a fixed list of three.
-- **Invariants I1 to I7** (`simulator/invariants.sql`, checked by every `simulator/stress.py` scenario): I1 one live pending offer per driver, I2 one active ride per driver, I3 one active ride per rider, I4 no REQUESTED ride without a PENDING offer, I5 no PENDING offer more than 10 s overdue, I6 no PENDING offer on a ride that is not REQUESTED, I7 every assigned, arrived, or in-progress ride has an ACCEPTED offer for its own driver. None can be legitimately violated even for an instant, so any sighting counts. The `chaos` scenario (random riders and drivers, a settle period, STUCK = a REQUESTED ride or PENDING offer left after it) must end `CHAOS CLEAN`; every scenario is expected to exit 0.
+- **Invariants I1 to I11** (`simulator/invariants.sql`, checked by every `simulator/stress.py` scenario): I1 one live pending offer per driver, I2 one active ride per driver, I3 one active ride per rider, I4 no REQUESTED ride without a PENDING offer, I5 no PENDING offer more than 10 s overdue, I6 no PENDING offer on a ride that is not REQUESTED, I7 every assigned, arrived, or in-progress ride has an ACCEPTED offer for its own driver, and since M5.1 I8 every COMPLETED ride has its fare and a `trip` breakdown, I9 every CANCELLED ride has its fee and a `cancellation` breakdown, I10 no unsettled ride has a fare, I11 no trip fare is above 150 percent of the estimate (rides marked `legacy` are left out of I8 and I9). None can be legitimately violated even for an instant, so any sighting counts. The `chaos` scenario (random riders and drivers, a settle period, STUCK = a REQUESTED ride or PENDING offer left after it) must end `CHAOS CLEAN`; every scenario is expected to exit 0.
 - **Tests that need the forbidden state** (two pending offers for one driver, two active rides for one rider) cannot insert it any more: reach the code another way, or use the `locks_disabled` fixture to prove what the indexes alone do.
+
+### Money rules (M5.1)
+
+- **All fare logic lives in `services/pricing.py`:** `calculate_fare`, `record_trip_point`, `settle_completed_ride`, `cancellation_fee`, `settle_cancelled_ride`. `services/rides.py` and `services/drivers.py` call it; there is no fare arithmetic anywhere else.
+- **Amounts are integer paise.** The one float is the distance accumulator in Redis, rounded to an integer before it is billed.
+- **`rides.final_fare` is what the rider owes, set exactly once.** COMPLETED: the trip fare. CANCELLED: the cancellation fee, which may be 0. NO_DRIVER_FOUND and every active status: NULL. It is stored, not charged (payments are M5.3). `fare_estimate` stays the upfront estimate.
+- **Settlement is in the same transaction, under the same ride lock, as the status change** (`driver_set_status` for COMPLETED, `cancel` for CANCELLED), so a settled ride always has its fare and two requests cannot settle it twice. A missing pricing rule gives 503 and the ride keeps its status, so the driver can retry. Completing a trip keeps working when Redis is down.
+- **The breakdown (`rides.fare_breakdown`, JSONB) stores amounts, not rates**, so a later rule change leaves old rides alone. Kinds: `trip`, `cancellation`, and `legacy` (a data migration marks rides settled before M5.1; invariants and receipts skip them).
+- **Actual distance comes from the driver's pings while the ride is IN_PROGRESS** (there is no location history). Each ping is added to the Redis hash `ride:{ride_id}:trip` (`distance_m`, `lat`, `lng`, `ts`, `pings`, `jumps`; TTL 24 h, never deleted): pings less than `MIN_PING_GAP_S` apart are ignored, a segment faster than `MAX_PLAUSIBLE_SPEED_MS` counts as a jump and adds no distance. Recording never fails a ping (a `RedisError` is logged and swallowed).
+- **The estimated distance is billed when tracking is missing or unreliable** (`no_tracking`, `unreliable_tracking`), because it is the route the rider agreed to. The fare is capped at `FARE_CAP_PERCENT` of the estimate; there is no lower bound.
+- **The cancellation quote and the real cancel call the same function** (`pricing.cancellation_fee`), so they cannot disagree. A driver never causes a fee.
 
 ## Coding style
 
@@ -273,7 +284,7 @@ Done when: an entire trip completes across two browser windows with live movemen
 Done when: a stress test shows zero double assignments and no stuck rides.
 
 ### Phase 5: Pricing and Payments
-- **M5.1 Final fare:** computed from actual trip distance and time, plus cancellation fees
+- **M5.1 Final fare:** final fare from tracked distance and actual time with a cap, and cancellation fees
 - **M5.2 Surge pricing:** geohash zones, multiplier from the open-requests-to-available-drivers ratio, with a cap
 - **M5.3 Payments:** internal wallet first, then Stripe test mode, with idempotency keys and a webhook handler
 - **M5.4 Money views:** driver earnings, platform commission, rider receipts

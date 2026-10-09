@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Ride, RideEvent, RideStatus, User
 from app.schemas import (
+    CancellationFeeResponse,
     EstimateRequest,
     EstimateResponse,
     OtpResponse,
@@ -56,6 +57,13 @@ async def get_ride_otp(
     ride_id: int, user: User = Depends(require_role("rider")), db: AsyncSession = Depends(get_db)
 ) -> OtpResponse:
     return await rides_service.get_otp(db, user, ride_id)
+
+
+@router.get("/{ride_id}/cancellation-fee", response_model=CancellationFeeResponse)
+async def get_cancellation_fee(
+    ride_id: int, user: User = Depends(require_role("rider")), db: AsyncSession = Depends(get_db)
+) -> CancellationFeeResponse:
+    return await rides_service.get_cancellation_fee(db, user, ride_id)
 
 
 @router.get("/{ride_id}/events", response_model=list[RideEventResponse])

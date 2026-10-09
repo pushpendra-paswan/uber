@@ -3,6 +3,7 @@ import collections
 import contextlib
 import os
 import time
+import types
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -24,12 +25,12 @@ from app import database  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.database import Base, get_db, redis_client  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Driver, PricingRule, Ride, RideStatus, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
+from app.models import Driver, PricingRule, Ride, RideEvent, RideStatus, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
 from app.repositories import drivers as drivers_repo  # noqa: E402
 from app.repositories import users as users_repo  # noqa: E402
 from app.routers import websocket as websocket_router  # noqa: E402
 from app.security import create_access_token  # noqa: E402
-from app.services import routing  # noqa: E402
+from app.services import pricing, routing  # noqa: E402
 from test_rides import RIDE_BODY  # noqa: E402
 
 # Tests never touch the dev database: they use a copy of its name with a _test suffix.
@@ -67,7 +68,8 @@ async def clean_tables(test_engine):
         # Same values as the seed migration (paise). TRUNCATE removed the migration's row, so put it back.
         await connection.execute(
             PricingRule.__table__.insert().values(
-                vehicle_type="economy", base_fare=5000, per_km=1200, per_min=200, min_fare=8000, surge_cap=2.0
+                vehicle_type="economy", base_fare=5000, per_km=1200, per_min=200, min_fare=8000, surge_cap=2.0,
+                cancellation_fee=3000, free_cancel_seconds=120,
             )
         )
 
@@ -94,6 +96,21 @@ def fake_route(monkeypatch):
         return {"distance_m": 5000, "duration_s": 900, "path": [[pickup_lat, pickup_lng], [dropoff_lat, dropoff_lng]]}
 
     monkeypatch.setattr(routing, "get_route", get_route)
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Replaces the `time` module inside services/pricing.py (the trip meter's clock) with an object whose time() is
+    controlled by the test: clock.now is the value, clock.advance(seconds) moves it."""
+    clock = types.SimpleNamespace(now=1_000_000.0)
+    clock.time = lambda: clock.now
+
+    def advance(seconds: float) -> None:
+        clock.now += seconds
+
+    clock.advance = advance
+    monkeypatch.setattr(pricing, "time", clock)
+    return clock
 
 
 def widen(monkeypatch, module, name: str, seconds: float, first_call_only: bool = False) -> None:
@@ -242,7 +259,9 @@ async def assign_ride(client, put_online, accept_offer):
 @pytest_asyncio.fixture
 async def insert_ride(db: AsyncSession):
     """Returns a function that inserts a ride straight into the database in the given status, with no matching.
-    DRIVER_ASSIGNED and DRIVER_ARRIVED rides get the trip code 1234, unless with_otp is False."""
+    DRIVER_ASSIGNED and DRIVER_ARRIVED rides get the trip code 1234, unless with_otp is False. Every ride gets the numbers
+    the fake route gives (5000 m, 900 s, fare 14000), because settlement uses them; a ride that was assigned has its
+    DRIVER_ASSIGNED event, and an IN_PROGRESS ride has started_at."""
 
     async def create(rider: dict, status: RideStatus, driver: dict | None = None, with_otp: bool = True) -> Ride:
         # A ride that was assigned through the real flow has the trip code until the trip starts or is cancelled.
@@ -258,8 +277,15 @@ async def insert_ride(db: AsyncSession):
             dropoff_lat=(settings.city_center_lat + settings.city_south) / 2,
             dropoff_lng=(settings.city_center_lng + settings.city_east) / 2,
             dropoff_address="Koramangala",
+            distance_m=5000,
+            duration_s=900,
+            fare_estimate=14000,
+            started_at=datetime.now(timezone.utc) if status == RideStatus.IN_PROGRESS else None,
         )
         db.add(ride)
+        await db.flush()
+        if status in (RideStatus.DRIVER_ASSIGNED, RideStatus.DRIVER_ARRIVED, RideStatus.IN_PROGRESS):
+            db.add(RideEvent(ride_id=ride.id, from_status=RideStatus.REQUESTED, to_status=RideStatus.DRIVER_ASSIGNED))
         await db.commit()
         return ride
 
