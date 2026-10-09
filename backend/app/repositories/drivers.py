@@ -1,9 +1,10 @@
 import time
 
-from sqlalchemy import exists, select
+from sqlalchemy import exists, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app import database
 from app.database import redis_client
 from app.models import ACTIVE_RIDE_STATUSES, Driver, OfferStatus, Ride, RideOffer, VerificationStatus, Vehicle
 
@@ -133,3 +134,15 @@ async def get_available_ids(db: AsyncSession, driver_ids: list[int]) -> set[int]
         )
     )
     return set(result.scalars().all())
+
+
+async def try_lock(db: AsyncSession, driver_id: int) -> bool:
+    """Takes the driver's row (FOR UPDATE SKIP LOCKED) until commit or rollback. False means someone else holds it."""
+    result = await db.execute(select(Driver.id).where(Driver.id == driver_id).with_for_update(skip_locked=True))
+    return result.first() is not None
+
+
+async def lock(db: AsyncSession, driver_id: int) -> None:
+    """Blocks until this driver's row is ours (FOR UPDATE), at most LOCK_WAIT_MS; the lock lasts until commit or rollback."""
+    await db.execute(text(f"SET LOCAL lock_timeout = {int(database.LOCK_WAIT_MS)}"))
+    await db.execute(select(Driver.id).where(Driver.id == driver_id).with_for_update())

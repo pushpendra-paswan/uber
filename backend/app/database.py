@@ -7,6 +7,9 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
 
+# How long a request waits for a row lock held by someone else before answering 503 (repositories/users.py, drivers.py).
+LOCK_WAIT_MS = 3000
+
 # Predictable constraint names, so Alembic migrations can drop and alter them by name.
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",

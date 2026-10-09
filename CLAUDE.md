@@ -89,8 +89,8 @@ uber-clone/
 │   │   │   ├── places.py      # Nominatim search/reverse proxy, map config
 │   │   │   └── routing.py     # OSRM route: distance, duration, path as [lat, lng]
 │   │   ├── repositories/      # all database and Redis access
-│   │   │   ├── users.py
-│   │   │   ├── drivers.py     # includes driver locations in Redis GEO
+│   │   │   ├── users.py       # includes lock(): FOR UPDATE on the user's row (M4.2)
+│   │   │   ├── drivers.py     # includes driver locations in Redis GEO, and try_lock() / lock(): FOR UPDATE on the driver's row (M4.2)
 │   │   │   ├── events.py      # WebSocket events: Redis pub/sub publish and subscribe
 │   │   │   ├── offers.py
 │   │   │   ├── rides.py
@@ -137,6 +137,17 @@ Services raise `HTTPException` directly. No custom exception hierarchy.
 
 **Lock order:** whenever more than one row is locked, lock the RIDE row first, then the OFFER row (accept, reject, expiry, and cancel all do). This prevents deadlocks between them. The first read of an offer before the lock selects only columns, because SQLAlchemy's identity map would otherwise return a stale copy of the entity for the locked read.
 
+### Concurrency rules
+
+Three places read "is this free?" and then write: `create_ride` (the rider has no active ride), `matching.offer_to_next_driver` (the driver is available), and `offers.accept` (the driver has no active ride). Each one holds a Postgres row lock (`FOR UPDATE`) from before the deciding check until after the commit. Any new code that reads availability or an active-ride count and then writes must follow the same rules:
+
+- **Lock, then check as a separate statement, then write, then commit.** The lock is released by the commit or the rollback; there is nothing to release by hand. Under READ COMMITTED every statement takes a fresh snapshot, so only a check that starts after the lock sees what the previous lock holder committed. A check that was already running when the lock was granted (an earlier prefilter, or a WHERE clause inside the locking query) can be stale. The prefilter in matching is kept as a cheap way to avoid useless locks, and the check after the lock decides.
+- **The lock query is a column-only select** (`select(Driver.id)...with_for_update()`), never an entity load, so the identity map cannot return an older copy.
+- **Never hold a lock across an OSRM or Nominatim call.** `create_ride` locks the rider's row after `estimate_ride`, and keeps the unlocked first check as the cheap early exit.
+- **Lock order.** Blocking locks are taken only as: ride row, offer row, driver row (accept); or the rider's user row and nothing else that blocks (create_ride). Every lock taken while another is held in matching is non-blocking (`SKIP LOCKED`), so no cycle can form.
+- **Offers skip busy drivers, riders and accepts wait.** If a candidate's row is locked, matching moves on to the next candidate: someone else is deciding about that driver right now, and waiting would line up the whole city behind one driver. `users.lock` and `drivers.lock` wait at most `database.LOCK_WAIT_MS` (3000 ms, `SET LOCAL lock_timeout`) and the service answers 503 `Busy, please retry` (it catches only SQLSTATE 55P03, nothing broader).
+- **Tests widen the race window with `widen()`** in `tests/conftest.py` (a repository function sleeps after computing its result), never with a sleep in production code. A new lock needs a test that fails without it.
+
 ## Coding style
 
 The code in this project is **simple and plain**. A beginner should be able to read any file top to bottom and follow it. The layers above are the only structure; do not add more.
@@ -160,6 +171,7 @@ The code in this project is **simple and plain**. A beginner should be able to r
 
 - `ALLOWED_TRANSITIONS` dict and one `change_ride_status()` function in `services/rides.py`. Every ride status change goes through it, and it writes to `ride_events`.
 - `finish_offer()` in `services/offers.py`: closes an offer that was rejected or ran out of time, then offers the ride to the next driver or ends it. Used by reject and by expiry, so it is the one private helper in that file.
+- `users.lock()`, `drivers.try_lock()`, and `drivers.lock()` in the repositories: the row locks of the concurrency rules above. Their callers in the services wrap only `users.lock` and `drivers.lock` in a `try/except` for the lock timeout.
 - `notify_ride_updated()` in `services/rides.py`: after the commit, publishes `ride_updated` to the ride's rider and its assigned driver. Used by `driver_set_status` and `cancel`, so it is the one private helper in that file.
 - `get_current_user` and role-check dependencies in `security.py`, and `user_from_token` (the one place a JWT becomes a user, shared by HTTP and WebSocket auth).
 - `api.js` in `frontend/shared/`, since all three frontends call the backend.
@@ -206,7 +218,7 @@ docker compose exec backend alembic upgrade head
 docker compose exec backend alembic revision --autogenerate -m "message"
 docker compose exec backend pytest
 python simulator/simulator.py --drivers 50 --admin-email ... --admin-password ...   # on the host, in a venv with simulator/requirements.txt
-python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...   # M4.1: simultaneous requests + invariant checks; exit 1 = race reproduced (expected until M4.2); --cleanup-only clears it
+python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...   # M4.1/M4.2: simultaneous requests + invariant checks; exit 0 = no violation (expected), exit 1 = an invariant broke; --api-url takes two comma-separated URLs; --cleanup-only clears it
 ```
 
 ## Milestones

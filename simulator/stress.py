@@ -1,8 +1,8 @@
 """Concurrency stress test (M4.1). Runs on the host and fires many requests at the same instant, then looks in
 the database for broken invariants (simulator/invariants.sql) and prints how often each one broke.
 
-It only REPRODUCES AND MEASURES the double-booking bug. It fixes nothing. Exit code 1 (an invariant broke) is the
-expected result until M4.2.
+It checks the fix for the double-booking bug (M4.2): exit code 0 is the expected result. Before M4.2 it reproduced
+the bug, and exit code 1 (an invariant broke) was expected. It changes nothing in the backend.
 
 Everything that changes state goes through the public API. The only direct database access is read-only SELECTs
 through `docker compose exec db psql`. It never touches Redis, Nominatim, or OpenStreetMap (only our API and OSRM).
@@ -10,6 +10,7 @@ through `docker compose exec db psql`. It never touches Redis, Nominatim, or Ope
 Usage: python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...
 Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulator.py fleet).
 Stop simulator.py for the drivers and riders scenarios: its drivers would join the test.
+--api-url takes several comma-separated URLs (two backend processes): requests are spread over them round-robin.
 """
 import argparse
 import asyncio
@@ -174,19 +175,24 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
     Returns {"results": [{"status", "body", "ms"}] in request order, "summary": text}.
     """
     client = ctx["api"]
+    urls = ctx["args"].api_urls
+    # Request number i goes to URL i % number of URLs, so the repeats of one rider alternate between processes.
     if ctx["args"].sequential:
         started = time.monotonic()
         outcomes = []
-        for token, method, path, body in requests:
+        for index, (token, method, path, body) in enumerate(requests):
             try:
-                outcomes.append(await api(client, method, path, token, body))
+                outcomes.append(await api(client, method, urls[index % len(urls)] + path, token, body))
             except httpx.HTTPError as error:
                 outcomes.append(error)
         seconds = time.monotonic() - started
     else:
-        await asyncio.gather(*[client.get("/health") for _ in requests])
+        await asyncio.gather(*[client.get(urls[index % len(urls)] + "/health") for index in range(len(requests))])
         gate = asyncio.Event()
-        tasks = [asyncio.create_task(api(client, method, path, token, body, gate)) for token, method, path, body in requests]
+        tasks = [
+            asyncio.create_task(api(client, method, urls[index % len(urls)] + path, token, body, gate))
+            for index, (token, method, path, body) in enumerate(requests)
+        ]
         await asyncio.sleep(BARRIER_WAIT_S)
         started = time.monotonic()
         gate.set()
@@ -355,6 +361,10 @@ async def scenario_drivers(ctx: dict) -> None:
                 "AND o.status = 'PENDING' AND o.expires_at > now() ORDER BY o.id",
             )
             offers = [row.split("|") for row in rows]
+        expected = min(args.riders, args.drivers)
+        ctx["offers"]["got"] += len(offers)
+        ctx["offers"]["expected"] += expected
+        ctx["offers"]["lost_rounds"] += len(offers) < expected
         mine = [(offer_id, email) for offer_id, email in offers if email in ctx["tokens"] and email.startswith("stress-driver-")]
         if len(mine) != len(offers):
             log.warning("round %d: offers went to drivers that are not stress drivers (%s): other drivers are online, "
@@ -363,7 +373,8 @@ async def scenario_drivers(ctx: dict) -> None:
         # Every live offer is accepted at the same moment, each with its own driver's token.
         accepted = await burst(ctx, [(ctx["tokens"][email], "POST", f"/offers/{offer_id}/accept", None) for offer_id, email in mine])
         invariants = await check_invariants(ctx, seen)  # I2 is the point here
-        log.info("drivers round %d/%d: %s; accepts: %s; %s", round_number, args.rounds, fired["summary"], accepted["summary"], invariants)
+        log.info("drivers round %d/%d: %s; offers %d/%d; accepts: %s; %s",
+                 round_number, args.rounds, fired["summary"], len(offers), expected, accepted["summary"], invariants)
         if not (round_number == args.rounds and args.keep_last_round):
             await cleanup(ctx)
 
@@ -476,7 +487,7 @@ async def main() -> int:
     parser.add_argument("--scenario", choices=["drivers", "riders", "fleet"], default="drivers")
     parser.add_argument("--admin-email", default=os.environ.get("SIM_ADMIN_EMAIL"), help="or env SIM_ADMIN_EMAIL")
     parser.add_argument("--admin-password", default=os.environ.get("SIM_ADMIN_PASSWORD"), help="or env SIM_ADMIN_PASSWORD")
-    parser.add_argument("--api-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--api-url", default="http://127.0.0.1:8000", help="one URL, or several separated by commas (two backend processes)")
     parser.add_argument("--osrm-url", default="http://127.0.0.1:5000")
     parser.add_argument("--center-lat", type=float, help="default: the city center")
     parser.add_argument("--center-lng", type=float, help="default: the city center")
@@ -490,6 +501,7 @@ async def main() -> int:
     parser.add_argument("--sequential", action="store_true", help="control run: one request after another, no race expected")
     parser.add_argument("--keep-last-round", action="store_true", help="skip the cleanup after the last round")
     parser.add_argument("--cleanup-only", action="store_true", help="only cancel the stress riders' rides and take the stress drivers offline")
+    parser.add_argument("--label", default="", help="free text printed in the summary, to tell saved outputs apart")
     parser.add_argument("--psql-user", help="default: POSTGRES_USER from .env")
     parser.add_argument("--psql-db", help="default: POSTGRES_DB from .env")
     args = parser.parse_args()
@@ -521,36 +533,47 @@ async def main() -> int:
         parser.error("--spread-m must not be negative and --watch-seconds must be positive")
     if (args.center_lat is None) != (args.center_lng is None):
         parser.error("--center-lat and --center-lng must be given together")
+    args.api_urls = [url.strip().rstrip("/") for url in args.api_url.split(",") if url.strip()]
+    if not args.api_urls:
+        parser.error("--api-url needs at least one URL")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # it logs every request at INFO
     log.info(
         "settings: scenario=%s rounds=%d riders=%d drivers=%s repeat=%s spread=%g m watch=%g s sequential=%s keep_last_round=%s "
-        "cleanup_only=%s seed=%s api=%s osrm=%s psql=%s/%s",
+        "cleanup_only=%s seed=%s api=%s osrm=%s psql=%s/%s label=%s",
         args.scenario, args.rounds, args.riders, args.drivers if args.scenario != "fleet" else "n/a",
         args.repeat if args.scenario == "riders" else "n/a", args.spread_m, args.watch_seconds, args.sequential,
-        args.keep_last_round, args.cleanup_only, args.seed, args.api_url, args.osrm_url, args.psql_user, args.psql_db,
+        args.keep_last_round, args.cleanup_only, args.seed, ",".join(args.api_urls), args.osrm_url, args.psql_user, args.psql_db,
+        args.label or "-",
     )
 
     ctx = {
         "args": args, "rng": random.Random(args.seed), "sem": asyncio.Semaphore(SETUP_CONCURRENCY), "tokens": {},
         "driver_emails": [], "rounds": [], "checks": 0, "latencies": {}, "per_rider": {}, "fleet": {"rides": 0, "no_driver": 0},
-        "finished": False, "unsettled": False,
+        "finished": False, "unsettled": False, "offers": {"got": 0, "expected": 0, "lost_rounds": 0},
     }
     failure = None
     interrupted = False
     # keepalive_expiry is below uvicorn's 5 s keep-alive timeout, as in simulator.py.
     limits = httpx.Limits(max_connections=MAX_CONNECTIONS, max_keepalive_connections=MAX_CONNECTIONS, keepalive_expiry=2)
-    async with httpx.AsyncClient(base_url=args.api_url, timeout=API_TIMEOUT_S, limits=limits) as api_client, \
+    async with httpx.AsyncClient(base_url=args.api_urls[0], timeout=API_TIMEOUT_S, limits=limits) as api_client, \
             httpx.AsyncClient(base_url=args.osrm_url, timeout=OSRM_TIMEOUT_S) as osrm_client:
         ctx["api"] = api_client
         ctx["osrm"] = osrm_client
         try:
             if not args.cleanup_only:
+                for url in args.api_urls:
+                    try:
+                        health = await api_client.get(f"{url}/health")
+                    except httpx.HTTPError as error:
+                        raise RuntimeError(f"cannot reach the API at {url}: {error!r}")
+                    if health.status_code != 200:
+                        raise RuntimeError(f"the API at {url} is not healthy ({health.status_code}): {health.text}")
                 try:
                     response = await api(api_client, "POST", "/auth/login", None, {"email": args.admin_email, "password": args.admin_password})
                 except httpx.HTTPError as error:
-                    raise RuntimeError(f"cannot reach the API at {args.api_url}: {error!r}")
+                    raise RuntimeError(f"cannot reach the API at {args.api_urls[0]}: {error!r}")
                 if response.status_code != 200:
                     raise RuntimeError(f"admin login failed ({response.status_code}): {response.text}")
                 if response.json()["user"]["role"] != "admin":
@@ -605,8 +628,9 @@ async def main() -> int:
             return 2
 
     rounds_run = len(ctx["rounds"])
-    log.info("summary: scenario=%s, %d of %d rounds run%s, %d invariant checks", args.scenario, rounds_run, args.rounds,
-             " (interrupted)" if interrupted else "", ctx["checks"])
+    log.info("summary%s: scenario=%s, %d of %d rounds run%s, %d invariant checks, %d API process(es)",
+             f" [{args.label}]" if args.label else "", args.scenario, rounds_run, args.rounds,
+             " (interrupted)" if interrupted else "", ctx["checks"], len(args.api_urls))
     violated = []
     for name, (code, who, what, _) in INVARIANTS.items():
         rounds_with = [seen[name] for seen in ctx["rounds"] if seen.get(name)]
@@ -615,6 +639,11 @@ async def main() -> int:
         log.info("  %s %s: violated in %d of %d rounds%s", code, name, len(rounds_with), rounds_run, worst_text if rounds_with else "")
         if rounds_with:
             violated.append(f"{code} in {len(rounds_with)} of {rounds_run} rounds")
+    if args.scenario == "drivers":
+        # Fewer offers than min(riders, drivers) means a free driver was skipped or a rider got NO_DRIVER_FOUND for nothing:
+        # a defect of its own, reported here but not an invariant.
+        log.info("  lost matches: %d of %d rounds; offers %d of %d expected", ctx["offers"]["lost_rounds"], rounds_run,
+                 ctx["offers"]["got"], ctx["offers"]["expected"])
     log.info("  HTTP answers: %s", ", ".join(f"{code} x{count}" for code, count in sorted(status_counts.items(), key=str)))
     for key, times in ctx["latencies"].items():
         if times:

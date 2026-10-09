@@ -32,14 +32,25 @@ async def offer_to_next_driver(db: AsyncSession, ride: Ride) -> RideOffer | None
     if stale_ids:
         await drivers_repo.remove_from_geo(stale_ids)
 
+    # Stale is fine here: this only avoids taking locks for drivers who are plainly busy.
     available_ids = await drivers_repo.get_available_ids(db, list(online_ids))
-    candidates = [
-        (distance_m, driver_id) for driver_id, distance_m in nearby if driver_id in available_ids and driver_id not in previous
-    ]
-    if not candidates:
-        return None
-
     # Ties on distance go to the lower driver id, so the result is the same every time.
-    distance_m, driver_id = min(candidates)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=OFFER_TIMEOUT_SECONDS)
-    return await offers_repo.create(db, ride.id, driver_id, round(distance_m), expires_at)
+    candidates = sorted(
+        (distance_m, driver_id) for driver_id, distance_m in nearby if driver_id in available_ids and driver_id not in previous
+    )
+
+    # Lock, then check as a separate statement, then write. The lock is the driver's row (FOR UPDATE SKIP LOCKED) and lasts
+    # until the caller commits or rolls back. A driver whose row is locked is skipped, never waited for: someone else is
+    # deciding about that driver right now, and waiting would line up the whole city behind one driver.
+    # Every lock taken here is non-blocking, so it cannot be part of a cycle with the blocking locks of accept and create_ride.
+    for distance_m, driver_id in candidates:
+        if not await drivers_repo.try_lock(db, driver_id):
+            continue
+        # Under READ COMMITTED a statement that starts after the lock sees everything the previous lock holder committed.
+        # The prefilter above started before the lock, so it can be stale: this check decides.
+        if not await drivers_repo.get_available_ids(db, [driver_id]):
+            continue
+
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=OFFER_TIMEOUT_SECONDS)
+        return await offers_repo.create(db, ride.id, driver_id, round(distance_m), expires_at)
+    return None

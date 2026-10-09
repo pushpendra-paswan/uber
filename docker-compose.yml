@@ -40,6 +40,8 @@ services:
     env_file: .env
     ports:
       - "8000:8000"
+      # A second uvicorn process is started by hand for the two-process stress runs (see README).
+      - "127.0.0.1:8001:8001"
     volumes:
       - ./backend:/app
       - ./frontend:/frontend

@@ -93,6 +93,23 @@ def fake_route(monkeypatch):
     monkeypatch.setattr(routing, "get_route", get_route)
 
 
+def widen(monkeypatch, module, name: str, seconds: float, first_call_only: bool = False) -> None:
+    """Makes a repository function sleep AFTER it has computed its result, so the answer is stale when the caller uses it.
+    Services call repositories through the module (drivers_repo.get_available_ids), so patching the module attribute works."""
+    real = getattr(module, name)
+    calls = 0
+
+    async def slow(*args, **kwargs):
+        nonlocal calls
+        result = await real(*args, **kwargs)
+        calls += 1
+        if not first_call_only or calls == 1:
+            await asyncio.sleep(seconds)
+        return result
+
+    monkeypatch.setattr(module, name, slow)
+
+
 @pytest_asyncio.fixture
 async def db(test_engine):
     async with async_sessionmaker(test_engine, expire_on_commit=False)() as session:

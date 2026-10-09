@@ -3,6 +3,7 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -11,6 +12,7 @@ from app.repositories import drivers as drivers_repo
 from app.repositories import events
 from app.repositories import offers as offers_repo
 from app.repositories import rides as rides_repo
+from app.repositories import users as users_repo
 from app.schemas import DriverLocation, EstimateRequest, OtpResponse, RideCreate, RideDriverResponse, VehicleResponse
 from app.services import matching, pricing, routing
 from app.utils.geo import is_inside_bounds
@@ -76,6 +78,21 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
 
     # The client never sends distance, time, or fare: the server always works them out itself.
     estimate = await estimate_ride(db, data)
+
+    # Lock, then check as a separate statement, then write. The lock is the rider's user row (FOR UPDATE), taken after the
+    # routing call so it is held only for the insert and the commit, never across OSRM. It lasts until the commit below.
+    # Blocking locks in this request: the user row, and nothing else. Matching takes only non-blocking driver locks
+    # while it holds it, so no cycle can form.
+    try:
+        await users_repo.lock(db, rider.id)
+    except DBAPIError as error:
+        if error.orig.sqlstate != "55P03":  # lock_timeout
+            raise
+        raise HTTPException(status_code=503, detail="Busy, please retry")
+    # This second check decides. It is its own statement, started after the lock, so under READ COMMITTED it sees a ride
+    # that another request committed while we waited. The first check above is only the cheap early exit.
+    if await rides_repo.get_active_for_rider(db, rider.id) is not None:
+        raise HTTPException(status_code=409, detail="You already have an active ride")
 
     # Not routed through change_ride_status: there is no previous status.
     ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])

@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import database
@@ -21,6 +22,8 @@ DUE_BATCH_SIZE = 50
 
 # Lock order everywhere: the ride row first, then the offer row. Accept, reject, expiry, and cancel all follow it,
 # so two of them can wait for each other's ride lock but never for each other's offer lock (no deadlock).
+# Accept then takes the driver's row as a third, blocking lock. Matching holds driver rows too, but only ever takes them
+# without waiting (SKIP LOCKED), so nobody holding a driver row waits for a ride or offer row held by accept.
 
 # uvicorn's logger, because it is the one that has a handler and prints INFO.
 logger = logging.getLogger("uvicorn.error")
@@ -60,6 +63,14 @@ async def accept(db: AsyncSession, user: User, offer_id: int) -> Ride:
 
     ride = await rides_repo.get_by_id(db, ids.ride_id, for_update=True)
     offer = await offers_repo.get_by_id(db, offer_id, for_update=True)
+    # Lock, then check as a separate statement, then write. The driver's row is held until the commit below, and the
+    # checks that follow start after the lock, so "no active ride" sees any ride another accept just committed.
+    try:
+        await drivers_repo.lock(db, driver.id)
+    except DBAPIError as error:
+        if error.orig.sqlstate != "55P03":  # lock_timeout
+            raise
+        raise HTTPException(status_code=503, detail="Busy, please retry")
 
     now = datetime.now(timezone.utc)
     if offer.status != OfferStatus.PENDING:
