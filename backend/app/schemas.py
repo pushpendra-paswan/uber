@@ -1,9 +1,13 @@
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from fastapi import Header
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, StrictInt, model_validator
 
-from app.models import RideStatus, UserRole, VerificationStatus
+from app.models import PaymentMethod, RideStatus, TopupStatus, UserRole, VerificationStatus, WalletEntryKind
+
+# The Idempotency-Key header of a request that must not happen twice: 8 to 64 characters, required.
+IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
 
 
 class RegisterRequest(BaseModel):
@@ -123,6 +127,7 @@ class EstimateResponse(BaseModel):
     normal_fare: int  # after the minimum fare, before surge
     surge_percent: int  # 100 is no surge, 150 is 1.5x
     surge_amount: int  # fare_estimate - normal_fare
+    max_fare: int  # the most this trip can cost: the fare cap, paise
     path: list[list[float]]  # [lat, lng] pairs
 
 
@@ -133,6 +138,8 @@ class RideCreate(EstimateRequest):
     dropoff_address: str = Field(min_length=1, max_length=255)
     # The multiplier the rider saw in the estimate. Absent means "accept the current one" (scripts and simulators).
     accepted_surge_percent: int | None = Field(default=None, ge=100, le=200)
+    # Chosen once and never changed. Absent means cash, so scripts and simulators keep working.
+    payment_method: Literal["cash", "wallet"] = "cash"
 
 
 class StartTripRequest(BaseModel):
@@ -166,6 +173,7 @@ class RideResponse(BaseModel):
     actual_distance_m: int | None
     actual_duration_s: int | None
     fare_breakdown: dict | None
+    payment_method: PaymentMethod
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
@@ -233,3 +241,49 @@ class PlaceResponse(BaseModel):
     display_name: str
     lat: float
     lng: float
+
+
+class WalletResponse(BaseModel):
+    balance: int  # paise
+    reserved: int  # the most the rider's current wallet ride can cost, or 0
+    available: int  # balance - reserved
+
+
+class WalletEntryResponse(BaseModel):
+    id: int
+    amount: int  # paise, signed
+    kind: WalletEntryKind
+    balance_after: int
+    ride_id: int | None
+    topup_id: int | None
+    note: str | None
+    created_at: datetime
+
+
+class TopupCreate(BaseModel):
+    amount: StrictInt  # paise; the limits are checked by the service
+
+
+class TopupResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    amount: int
+    status: TopupStatus
+    checkout_url: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    @model_validator(mode="after")
+    def hide_finished_checkout_url(self) -> "TopupResponse":
+        # The page is only worth opening while the top-up is waiting for the payment.
+        if self.status != TopupStatus.PENDING:
+            self.checkout_url = None
+        return self
+
+
+class AdjustRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    amount: StrictInt  # paise, signed, not 0; the limit is checked by the service
+    note: str = Field(min_length=1, max_length=200)

@@ -410,12 +410,14 @@ function render() {
     // Rides finished before the fare existed have no breakdown, or only a legacy marker.
     const breakdown = state.ride.fare_breakdown;
     const settled = state.ride.final_fare !== null && breakdown !== null && breakdown.kind !== "legacy";
+    // Who pays the driver: cash is collected from the rider, a wallet ride was already paid from the rider's wallet.
+    const paidText = !settled ? "" : state.ride.payment_method === "wallet" ? "Paid from the rider's wallet." : `Collect ${money.format(state.ride.final_fare / 100)} in cash from the rider.`;
     let note = "";
     if (cancelled) {
       if (cancelled.actor_user_id === getSession().user.id) note = settled ? "You cancelled this ride. The rider was not charged." : "You cancelled this ride.";
       else if (cancelled.actor_user_id === null) note = "Ride cancelled.";
       else if (!settled) note = "The rider cancelled this ride.";
-      else if (breakdown.fee > 0) note = `The rider cancelled and was charged a cancellation fee of ${money.format(breakdown.fee / 100)}.`;
+      else if (breakdown.fee > 0) note = `The rider cancelled and was charged a cancellation fee of ${money.format(breakdown.fee / 100)}. ${paidText}`;
       else note = "The rider cancelled. No fee was charged.";
     }
     rideNote.hidden = note === "";
@@ -423,7 +425,7 @@ function render() {
     const showFare = settled && status === "COMPLETED";
     rideFare.hidden = !showFare;
     if (showFare) {
-      rideFare.textContent = `Trip fare: ${money.format(state.ride.final_fare / 100)} (${(breakdown.distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(breakdown.duration_s / 60))} min)`;
+      rideFare.textContent = `Trip fare: ${money.format(state.ride.final_fare / 100)} (${(breakdown.distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(breakdown.duration_s / 60))} min). ${paidText}`;
     }
     ridePickup.textContent = state.ride.pickup_address;
     rideDropoff.textContent = state.ride.dropoff_address;

@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Enum, Float, ForeignKey, Index, Integer, String, UniqueConstraint, func, text
+from sqlalchemy import CheckConstraint, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -60,6 +60,18 @@ class PaymentStatus(enum.Enum):
     succeeded = "succeeded"
     failed = "failed"
     refunded = "refunded"
+
+
+class WalletEntryKind(enum.Enum):
+    TOPUP = "TOPUP"
+    RIDE_CHARGE = "RIDE_CHARGE"
+    ADJUSTMENT = "ADJUSTMENT"
+
+
+class TopupStatus(enum.Enum):
+    PENDING = "PENDING"
+    SUCCEEDED = "SUCCEEDED"
+    EXPIRED = "EXPIRED"
 
 
 class User(Base):
@@ -145,6 +157,10 @@ class Ride(Base):
     actual_duration_s: Mapped[int | None] = mapped_column(Integer)
     # Amounts, not rates: a later change to the pricing rule does not touch old rides.
     fare_breakdown: Mapped[dict | None] = mapped_column(JSONB)
+    # Chosen when the ride is requested and never changed. Cash is collected by the driver; wallet is charged at settlement.
+    payment_method: Mapped[PaymentMethod] = mapped_column(
+        Enum(PaymentMethod, native_enum=False), default=PaymentMethod.cash, server_default="cash"
+    )
     otp: Mapped[str | None] = mapped_column(String(4))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -193,9 +209,11 @@ class RideOffer(Base):
 
 class Payment(Base):
     __tablename__ = "payments"
+    __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    ride_id: Mapped[int] = mapped_column(ForeignKey("rides.id"), index=True)
+    # Unique: a ride is charged once, at settlement. A fee of 0 creates no payment.
+    ride_id: Mapped[int] = mapped_column(ForeignKey("rides.id"), unique=True)
     amount: Mapped[int] = mapped_column(Integer)  # paise
     method: Mapped[PaymentMethod] = mapped_column(Enum(PaymentMethod, native_enum=False))
     status: Mapped[PaymentStatus] = mapped_column(
@@ -203,6 +221,75 @@ class Payment(Base):
     )
     idempotency_key: Mapped[str] = mapped_column(String(100), unique=True)
     gateway_ref: Mapped[str | None] = mapped_column(String(100), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Wallet(Base):
+    __tablename__ = "wallets"
+
+    # One row per user, created lazily by the first ledger write. balance always equals the sum of the user's entries.
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    balance: Mapped[int] = mapped_column(Integer, default=0, server_default="0")  # paise
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class WalletTopup(Base):
+    __tablename__ = "wallet_topups"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_wallet_topups_user_id_idempotency_key"),
+        CheckConstraint("amount > 0", name="amount_positive"),
+        Index("ix_wallet_topups_user_id_id", "user_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    amount: Mapped[int] = mapped_column(Integer)  # paise
+    status: Mapped[TopupStatus] = mapped_column(
+        Enum(TopupStatus, native_enum=False), default=TopupStatus.PENDING, server_default="PENDING"
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    stripe_session_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    checkout_url: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WalletEntry(Base):
+    __tablename__ = "wallet_entries"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_wallet_entries_user_id_idempotency_key"),
+        # Safety nets behind the locks: a ride is charged once and a top-up is credited once, whatever the code does.
+        # The conditions match the stored enum values (upper-case names, plain strings).
+        Index("uq_wallet_entries_one_charge_per_ride", "ride_id", unique=True, postgresql_where=text("kind = 'RIDE_CHARGE'")),
+        Index("uq_wallet_entries_one_credit_per_topup", "topup_id", unique=True, postgresql_where=text("kind = 'TOPUP'")),
+        CheckConstraint("amount <> 0", name="amount_nonzero"),
+        CheckConstraint("(kind = 'RIDE_CHARGE') = (ride_id IS NOT NULL)", name="ride_id_matches_kind"),
+        CheckConstraint("(kind = 'TOPUP') = (topup_id IS NOT NULL)", name="topup_id_matches_kind"),
+        CheckConstraint("(kind <> 'RIDE_CHARGE' OR amount < 0) AND (kind <> 'TOPUP' OR amount > 0)", name="amount_sign_matches_kind"),
+        Index("ix_wallet_entries_user_id_id", "user_id", "id"),
+    )
+
+    # Append-only: rows are inserted by services/wallet.post_entry and never updated or deleted.
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    amount: Mapped[int] = mapped_column(Integer)  # paise, signed: positive credits, negative debits
+    kind: Mapped[WalletEntryKind] = mapped_column(Enum(WalletEntryKind, native_enum=False))
+    balance_after: Mapped[int] = mapped_column(Integer)
+    ride_id: Mapped[int | None] = mapped_column(ForeignKey("rides.id"))
+    topup_id: Mapped[int | None] = mapped_column(ForeignKey("wallet_topups.id"))
+    idempotency_key: Mapped[str | None] = mapped_column(String(64))
+    note: Mapped[str | None] = mapped_column(String(200))
+    actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class StripeEvent(Base):
+    __tablename__ = "stripe_events"
+
+    # The Stripe event id: inserting it is the first step of processing a webhook, which is how duplicates are told apart.
+    id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

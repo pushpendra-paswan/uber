@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     city_west: float
     city_north: float
     city_east: float
+    # Payments (M5.3). Only Stripe TEST keys are used (sk_test_ or rk_test_); anything else counts as not configured.
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_api_url: str = "https://api.stripe.com"
+    app_base_url: str = "http://localhost:8000"
 
     @property
     def postgres_url(self) -> str:

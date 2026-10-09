@@ -13,8 +13,9 @@ from app.repositories import events
 from app.repositories import offers as offers_repo
 from app.repositories import rides as rides_repo
 from app.repositories import users as users_repo
+from app.repositories import wallet as wallet_repo
 from app.schemas import CancellationFeeResponse, DriverLocation, EstimateRequest, OtpResponse, RideCreate, RideDriverResponse, VehicleResponse
-from app.services import matching, pricing, routing
+from app.services import matching, payments, pricing, routing
 from app.utils.geo import is_inside_bounds
 
 MIN_TRIP_DISTANCE_M = 200
@@ -69,7 +70,7 @@ async def estimate_ride(db: AsyncSession, data: EstimateRequest) -> dict:
 
     zone, surge_percent = await pricing.get_surge_percent(db, data.pickup_lat, data.pickup_lng)
     fare = await pricing.calculate_fare(db, route["distance_m"], route["duration_s"], surge_percent)
-    return {**route, **fare, "zone": zone}
+    return {**route, **fare, "zone": zone, "max_fare": pricing.fare_cap(fare["fare_estimate"])}
 
 
 async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
@@ -88,6 +89,17 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
             detail=f"Prices have increased in your area (now {estimate['surge_percent'] / 100:.1f}x). "
             "Please review the new fare and request again.",
         )
+
+    # A wallet ride needs the money for the most the trip can cost, so the settlement charge can always be covered: the
+    # rider has one active ride (unique index) and nothing else lowers the balance meanwhile. Read before any lock.
+    if data.payment_method == "wallet":
+        balance = await wallet_repo.get_balance(db, rider.id)
+        if balance < estimate["max_fare"]:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Your wallet balance (₹{balance / 100:,.2f}) is below the ₹{estimate['max_fare'] / 100:,.2f} this trip can "
+                "cost. Add money or pay with cash.",
+            )
 
     # Lock, then check as a separate statement, then write. The lock is the rider's user row (FOR UPDATE), taken after the
     # routing call so it is held only for the insert and the commit, never across OSRM. It lasts until the commit below.
@@ -214,6 +226,7 @@ async def driver_set_status(
     # Settled in the same transaction, under the same ride lock, so a completed ride always has its fare.
     if new_status == RideStatus.COMPLETED:
         await pricing.settle_completed_ride(db, ride)
+        await payments.charge_ride(db, ride)
     await db.commit()
 
     await notify_ride_updated(db, ride)
@@ -230,6 +243,8 @@ async def cancel(db: AsyncSession, user: User, ride_id: int) -> Ride:
     if offer is not None:
         await offers_repo.set_status(db, offer, OfferStatus.CANCELLED)
         driver_user_id = await drivers_repo.get_user_id(db, offer.driver_id)
+    # Last write before the commit: the wallet row is a leaf lock (see services/wallet.post_entry).
+    await payments.charge_ride(db, ride)
     await db.commit()
 
     if offer is not None:

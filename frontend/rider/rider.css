@@ -104,3 +104,23 @@ input[type="radio"] {
   font-weight: 700;
   letter-spacing: 0.5rem;
 }
+
+#wallet-section {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  background: #f5f6f8;
+}
+
+.plain-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.plain-list li {
+  margin-bottom: 0.25rem;
+}
+
+.plain-list button {
+  margin: 0 0 0 0.5rem;
+}

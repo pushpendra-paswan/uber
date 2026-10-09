@@ -266,7 +266,7 @@ The reply is the number of backend processes listening (1 in dev). Backend code 
 
 ## Fares and cancellation fees (M5.1)
 
-When a trip is completed the server works out the **final fare** and stores it on the ride (`final_fare`, with `actual_distance_m`, `actual_duration_s`, and a `fare_breakdown`). Nothing is charged yet (payments are M5.3). The formula is the one the estimate uses (all money in integer paise, half rounded up):
+When a trip is completed the server works out the **final fare** and stores it on the ride (`final_fare`, with `actual_distance_m`, `actual_duration_s`, and a `fare_breakdown`). The fare is charged when the ride is settled, from the rider's wallet or in cash (see "Payments and wallet" below). The formula is the one the estimate uses (all money in integer paise, half rounded up):
 
 ```
 fare = max(base + per_km x distance + per_min x time, minimum fare)         # seed rule: 5000, 1200 per km, 200 per minute, 8000
@@ -335,6 +335,64 @@ docker compose exec redis redis-cli GET surge:snapshot
 
 **Make surge for a demo:** with no driver online, request rides from 3 or more different rider accounts at the same pickup (each ends NO_DRIVER_FOUND, which is unmet demand), wait up to 15 seconds, then change the pickup a little on the rider page: the estimate shows the high-demand lines. The demand ages out 3 minutes after the last request. **Stress and chaos runs leave NO_DRIVER_FOUND rides that raise surge in their zone for 3 minutes.** That is harmless to the invariants, but it changes the fares you see in the next run.
 
+## Payments and wallet (M5.3)
+
+Riders have a **wallet** (integer paise, INR only). Money gets in through a Stripe Checkout top-up, or an admin adjustment, and a ride is paid **from the wallet or in cash**. Nothing real is ever charged: only Stripe **test** keys (`sk_test_...`, `rk_test_...`) are accepted, anything else counts as "not configured".
+
+**The money model.** Table `wallet_entries` is an append-only ledger: one row per change, signed (positive credits, negative debits), each with the `balance_after`. Table `wallets` has one row per user with a `balance` that must always equal the sum of that user's entries (invariants I13 and I14 check it). The only function that writes either is `post_entry` in `services/wallet.py`; it takes the wallet row lock, adds the entry, and updates the balance, in the same transaction as whatever caused it (a settled ride, a credited top-up, an adjustment). Wallet rows are created by the first entry; reading never creates one. The **reserved** amount is not stored: it is the fare cap (150 percent of the estimate) of the rider's active wallet ride, or 0, and `GET /wallet` shows `balance`, `reserved`, and `available = balance - reserved`.
+
+**Paying for rides.** `POST /rides` takes `payment_method`: `cash` (the default, so scripts keep working) or `wallet`, fixed for the life of the ride. A wallet ride needs a balance of at least the fare cap, otherwise `402 Your wallet balance (Rs X) is below the Rs Y this trip can cost. Add money or pay with cash.` and nothing is created (the estimate shows the cap as `max_fare`). The rider has one active ride and nothing else lowers the balance, so the charge at the end can always be covered, and the rider can never be charged more than the cap. When the ride is settled (completed, or cancelled with a fee above 0) the same transaction creates one `payments` row (`ride:<id>:charge`, status succeeded) and, for a wallet ride, one `RIDE_CHARGE` entry. Cash is assumed collected by the driver (the driver page says "Collect Rs X in cash from the rider"). If charging fails the whole settlement is undone and the driver can retry.
+
+**Adding money (Stripe Checkout, hosted page).** Card details never touch this server or these pages.
+
+1. The rider page sends `POST /wallet/topups` (`{"amount": 50000}` in paise, Rs 100 to Rs 10,000) with an `Idempotency-Key` header. The backend stores a `wallet_topups` row, creates a Checkout Session at Stripe, and answers `checkout_url`.
+2. The page goes to that address, the rider pays on Stripe's page, and Stripe sends the browser back to `/rider/?topup=success&id=N`.
+3. Stripe also calls `POST /webhooks/stripe`; the webhook credits the wallet. The page calls `POST /wallet/topups/N/sync` on return (and the "Check status" button does the same), which asks Stripe about the session and applies the answer. It exists because webhooks can be late or missing in development.
+
+**Idempotency, so nothing is charged or credited twice.**
+
+- **Creating a top-up:** the same `Idempotency-Key` returns the same top-up (200 instead of 201; a different amount with the same key is `409`). The call to Stripe carries its own `Idempotency-Key: topup-<our top-up id>`, derived from our row, which is stored and committed BEFORE the call. A crash between "row stored" and "session stored" leaves a row without a session; the same request again finishes it and gets the SAME session. Keys are 8 to 64 characters of `A-Za-z0-9_-` (a missing or malformed one is `422`). The rider page keeps its key after a failed request, so a retry is a replay.
+- **Webhooks:** the first statement is `INSERT INTO stripe_events ... ON CONFLICT DO NOTHING` on the Stripe event id, in the SAME transaction as the credit, so a crash in the middle rolls the event id back too and Stripe's retry is processed. A repeated event answers `{"status": "duplicate"}`. The credit itself is `credit_topup`, which locks the top-up row, re-checks its status, and credits only if it is not already SUCCEEDED; so a different event for the same session, or `sync` racing the webhook, cannot credit twice. Partial unique indexes on the ledger are the last safety net. We trust our own row (session id, amount, currency), never the event's metadata. A top-up that already EXPIRED but turns out to be paid is credited (the money was taken).
+- **Rides:** a settled ride is charged once because completing or cancelling twice is already refused by the state machine (`409`), under the ride lock; `payments.ride_id` is unique as the safety net.
+
+**Webhook rules.** `POST /webhooks/stripe` has no login; the `Stripe-Signature` header is the authentication. The signature (`t=<unix time>,v1=<hex HMAC-SHA256 of "t.body">`, possibly several `v1`) is checked over the RAW body with the webhook secret; a timestamp more than 5 minutes away is refused. Answers: `200` `{"status": "processed" | "duplicate" | "ignored"}` (events we do not handle, or that do not match our row, are `ignored` and still 200), `400` for a bad signature or payload, `413` over 256 KiB, `503` when no webhook secret is set. Events handled: `checkout.session.completed` and `checkout.session.async_payment_succeeded` (credit when paid), `checkout.session.expired` (PENDING becomes EXPIRED). Secrets, signatures, idempotency keys and bodies are never logged.
+
+**Endpoints.** Rider: `GET /wallet`, `GET /wallet/entries?limit=&before_id=`, `POST /wallet/topups`, `GET /wallet/topups?limit=`, `POST /wallet/topups/{id}/sync`. Admin: `POST /admin/wallets/{rider_id}/adjust` (`Idempotency-Key` header, `{"amount": 10000, "note": "goodwill"}`: 201 for a new entry, 200 for a replay, `409` for the same key with another body or a debit that would make the balance negative). It is how wallets are funded in development without Stripe:
+
+```bash
+curl -s -X POST localhost:8000/admin/wallets/<rider id>/adjust -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: fund-$(date +%s)" -d '{"amount": 50000, "note": "funding"}'
+docker compose exec -T db psql -U uber -d uber -c "SELECT id, amount, kind, balance_after, ride_id, topup_id, note FROM wallet_entries WHERE user_id = <id> ORDER BY id"
+```
+
+### Setup 1: the local fake Stripe (no account needed)
+
+`simulator/fake_stripe.py` (standard library only) fakes the small part of Stripe the backend uses: Checkout Session create and retrieve with `Idempotency-Key`, a pay page with a Pay button, and signed webhooks. It is a development tool: it keeps everything in memory and does not model refunds, disputes, declines, API versions, or expiry by the clock.
+
+```bash
+python simulator/fake_stripe.py --host 0.0.0.0 --webhook-secret whsec_fake_local_secret     # on the host, not in Docker
+```
+
+Then put these in `.env` and run `docker compose up -d --force-recreate backend` (the startup log says `payments: stripe configured (test key), webhook secret set`, never the values):
+
+```
+STRIPE_SECRET_KEY=sk_test_fake_local
+STRIPE_WEBHOOK_SECRET=whsec_fake_local_secret
+STRIPE_API_URL=http://host.docker.internal:12111
+```
+
+`--host 0.0.0.0` is needed on Linux, because the container reaches the host through the Docker bridge (`extra_hosts: host.docker.internal:host-gateway` in `docker-compose.yml`), not through 127.0.0.1; the script prints a warning because anyone on your network can then reach the fake. Flags: `--host` (127.0.0.1), `--port` (12111), `--public-url` (`http://localhost:12111`, the address your browser uses in checkout links), `--webhook-url` (`http://localhost:8000/webhooks/stripe`), `--webhook-secret` (or env `STRIPE_WEBHOOK_SECRET`, required), `--delay-ms` (0, a pause inside session creation to widen races). Handy endpoints: `POST /pay/<session>/complete` (what the Pay button does), `POST /_expire/<session>`, `POST /_replay/<event id>?times=10` (re-sends a stored event with a fresh signature, all at once, and shows each answer), `GET /_events`.
+
+### Setup 2: real Stripe test mode
+
+Create a Stripe account (whether you can depends on your country), take the **test** secret key from the Dashboard (Developers, API keys, with "test mode" on), install the Stripe CLI, and forward webhooks to the backend:
+
+```bash
+stripe listen --forward-to localhost:8000/webhooks/stripe     # prints the signing secret: whsec_...
+```
+
+Put `STRIPE_SECRET_KEY=sk_test_...` and `STRIPE_WEBHOOK_SECRET=whsec_...` (from `stripe listen`) in `.env` and leave `STRIPE_API_URL` at `https://api.stripe.com`, then recreate the backend. Pay on Stripe's page with the card `4242 4242 4242 4242` (any future expiry and CVC) for a success, or `4000 0000 0000 0002` for a decline (no credit happens). `stripe events resend <event id>` replays an event: the balance must not change. A live key (`sk_live_...`) is refused on purpose.
+
 ## Concurrency stress test (M4.1, M4.2, M4.3)
 
 `simulator/stress.py` fires many requests at the same instant and then looks in the database for broken invariants. M4.1 used it to reproduce a real bug (the offer flow checked "is this driver free?" and wrote the offer in separate steps, with no lock in between); M4.2 fixed it with row locks in Postgres (the rider's `users` row in `POST /rides`, the driver's `drivers` row in matching and in accept; see `PROJECT_CONTEXT.md`). **Exit code 0 ("no violation observed") is the expected result for every scenario, including `chaos` (M4.3).** An exit code of 1 means a lock is missing or broken.
@@ -369,7 +427,18 @@ export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --
 
 **Chaos flags (M4.3):** `--chaos-seconds` (60, 10 to 600: how long the agents act), `--settle-seconds` (45, 30 to 300: how long the system gets to finish after they stop), `--tolerate-5xx` (count 5xx responses and connection errors and report them, but they do not decide the exit code: use it when you restart the backend or stop Redis by hand during a run), `--otp` (1234, the trip code). The defaults of the scenario are `--riders 30` and `--drivers 10`; `--seed` fixes the agents' choices (each agent has its own `random.Random`), not the timing. After the settle period a ride still REQUESTED or an offer still PENDING is STUCK (printed with its offers); rides left assigned, arrived, or in progress are not. The run ends with `CHAOS CLEAN` or `CHAOS FOUND PROBLEMS: ...`, action counts (so you can see that cancels, double accepts, and drivers going offline really happened), final ride and offer status counts, and the first five 5xx bodies. While it runs, kill the backend or Redis yourself: `docker compose restart backend`, or `docker compose stop redis` and `docker compose start redis` ten seconds later, with `--tolerate-5xx`.
 
-Other flags: `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url` (one URL or several separated by commas, see below), `--label` (free text printed in the summary header, so saved outputs identify themselves), `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
+**Money in the chaos run (M5.3).** The setup fills every stress rider's wallet to Rs 5,000 through the admin API (`POST /admin/wallets/{id}/adjust`, key `stress-fund-<rider>-<unix time>-<balance>`) and remembers the starting balances. Each chaos ride is paid from the wallet with 50 percent probability, otherwise in cash (a `402` is counted as `wallet_402`; it should be 0). An extra agent, the admin, credits a random stress rider Rs 10 to Rs 100 every 2 seconds with a fresh key, and 30 percent of the time sends the SAME request twice at once: every successful answer for one key must carry the same entry id (`adjust_replay_mismatch`, any non-zero value is a violation). The summary lists wallet and cash rides with what was charged, the adjustments, and checks `final balance == starting balance + credits - wallet charges` for every stress rider.
+
+**The `payments` scenario (M5.3).** It needs the backend to use the local fake Stripe (see "Payments and wallet"); it creates one Checkout Session per rider per round in whichever Stripe the backend uses, and prints a warning to that effect. No drivers are needed.
+
+```bash
+.venv-sim/bin/python simulator/stress.py --scenario payments --webhook-secret whsec_fake_local_secret --riders 20 --rounds 5
+# or: export STRIPE_WEBHOOK_SECRET=...   two backend processes: --api-url http://127.0.0.1:8000,http://127.0.0.1:8001
+```
+
+Each round, for all riders at once: (1) the same top-up request five times at once (one top-up row per rider and key, the same id in every answer; a `409` "in progress" is retried once after a second); (2) the signed `checkout.session.completed` event delivered ten times at once with one event id, plus three times with another event id for the same session (every answer 200, exactly one `processed` per top-up and one `ignored` for the first delivery of the other event id, the rest `duplicate`; every top-up SUCCEEDED with exactly one `TOPUP` entry, each balance up by exactly the top-up); (3) three badly signed events (wrong secret, tampered body, a timestamp 10 minutes old): all `400`, and the database does not change; (4) I1 to I18. The summary counts top-ups, webhook answers (`processed`, `duplicate`, `ignored`), and ends with `PAYMENTS CLEAN` or `PAYMENTS FOUND PROBLEMS: ...`. Exit code 2 with `INVARIANTS NOT CHECKED: Stripe is not configured on the backend ...` when the backend has no test key.
+
+Other flags: `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url` (one URL or several separated by commas, see below), `--webhook-secret` (payments scenario), `--label` (free text printed in the summary header, so saved outputs identify themselves), `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
 
 **Against two backend processes.** The locks live in Postgres, so they must also hold across processes. `docker-compose.yml` publishes a second port (`127.0.0.1:8001`). Start a second uvicorn inside the same container (it does not auto-reload, so stop it and start it again after every code change, and it inherits the container's environment), then give the stress tool both URLs. Requests of a burst are spread over the URLs one after the other, and in the riders scenario the repeats of one rider alternate between the processes:
 
@@ -397,8 +466,14 @@ The container has no `pkill`; `docker compose up -d --force-recreate backend` st
 | I10 `fare_on_unsettled_ride` | no ride that is neither COMPLETED nor CANCELLED (active, or NO_DRIVER_FOUND) has a fare, a billed distance or duration, or a breakdown |
 | I11 `fare_over_cap` | no trip fare is above 150 percent of the ride's estimate (integer division, like the code) |
 | I12 `surge_settlement_mismatch` | a settled trip used the multiplier locked on its ride, and `normal_fare + surge_amount = computed_fare` (trips settled before M5.2 have no surge keys and are left out) |
+| I13 `wallet_balance_mismatch` | a wallet's `balance` equals the sum of its entries and the `balance_after` of its latest entry, and every entry's user has a wallet row |
+| I14 `ledger_running_balance_mismatch` | every entry's `balance_after` equals the running sum of that user's amounts in id order |
+| I15 `negative_wallet` | no wallet is below zero |
+| I16 `ride_payment_mismatch` | a COMPLETED or CANCELLED ride (not legacy) with a fare has exactly one succeeded payment of that amount and method; one without a fare has none; a ride that is not settled has none |
+| I17 `wallet_charge_mismatch` | a wallet payment has exactly one `RIDE_CHARGE` entry of minus its amount on the rider's wallet, and a `RIDE_CHARGE` entry has a wallet payment (never a cash one) |
+| I18 `topup_credit_mismatch` | a SUCCEEDED top-up has exactly one `TOPUP` entry of its amount on its user's wallet; any other top-up has no entry |
 
-I4 to I12 cannot be legitimately violated even for an instant (each pair of changes, and each status change with its settlement, is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
+I4 to I18 cannot be legitimately violated even for an instant (each pair of changes, each status change with its settlement, and each ledger entry with its cause is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
 
 ```bash
 docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql

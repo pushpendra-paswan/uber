@@ -4,7 +4,7 @@ from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import redis_client
-from app.models import ACTIVE_RIDE_STATUSES, Ride, RideEvent, RideStatus
+from app.models import ACTIVE_RIDE_STATUSES, PaymentMethod, Ride, RideEvent, RideStatus
 from app.schemas import RideCreate
 
 TRIP_KEY = "ride:{}:trip"
@@ -22,7 +22,8 @@ async def create(
         fare_estimate=fare_estimate,
         pickup_zone=pickup_zone,
         surge_percent=surge_percent,
-        **data.model_dump(exclude={"accepted_surge_percent"}),
+        payment_method=PaymentMethod(data.payment_method),
+        **data.model_dump(exclude={"accepted_surge_percent", "payment_method"}),
     )
     db.add(ride)
     await db.flush()

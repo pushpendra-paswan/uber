@@ -33,6 +33,12 @@ SURGE_CACHE_TTL_S = 15  # 0 or less turns the snapshot cache off
 logger = logging.getLogger("uvicorn.error")
 
 
+def fare_cap(fare_estimate: int) -> int:
+    """The most a trip can cost, in paise. Settlement, the estimate, the wallet reservation and the wallet check at request
+    all use it, so they cannot disagree."""
+    return fare_estimate * FARE_CAP_PERCENT // 100
+
+
 async def get_surge_snapshot(db: AsyncSession, force: bool = False) -> dict:
     """One city-wide snapshot of demand, supply and the step multiplier of every zone, shared through Redis so everyone
     asking within SURGE_CACHE_TTL_S sees the same numbers. Raises RedisError when Redis fails."""
@@ -180,8 +186,8 @@ async def settle_completed_ride(db: AsyncSession, ride: Ride) -> None:
 
     # The multiplier locked on the ride at request time, never the current one.
     fare = await calculate_fare(db, distance_m, duration_s, ride.surge_percent)
-    fare_cap = ride.fare_estimate * FARE_CAP_PERCENT // 100
-    ride.final_fare = min(fare["fare_estimate"], fare_cap)
+    cap = fare_cap(ride.fare_estimate)
+    ride.final_fare = min(fare["fare_estimate"], cap)
     ride.actual_distance_m = distance_m
     ride.actual_duration_s = duration_s
     ride.fare_breakdown = {
@@ -200,8 +206,8 @@ async def settle_completed_ride(db: AsyncSession, ride: Ride) -> None:
         "normal_fare": fare["normal_fare"],
         "surge_percent": fare["surge_percent"],
         "surge_amount": fare["surge_amount"],
-        "fare_cap": fare_cap,
-        "capped": fare["fare_estimate"] > fare_cap,
+        "fare_cap": cap,
+        "capped": fare["fare_estimate"] > cap,
     }
 
 

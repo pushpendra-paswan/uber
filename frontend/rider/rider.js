@@ -44,6 +44,9 @@ const MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
 const MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
 const ROUTE_WEIGHT = 5;
 const FIT_PADDING = [40, 40];
+const ENTRY_LABEL = { TOPUP: "Added money", RIDE_CHARGE: "Ride payment", ADJUSTMENT: "Adjustment" };
+const TOPUP_MIN_RUPEES = 100;
+const TOPUP_MAX_RUPEES = 10000;
 const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
 const session = getSession();
@@ -73,6 +76,13 @@ const state = {
   driverKey: null, // "rideId:driverId" the details were asked for; set before the call so a failure is not retried every poll
   otp: null, // the trip code, from GET /rides/{id}/otp
   otpKey: null, // the ride id the code was asked for; set before the call so a failure is not retried every poll
+  wallet: null, // answer of GET /wallet: balance, reserved, available (paise)
+  entries: [], // the last 10 ledger entries
+  topups: [], // the last 5 top-ups
+  topupKey: null, // the Idempotency-Key of the top-up being attempted; kept after a failure, so a retry is a replay
+  topupAmount: null, // the amount (paise) that key was made for
+  topupNotice: "", // "Payment received" and the like
+  paymentMethod: "cash", // written only by the radios' change handler
   error: "",
   busy: false,
 };
@@ -150,6 +160,19 @@ const fareReason = document.getElementById("fare-reason");
 const rideTrip = document.getElementById("ride-trip");
 const rideFare = document.getElementById("ride-fare");
 const rideFareSurge = document.getElementById("ride-fare-surge");
+const walletSection = document.getElementById("wallet-section");
+const walletBalance = document.getElementById("wallet-balance");
+const walletReserved = document.getElementById("wallet-reserved");
+const topupNotice = document.getElementById("topup-notice");
+const topupForm = document.getElementById("topup-form");
+const topupAmount = document.getElementById("topup-amount");
+const topupList = document.getElementById("topup-list");
+const entryList = document.getElementById("entry-list");
+const paymentRadios = document.querySelectorAll('input[name="payment"]');
+const paymentHint = document.getElementById("payment-hint");
+const ridePayment = document.getElementById("ride-payment");
+const farePayment = document.getElementById("fare-payment");
+let shownTopups = null; // the JSON of the top-ups in the DOM, so polling does not rebuild their buttons under a click
 
 // "5.2 km, 14 min". Used by the estimate panel and the ride view. Old rides have null values.
 function formatTrip(distanceM, durationS) {
@@ -230,6 +253,11 @@ async function refresh() {
   if (!state.user || state.user.role !== "rider") return;
   try {
     if (state.config === null) state.config = await api("GET", "/places/map-config");
+    [state.wallet, state.entries, state.topups] = await Promise.all([
+      api("GET", "/wallet"),
+      api("GET", "/wallet/entries?limit=10"),
+      api("GET", "/wallet/topups?limit=5"),
+    ]);
     const active = await api("GET", "/rides/active").catch((err) => {
       if (err.status === 404) return null;
       throw err;
@@ -529,8 +557,60 @@ function render() {
     }
   }
 
+  // Only textContent below: names, notes and addresses are plain text. No input is touched here.
+  walletSection.hidden = !isRider || state.wallet === null;
+  if (!walletSection.hidden) {
+    walletBalance.textContent = money.format(state.wallet.balance / 100);
+    walletReserved.hidden = state.wallet.reserved === 0;
+    walletReserved.textContent = `(${money.format(state.wallet.reserved / 100)} reserved for your current ride)`;
+    topupNotice.hidden = state.topupNotice === "";
+    topupNotice.textContent = state.topupNotice;
+
+    const topupsJson = JSON.stringify(state.topups);
+    if (topupsJson !== shownTopups) {
+      shownTopups = topupsJson;
+      topupList.replaceChildren(
+        ...state.topups.map((topup) => {
+          const row = document.createElement("li");
+          const text = document.createElement("span");
+          text.textContent = topup.status === "PENDING" ? `Pending top-up ${money.format(topup.amount / 100)}` : `Top-up ${money.format(topup.amount / 100)}: ${topup.status.toLowerCase()}`;
+          row.append(text);
+          if (topup.status === "PENDING") {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = "Check status";
+            button.addEventListener("click", () =>
+              act(async () => {
+                const checked = await api("POST", `/wallet/topups/${topup.id}/sync`);
+                state.topupNotice = { SUCCEEDED: "Payment received", EXPIRED: "That top-up expired" }[checked.status] || "Payment is still being confirmed";
+              })
+            );
+            row.append(button);
+          }
+          return row;
+        })
+      );
+    }
+    entryList.replaceChildren(
+      ...state.entries.map((entry) => {
+        const row = document.createElement("li");
+        const label = ENTRY_LABEL[entry.kind] + (entry.kind === "ADJUSTMENT" && entry.note ? `: ${entry.note}` : "");
+        row.textContent = `${label}  ${entry.amount > 0 ? "+" : ""}${money.format(entry.amount / 100)}  (balance ${money.format(entry.balance_after / 100)})`;
+        return row;
+      })
+    );
+  }
+  const showWalletHint = state.paymentMethod === "wallet" && state.estimate !== null && state.wallet !== null;
+  paymentHint.hidden = !showWalletHint;
+  if (showWalletHint) {
+    paymentHint.textContent =
+      `Your wallet: ${money.format(state.wallet.available / 100)} available. This trip can cost up to ${money.format(state.estimate.max_fare / 100)}.` +
+      (state.wallet.available < state.estimate.max_fare ? " Add money or pay with cash." : "");
+  }
+
   if (showRide) {
     rideId.textContent = state.ride.id;
+    ridePayment.textContent = `Payment: ${state.ride.payment_method}`;
     rideStatus.textContent = state.ride.status;
     rideStatusText.textContent = STATUS_TEXT[state.ride.status];
 
@@ -575,6 +655,13 @@ function render() {
       fareFee.textContent = breakdown.fee > 0 ? `Cancellation fee: ${money.format(breakdown.fee / 100)}` : "No cancellation fee.";
       fareReason.hidden = breakdown.fee === 0;
       fareReason.textContent = CANCEL_REASON_TEXT[breakdown.reason] || "";
+    }
+
+    // Rides from before payments existed are cash. A fee of 0 leaves nothing to pay.
+    farePayment.hidden = !settled || state.ride.final_fare === 0;
+    if (!farePayment.hidden) {
+      const owed = money.format(state.ride.final_fare / 100);
+      farePayment.textContent = state.ride.payment_method === "wallet" ? `Paid ${owed} from your wallet.` : `Pay ${owed} in cash to the driver.`;
     }
 
     codeSection.hidden = !CODE_STATUSES.includes(state.ride.status) || state.otp === null;
@@ -692,12 +779,60 @@ requestButton.addEventListener("click", () => {
         dropoff_lat: dropoff.lat,
         dropoff_lng: dropoff.lng,
         accepted_surge_percent: acceptedSurgePercent,
+        payment_method: state.paymentMethod,
       });
     } catch (err) {
       fetchEstimate(); // for example "Prices have increased": the panel shows the current price, the message stays
       throw err;
     }
     state.rideId = state.ride.id;
+  });
+});
+
+for (const radio of paymentRadios) {
+  radio.addEventListener("change", () => {
+    state.paymentMethod = radio.value;
+    render();
+  });
+}
+
+topupForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const rupees = Number(topupAmount.value);
+  act(async () => {
+    if (!Number.isInteger(rupees) || rupees < TOPUP_MIN_RUPEES || rupees > TOPUP_MAX_RUPEES) {
+      throw new Error("Enter a whole number of rupees between 100 and 10,000");
+    }
+    const amount = rupees * 100;
+    // A new key for a new attempt. After a failure the same key is sent again, so a retry is a replay, never a second top-up.
+    if (state.topupKey === null || state.topupAmount !== amount) {
+      state.topupKey = crypto.randomUUID();
+      state.topupAmount = amount;
+    }
+    // The one request that does not go through api(): shared/api.js cannot send the Idempotency-Key header, and it is shared
+    // with the other pages. The error handling is the same: a readable message, and a 401 clears the session and reloads.
+    const response = await fetch("/wallet/topups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${getSession().token}`, "Idempotency-Key": state.topupKey },
+      body: JSON.stringify({ amount }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      if (response.status === 401) {
+        clearSession();
+        location.reload();
+      }
+      const detail = data && data.detail;
+      if (typeof detail === "string") throw new Error(detail);
+      if (Array.isArray(detail)) throw new Error(detail.map((item) => `${item.loc[item.loc.length - 1]}: ${item.msg}`).join("; "));
+      throw new Error(`Request failed (${response.status})`);
+    }
+    state.topupKey = null;
+    state.topupAmount = null;
+    // Only web addresses: never a javascript: URL, whatever the API sends.
+    const checkout = new URL(data.checkout_url);
+    if (checkout.protocol !== "https:" && checkout.protocol !== "http:") throw new Error("The payment page address is not valid");
+    location.assign(checkout.href);
   });
 });
 
@@ -745,5 +880,20 @@ setInterval(async () => {
 }, POLL_MS);
 
 if (state.user !== null && state.user.role === "rider") connect(socketHandlers);
+
+// Back from Stripe's page: ?topup=success&id=N or ?topup=cancelled. The id is only a hint to ask the backend about,
+// which checks that the top-up is ours; nothing in the address is believed.
+const returned = new URLSearchParams(location.search);
+if (returned.has("topup") && state.user !== null && state.user.role === "rider") {
+  history.replaceState(null, "", location.pathname);
+  if (returned.get("topup") === "cancelled") {
+    state.topupNotice = "Top-up cancelled";
+  } else if (returned.get("topup") === "success" && /^[0-9]+$/.test(returned.get("id") || "")) {
+    act(async () => {
+      const topup = await api("POST", `/wallet/topups/${returned.get("id")}/sync`);
+      state.topupNotice = topup.status === "SUCCEEDED" ? "Payment received" : "Payment is still being confirmed";
+    });
+  }
+}
 render();
 refresh().then(render);

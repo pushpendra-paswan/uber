@@ -99,7 +99,7 @@ async def test_the_code_is_stored_on_accept_and_is_in_no_response_or_message(
         assert set(response.json()) == {
             "id", "rider_id", "driver_id", "pickup_lat", "pickup_lng", "pickup_address", "dropoff_lat", "dropoff_lng",
             "dropoff_address", "status", "distance_m", "duration_s", "fare_estimate", "surge_percent", "final_fare", "actual_distance_m",
-            "actual_duration_s", "fare_breakdown", "created_at", "started_at", "completed_at",
+            "actual_duration_s", "fare_breakdown", "payment_method", "created_at", "started_at", "completed_at",
         }
         assert await get(rider_ws) == ride_updated(trip, status)
         assert await get(driver_ws) == ride_updated(trip, status)

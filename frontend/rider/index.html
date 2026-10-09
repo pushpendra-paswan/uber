@@ -48,6 +48,23 @@
       <p id="wrong-role-text"></p>
     </section>
 
+    <section id="wallet-section" hidden>
+      <h2>Wallet</h2>
+      <p>Wallet balance <strong id="wallet-balance"></strong> <span id="wallet-reserved" class="note" hidden></span></p>
+      <p id="topup-notice" class="note" role="status" hidden></p>
+      <form id="topup-form">
+        <label for="topup-amount">Add money (whole rupees, 100 to 10,000)</label>
+        <div class="search-row">
+          <input id="topup-amount" type="number" min="100" max="10000" step="1" inputmode="numeric" autocomplete="off">
+          <button type="submit">Add money</button>
+        </div>
+      </form>
+      <h3>Top-ups</h3>
+      <ul id="topup-list" class="plain-list"></ul>
+      <h3>Recent activity</h3>
+      <ul id="entry-list" class="plain-list"></ul>
+    </section>
+
     <section id="map-section" hidden>
       <div id="map"></div>
     </section>
@@ -80,6 +97,13 @@
         <label class="radio"><input type="radio" name="pick" value="dropoff"> Drop-off</label>
       </fieldset>
 
+      <fieldset>
+        <legend>Pay with:</legend>
+        <label class="radio"><input type="radio" name="payment" value="cash" autocomplete="off" checked> Pay with cash</label>
+        <label class="radio"><input type="radio" name="payment" value="wallet" autocomplete="off"> Pay from wallet</label>
+        <p id="payment-hint" class="note" hidden></p>
+      </fieldset>
+
       <p id="estimate-loading" class="note" hidden>Estimating route...</p>
 
       <section id="estimate-section" hidden>
@@ -106,6 +130,7 @@
       <h2>Ride #<span id="ride-id"></span></h2>
       <p><span id="ride-status" class="badge"></span> <span id="ride-status-text"></span></p>
       <p id="ride-note" class="note" hidden></p>
+      <p id="ride-payment"></p>
 
       <div id="code-section" hidden>
         <h3>Trip code</h3>
@@ -156,6 +181,7 @@
           <p id="fare-fee"></p>
           <p id="fare-reason" class="note" hidden></p>
         </div>
+        <p id="fare-payment" hidden></p>
       </div>
 
       <div id="driver-section" hidden>

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -8,13 +9,27 @@ from fastapi.staticfiles import StaticFiles
 from redis.exceptions import RedisError
 from sqlalchemy import text
 
+from app.config import settings
 from app.database import engine, redis_client
-from app.routers import admin, auth, drivers, offers, places, rides, websocket
+from app.routers import admin, auth, drivers, offers, payments, places, rides, websocket
 from app.services import offers as offers_service
+from app.services.payments import TEST_KEY_PREFIXES
+
+# uvicorn's logger, because it is the one that has a handler and prints INFO.
+logger = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    # One line about payments, never the values themselves.
+    if not settings.stripe_secret_key:
+        logger.info("payments: stripe not configured")
+    elif not settings.stripe_secret_key.startswith(TEST_KEY_PREFIXES):
+        logger.error("payments: stripe REJECTED: key is not a test key (only sk_test_ and rk_test_ keys are used)")
+    else:
+        webhook = "webhook secret set" if settings.stripe_webhook_secret else "webhook secret NOT set"
+        logger.info("payments: stripe configured (test key), %s", webhook)
+
     # Starts even when Redis or Postgres is down: both tasks keep retrying in the background.
     tasks = [asyncio.create_task(websocket.listen_for_events()), asyncio.create_task(offers_service.sweep_forever())]
     yield
@@ -61,6 +76,7 @@ app.include_router(drivers.router)
 app.include_router(admin.router)
 app.include_router(rides.router)
 app.include_router(offers.router)
+app.include_router(payments.router)
 app.include_router(places.router)
 app.include_router(websocket.router)
 

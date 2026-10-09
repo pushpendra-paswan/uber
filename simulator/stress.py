@@ -9,7 +9,10 @@ through `docker compose exec db psql`. It never touches Redis, Nominatim, or Ope
 
 Usage: python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...
 Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulator.py fleet), chaos (M4.3: riders and
-drivers acting at random for a while, then a settle period; looks for any invariant violation and for stuck rides).
+drivers acting at random for a while, then a settle period; looks for any invariant violation and for stuck rides; since
+M5.3 riders pay from a funded wallet or in cash and an admin credits wallets with replayed requests), payments (M5.3: top-up
+requests repeated at once, signed webhooks delivered many times at once, bad signatures refused; needs the backend to use the
+local fake Stripe, simulator/fake_stripe.py).
 Stop simulator.py for the drivers, riders and chaos scenarios: its drivers would join the test.
 Exit codes: 0 no violation (expected for every scenario), 1 a violation, a stuck ride, or a 5xx, 2 the check could not run.
 --api-url takes several comma-separated URLs (two backend processes): requests are spread over them round-robin.
@@ -17,6 +20,9 @@ Exit codes: 0 no violation (expected for every scenario), 1 a violation, a stuck
 import argparse
 import asyncio
 import collections
+import hashlib
+import hmac
+import json
 import logging
 import math
 import os
@@ -77,7 +83,19 @@ INVARIANTS = {
     "surge_settlement_mismatch": (
         "I12", "rides", None, ("ride_id", "ride_surge", "breakdown_surge", "normal_fare", "surge_amount", "computed_fare")
     ),
+    "wallet_balance_mismatch": ("I13", "wallets", None, ("user_id", "balance", "entries_sum", "last_balance_after")),
+    "ledger_running_balance_mismatch": ("I14", "entries", None, ("entry_id", "user_id", "balance_after", "running_sum")),
+    "negative_wallet": ("I15", "wallets", None, ("user_id", "balance")),
+    "ride_payment_mismatch": (
+        "I16", "rides", None, ("ride_id", "final_fare", "payment_count", "payment_amount", "payment_method", "ride_method")
+    ),
+    "wallet_charge_mismatch": ("I17", "rides", None, ("ride_id", "payment_amount", "entry_count", "entry_amount")),
+    "topup_credit_mismatch": ("I18", "top-ups", None, ("topup_id", "status", "amount", "entry_count", "entry_amount")),
 }
+FUND_TO_PAISE = 500000  # the chaos riders' wallets are filled up to 5,000 rupees
+ADJUST_MAX_PAISE = 1000000  # the most one adjustment may move
+WEBHOOK_COPIES = 10  # payments scenario: one event delivered this many times at once
+OTHER_EVENT_COPIES = 3  # ... plus this many deliveries of a different event for the same session
 
 log = logging.getLogger("stress")
 status_counts = collections.Counter()  # every HTTP answer of the whole run, by status code
@@ -85,14 +103,18 @@ bodies_5xx = []  # (method, path, status, body) of the first server errors, to p
 
 
 async def api(
-    client: httpx.AsyncClient, method: str, path: str, token: str | None = None, body: dict | None = None,
-    gate: asyncio.Event | None = None,
+    client: httpx.AsyncClient, method: str, path: str, token: str | None = None, body: dict | bytes | None = None,
+    gate: asyncio.Event | None = None, headers: dict | None = None,
 ) -> httpx.Response:
-    """One HTTP call with a bearer token. With a gate it waits for the event first (see burst)."""
+    """One HTTP call with a bearer token and optional extra headers. A bytes body is sent as it is (a webhook); anything
+    else as JSON. With a gate it waits for the event first (see burst)."""
     if gate is not None:
         await gate.wait()
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    response = await client.request(method, path, json=body, headers=headers)
+    headers = {**({"Authorization": f"Bearer {token}"} if token else {}), **(headers or {})}
+    if isinstance(body, bytes):
+        response = await client.request(method, path, content=body, headers=headers)
+    else:
+        response = await client.request(method, path, json=body, headers=headers)
     status_counts[response.status_code] += 1
     if response.status_code >= 500 and len(bodies_5xx) < 5:
         bodies_5xx.append((method, path, response.status_code, response.text[:300]))
@@ -162,6 +184,7 @@ async def setup_accounts(ctx: dict, kind: str, n: int) -> None:
             raise RuntimeError(f"setup failed: login of {email} answered {response.status_code} {response.text}")
         token = response.json()["access_token"]
         ctx["tokens"][email] = token
+        ctx["user_ids"][email] = response.json()["user"]["id"]
 
         if kind == "driver":
             response = await api(client, "GET", "/drivers/me", token)
@@ -185,7 +208,7 @@ async def setup_accounts(ctx: dict, kind: str, n: int) -> None:
 
 
 async def burst(ctx: dict, requests: list[tuple]) -> dict:
-    """Sends (token, method, path, body) requests so that they all start in the same instant.
+    """Sends (token, method, path, body[, headers]) requests so that they all start in the same instant.
 
     One shared client; warmed up with as many /health calls as there are requests so the connections already
     exist; one task per request, all parked on one event; the event is set after BARRIER_WAIT_S.
@@ -198,9 +221,9 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
     if ctx["args"].sequential:
         started = time.monotonic()
         outcomes = []
-        for index, (token, method, path, body) in enumerate(requests):
+        for index, (token, method, path, body, *extra) in enumerate(requests):
             try:
-                outcomes.append(await api(client, method, urls[index % len(urls)] + path, token, body))
+                outcomes.append(await api(client, method, urls[index % len(urls)] + path, token, body, headers=extra[0] if extra else None))
             except httpx.HTTPError as error:
                 outcomes.append(error)
         seconds = time.monotonic() - started
@@ -208,8 +231,8 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
         await asyncio.gather(*[client.get(urls[index % len(urls)] + "/health") for index in range(len(requests))])
         gate = asyncio.Event()
         tasks = [
-            asyncio.create_task(api(client, method, urls[index % len(urls)] + path, token, body, gate))
-            for index, (token, method, path, body) in enumerate(requests)
+            asyncio.create_task(api(client, method, urls[index % len(urls)] + path, token, body, gate, extra[0] if extra else None))
+            for index, (token, method, path, body, *extra) in enumerate(requests)
         ]
         await asyncio.sleep(BARRIER_WAIT_S)
         started = time.monotonic()
@@ -246,7 +269,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I12 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I18 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -259,7 +282,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all twelve invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all eighteen invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -273,7 +296,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I12 ok"
+    return ", ".join(parts) or "I1-I18 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -520,10 +543,14 @@ async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict,
                     })
                     if quoted.status_code == 200:
                         body["accepted_surge_percent"] = quoted.json()["surge_percent"]
+                # Half of the rides are paid from the wallet. The wallets are funded for it, so a 402 should not happen.
+                body["payment_method"] = "wallet" if rng.random() < 0.50 else "cash"
                 counters["rides_requested"] += 1
+                counters["wallet_rides_requested"] += body["payment_method"] == "wallet"
                 answers = await asyncio.gather(
                     *[api(client, "POST", rng.choice(urls) + "/rides", token, body) for _ in range(2 if duplicate else 1)]
                 )
+                counters["wallet_402"] += sum(1 for answer in answers if answer.status_code == 402)
                 # The price went up between the quote and the request: normal, not a failure.
                 price_up = [answer for answer in answers if answer.status_code == 409 and str(answer.json().get("detail", "")).startswith("Prices have increased")]
                 counters["surge_409"] += len(price_up)
@@ -643,8 +670,36 @@ async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Rando
         counters["transport_errors"] += 1
 
 
+async def chaos_admin(ctx: dict, rng: random.Random, counters: dict, deadline: float) -> None:
+    """The admin until the deadline, a tick every 2 s: credits a random stress rider 10 to 100 rupees with a fresh
+    Idempotency-Key, and 30 percent of the time sends the SAME request twice at once. Every successful answer for one key must
+    carry the same entry id (adjust_replay_mismatch counts the keys where they did not)."""
+    client, urls = ctx["api"], ctx["args"].api_urls
+    user_ids = [ctx["user_ids"][RIDER_EMAIL.format(n=n)] for n in range(1, ctx["args"].riders + 1)]
+    while time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        user_id = rng.choice(user_ids)
+        body = {"amount": rng.randrange(10, 101) * 100, "note": "stress credit"}
+        headers = {"Idempotency-Key": f"stress-credit-{time.time_ns()}"}
+        twice = rng.random() < 0.30
+        try:
+            answers = await asyncio.gather(
+                *[api(client, "POST", rng.choice(urls) + f"/admin/wallets/{user_id}/adjust", ctx["admin_token"], body, headers=headers)
+                  for _ in range(2 if twice else 1)]
+            )
+        except httpx.HTTPError:
+            counters["transport_errors"] += 1
+            continue
+        counters["adjustments_sent"] += 1
+        counters["adjustments_created"] += any(answer.status_code == 201 for answer in answers)
+        if twice:
+            counters["adjust_replays_sent"] += 1
+            if len({answer.json()["id"] for answer in answers if answer.status_code in (200, 201)}) > 1:
+                counters["adjust_replay_mismatch"] += 1
+
+
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I12 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I18 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -670,6 +725,23 @@ async def scenario_chaos(ctx: dict) -> None:
             raise RuntimeError(f"a stress driver could not go online: {answer.status_code} {answer.text}")
     ctx["places"] = [(await snap(ctx, 0, args.spread_m), await snap(ctx, DROPOFF_MIN_M, DROPOFF_MAX_M)) for _ in range(CHAOS_PLACES)]
 
+    # Fill every rider's wallet up to FUND_TO_PAISE through the admin API (never more than one adjustment's limit at a time),
+    # then remember the starting balances for the check at the end.
+    unix_time = int(time.time())
+    for n in range(1, args.riders + 1):
+        email = RIDER_EMAIL.format(n=n)
+        balance = (await api(ctx["api"], "GET", "/wallet", ctx["tokens"][email])).json()["balance"]
+        while balance < FUND_TO_PAISE:
+            step = min(FUND_TO_PAISE - balance, ADJUST_MAX_PAISE)
+            answer = await api(
+                ctx["api"], "POST", f"/admin/wallets/{ctx['user_ids'][email]}/adjust", ctx["admin_token"],
+                {"amount": step, "note": "stress funding"}, headers={"Idempotency-Key": f"stress-fund-{n}-{unix_time}-{balance}"},
+            )
+            if answer.status_code not in (200, 201):
+                raise RuntimeError(f"funding the wallet of {email} answered {answer.status_code} {answer.text}")
+            balance += step
+        ctx["starting"][ctx["user_ids"][email]] = (await api(ctx["api"], "GET", "/wallet", ctx["tokens"][email])).json()["balance"]
+
     since = (await sql(ctx, "SELECT now()"))[0]
     mine = f"r.created_at >= '{since}' AND r.rider_id IN (SELECT id FROM users WHERE email LIKE '{RIDER_LIKE}')"
     counters = ctx["counters"]
@@ -684,7 +756,7 @@ async def scenario_chaos(ctx: dict) -> None:
     ] + [
         asyncio.create_task(chaos_driver(ctx, email, locations[email], random.Random(f"{seed}-driver-{n}"), counters, deadline))
         for n, email in enumerate(ctx["driver_emails"], 1)
-    ]
+    ] + [asyncio.create_task(chaos_admin(ctx, random.Random(f"{seed}-admin"), counters, deadline))]
     settle_deadline = None
     next_status = start + CHAOS_STATUS_INTERVAL_S
     try:
@@ -749,6 +821,34 @@ async def scenario_chaos(ctx: dict) -> None:
         f"FROM rides r WHERE {mine}",
     )
     ctx["money"] = [int(value) for value in money[0].split("|")]
+    # The wallet money of the run, read-only: rides by payment method with what was charged, the adjustments that were
+    # credited, and for every stress rider final balance == starting balance + credits - wallet charges.
+    rows = await sql(
+        ctx,
+        "SELECT r.payment_method, r.status, count(*), COALESCE(sum(p.amount), 0) FROM rides r LEFT JOIN payments p ON p.ride_id = r.id "
+        f"WHERE {mine} AND r.status IN ('COMPLETED', 'CANCELLED') GROUP BY 1, 2 ORDER BY 1, 2",
+    )
+    ctx["paid_rides"] = [row.split("|") for row in rows]
+    rows = await sql(
+        ctx,
+        "SELECT count(*), COALESCE(sum(amount), 0) FROM wallet_entries WHERE kind = 'ADJUSTMENT' "
+        f"AND created_at >= '{since}' AND user_id IN (SELECT id FROM users WHERE email LIKE '{RIDER_LIKE}')",
+    )
+    ctx["adjustments"] = [int(value) for value in rows[0].split("|")]
+    rows = await sql(
+        ctx,
+        "SELECT u.id, COALESCE(w.balance, 0), "
+        "COALESCE((SELECT sum(e.amount) FROM wallet_entries e WHERE e.user_id = u.id AND e.kind = 'ADJUSTMENT' "
+        f"AND e.created_at >= '{since}'), 0), "
+        "COALESCE((SELECT sum(p.amount) FROM payments p JOIN rides q ON q.id = p.ride_id WHERE q.rider_id = u.id "
+        f"AND p.method = 'wallet' AND q.created_at >= '{since}'), 0) "
+        f"FROM users u LEFT JOIN wallets w ON w.user_id = u.id WHERE u.email LIKE '{RIDER_LIKE}' ORDER BY u.id",
+    )
+    ctx["wallet_mismatches"] = []
+    for row in rows:
+        user_id, final, credits, charges = (int(value) for value in row.split("|"))
+        if user_id in ctx["starting"] and final != ctx["starting"][user_id] + credits - charges:
+            ctx["wallet_mismatches"].append(f"user {user_id}: final {final} != start {ctx['starting'][user_id]} + credits {credits} - charges {charges}")
     # Surge, read-only: rides that were quoted above 1.0x, the highest multiplier, and the surge part of the settled trips
     # (only trips whose breakdown has the key).
     surge = await sql(
@@ -761,11 +861,134 @@ async def scenario_chaos(ctx: dict) -> None:
     ctx["surge"] = [int(value) for value in surge[0].split("|")]
 
 
+async def scenario_payments(ctx: dict) -> None:
+    """Top-ups and webhooks under repetition (M5.3). Each round, for all riders at once: the same top-up request five times
+    (one top-up, one Stripe session), then the signed paid event delivered ten times with one event id plus three times with
+    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I18 are checked after each
+    round. Needs the backend to talk to simulator/fake_stripe.py: it creates a Checkout Session per rider per round."""
+    args = ctx["args"]
+    ctx["driver_emails"] = []
+    await asyncio.gather(*[setup_accounts(ctx, "rider", n) for n in range(1, args.riders + 1)])
+    log.warning("payments: this creates one Checkout Session per rider per round in whichever Stripe the backend uses; "
+                "run it against the local fake (simulator/fake_stripe.py), not a real Stripe account")
+    secret = args.webhook_secret.encode()
+    counters, problems = ctx["counters"], ctx["payment_problems"]
+    webhook_headers = {"Content-Type": "application/json"}
+    riders = {n: ctx["user_ids"][RIDER_EMAIL.format(n=n)] for n in range(1, args.riders + 1)}
+
+    for round_number in range(1, args.rounds + 1):
+        seen = {}
+        ctx["rounds"].append(seen)
+        before = {int(row.split("|")[0]): int(row.split("|")[1]) for row in await sql(
+            ctx, f"SELECT user_id, balance FROM wallets WHERE user_id IN ({', '.join(str(i) for i in riders.values())})")}
+
+        # 1. The same request five times at once per rider: one top-up each.
+        stamp = time.time_ns()
+        keys = {n: f"stress-topup-{n}-{stamp}" for n in riders}
+        amounts = {n: ctx["rng"].randrange(100, 501) * 100 for n in riders}  # 100 to 500 rupees
+        fired = await burst(ctx, [
+            (ctx["tokens"][RIDER_EMAIL.format(n=n)], "POST", "/wallet/topups", {"amount": amounts[n]}, {"Idempotency-Key": keys[n]})
+            for n in riders for _ in range(5)
+        ])
+        topup_ids = {}
+        for index, n in enumerate(riders):
+            answers = fired["results"][index * 5 : (index + 1) * 5]
+            if any(a["status"] == 503 and "not configured" in str(a["body"]) for a in answers):
+                raise RuntimeError("Stripe is not configured on the backend (POST /wallet/topups answered 503): "
+                                   "start simulator/fake_stripe.py and set the three STRIPE_* values in .env")
+            for position, answer in enumerate(answers):
+                if answer["status"] == 409:  # another copy of the request is still talking to Stripe: once more, a second later
+                    await asyncio.sleep(1)
+                    retry = await api(ctx["api"], "POST", "/wallet/topups", ctx["tokens"][RIDER_EMAIL.format(n=n)], {"amount": amounts[n]},
+                                      headers={"Idempotency-Key": keys[n]})
+                    counters["topup_409_retried"] += 1
+                    answers[position] = {"status": retry.status_code, "body": retry.json()}
+            ids = {a["body"]["id"] for a in answers if a["status"] in (200, 201)}
+            counters["topup_requests"] += len(answers)
+            counters["topup_requests_ok"] += sum(1 for a in answers if a["status"] in (200, 201))
+            if len(ids) != 1 or any(a["status"] not in (200, 201) for a in answers):
+                problems.append(f"round {round_number} rider {n}: top-up answers {[a['status'] for a in answers]}, ids {sorted(ids)}")
+            if ids:
+                topup_ids[n] = ids.pop()
+        rows = await sql(ctx, f"SELECT user_id, count(*) FROM wallet_topups WHERE idempotency_key IN ({', '.join(repr(k) for k in keys.values())}) GROUP BY user_id")
+        if sorted(rows) != sorted(f"{user_id}|1" for user_id in riders.values()):
+            problems.append(f"round {round_number}: not exactly one top-up row per rider and key ({len(rows)} riders have rows)")
+        counters["topups_created"] += len(topup_ids)
+        if not topup_ids:
+            raise RuntimeError(f"round {round_number}: no top-up could be created ({problems[-1] if problems else 'no answers'})")
+
+        # 2. Pay every top-up: the same signed event ten times at once plus another event three times, all riders together.
+        sessions = {int(r.split("|")[0]): r.split("|")[1] for r in await sql(
+            ctx, f"SELECT id, stripe_session_id FROM wallet_topups WHERE id IN ({', '.join(str(i) for i in topup_ids.values())})")}
+        now = int(time.time())
+        deliveries = []
+        for n, topup_id in topup_ids.items():
+            session = {"id": sessions[topup_id], "object": "checkout.session", "payment_status": "paid", "status": "complete",
+                       "amount_total": amounts[n], "currency": "inr", "client_reference_id": str(topup_id),
+                       "payment_intent": f"pi_stress_{topup_id}_{stamp}"}
+            for letter, copies in (("a", WEBHOOK_COPIES), ("b", OTHER_EVENT_COPIES)):
+                body = json.dumps({"id": f"evt_stress_{stamp}_{topup_id}_{letter}", "object": "event", "type": "checkout.session.completed",
+                                   "created": now, "data": {"object": session}}).encode()
+                header = f"t={now},v1=" + hmac.new(secret, f"{now}.".encode() + body, hashlib.sha256).hexdigest()
+                deliveries.extend([(None, "POST", "/webhooks/stripe", body, {**webhook_headers, "Stripe-Signature": header})] * copies)
+        fired = await burst(ctx, deliveries)
+        per_topup = WEBHOOK_COPIES + OTHER_EVENT_COPIES
+        for index, (n, topup_id) in enumerate(topup_ids.items()):
+            answers = fired["results"][index * per_topup : (index + 1) * per_topup]
+            labels = [(a["body"] or {}).get("status") if a["status"] == 200 else a["status"] for a in answers]
+            counters.update(f"webhook_{label}" for label in labels)
+            counters["webhook_deliveries"] += len(labels)
+            # One processed. The first delivery of the OTHER event id is ignored (new event, top-up already credited); every
+            # other delivery is a duplicate of one of the two event ids.
+            if labels.count("processed") != 1 or labels.count("ignored") != 1 or labels.count("duplicate") != WEBHOOK_COPIES + OTHER_EVENT_COPIES - 2:
+                problems.append(f"round {round_number} top-up {topup_id}: webhook answers {sorted(map(str, labels))}")
+        rows = await sql(
+            ctx,
+            "SELECT t.id, t.user_id, t.status, t.amount, count(e.id), COALESCE(sum(e.amount), 0) FROM wallet_topups t "
+            f"LEFT JOIN wallet_entries e ON e.topup_id = t.id WHERE t.id IN ({', '.join(str(i) for i in topup_ids.values())}) GROUP BY t.id",
+        )
+        credited = collections.Counter()
+        for row in rows:
+            topup_id, user_id, status, amount, entry_count, entry_amount = row.split("|")
+            if (status, int(entry_count), int(entry_amount)) != ("SUCCEEDED", 1, int(amount)):
+                problems.append(f"round {round_number} top-up {topup_id}: {status}, {entry_count} entries totalling {entry_amount} for {amount}")
+            credited[int(user_id)] += int(amount)
+        after = {int(row.split("|")[0]): int(row.split("|")[1]) for row in await sql(
+            ctx, f"SELECT user_id, balance FROM wallets WHERE user_id IN ({', '.join(str(i) for i in riders.values())})")}
+        for user_id, amount in credited.items():
+            if after.get(user_id, 0) - before.get(user_id, 0) != amount:
+                problems.append(f"round {round_number} user {user_id}: balance rose by {after.get(user_id, 0) - before.get(user_id, 0)}, top-ups {amount}")
+
+        # 3. Three events that must be refused, and nothing may change because of them.
+        snapshot = "SELECT (SELECT count(*) FROM stripe_events), (SELECT count(*) FROM wallet_entries), (SELECT COALESCE(sum(balance), 0) FROM wallets), (SELECT count(*) FROM wallet_topups WHERE status = 'SUCCEEDED')"
+        state_before = await sql(ctx, snapshot)
+        bad = []
+        any_topup = next(iter(topup_ids.items()))
+        for name, signing_secret, timestamp, tamper in (("wrong secret", b"whsec_not_the_secret", now, False), ("tampered body", secret, now, True), ("old timestamp", secret, now - 600, False)):
+            body = json.dumps({"id": f"evt_stress_{stamp}_bad_{len(bad)}", "object": "event", "type": "checkout.session.completed", "created": now,
+                               "data": {"object": {"id": sessions[any_topup[1]], "payment_status": "paid", "amount_total": amounts[any_topup[0]],
+                                                   "currency": "inr", "client_reference_id": str(any_topup[1])}}}).encode()
+            header = f"t={timestamp},v1=" + hmac.new(signing_secret, f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+            bad.append((None, "POST", "/webhooks/stripe", body + b" " if tamper else body, {**webhook_headers, "Stripe-Signature": header}))
+        fired = await burst(ctx, bad)
+        counters["bad_events_sent"] += len(bad)
+        counters["bad_events_refused"] += sum(1 for r in fired["results"] if r["status"] == 400)
+        if [r["status"] for r in fired["results"]] != [400, 400, 400]:
+            problems.append(f"round {round_number}: bad events answered {[r['status'] for r in fired['results']]}, not 400 each")
+        if await sql(ctx, snapshot) != state_before:
+            problems.append(f"round {round_number}: the database changed after bad events")
+
+        invariants = await check_invariants(ctx, seen)
+        log.info("payments round %d/%d: %d top-ups; webhooks %s; %s", round_number, args.rounds, len(topup_ids),
+                 {label[8:]: count for label, count in sorted(counters.items()) if label.startswith("webhook_") and label != "webhook_deliveries"}, invariants)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Concurrency stress test: fires simultaneous requests and checks database invariants")
-    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos"], default="drivers")
+    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos", "payments"], default="drivers")
     parser.add_argument("--admin-email", default=os.environ.get("SIM_ADMIN_EMAIL"), help="or env SIM_ADMIN_EMAIL")
     parser.add_argument("--admin-password", default=os.environ.get("SIM_ADMIN_PASSWORD"), help="or env SIM_ADMIN_PASSWORD")
+    parser.add_argument("--webhook-secret", default=os.environ.get("STRIPE_WEBHOOK_SECRET"), help="payments scenario: the backend's webhook secret, or env STRIPE_WEBHOOK_SECRET")
     parser.add_argument("--api-url", default="http://127.0.0.1:8000", help="one URL, or several separated by commas (two backend processes)")
     parser.add_argument("--osrm-url", default="http://127.0.0.1:5000")
     parser.add_argument("--center-lat", type=float, help="default: the city center")
@@ -802,6 +1025,8 @@ async def main() -> int:
     if not args.cleanup_only and (not args.admin_email or not args.admin_password):
         parser.error("admin credentials are needed: --admin-email and --admin-password (or SIM_ADMIN_EMAIL and SIM_ADMIN_PASSWORD). "
                      "The admin must already exist (backend/create_admin.py).")
+    if args.scenario == "payments" and not args.webhook_secret:
+        parser.error("the payments scenario signs webhooks: --webhook-secret (or env STRIPE_WEBHOOK_SECRET) is needed")
     if not 1 <= args.rounds <= 50:
         parser.error("--rounds must be between 1 and 50")
     if args.riders is None:
@@ -809,12 +1034,12 @@ async def main() -> int:
     if not 2 <= args.riders <= 100:
         parser.error("--riders must be between 2 and 100")
     if args.drivers is None:
-        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10}[args.scenario]
+        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10, "payments": 0}[args.scenario]
     if not 10 <= args.chaos_seconds <= 600:
         parser.error("--chaos-seconds must be between 10 and 600")
     if not 30 <= args.settle_seconds <= 300:
         parser.error("--settle-seconds must be between 30 and 300")
-    if args.scenario != "fleet" and not 1 <= args.drivers <= 100:
+    if args.scenario not in ("fleet", "payments") and not 1 <= args.drivers <= 100:
         parser.error("--drivers must be between 1 and 100")
     if not 2 <= args.repeat <= 5:
         parser.error("--repeat must be between 2 and 5")
@@ -831,7 +1056,7 @@ async def main() -> int:
     log.info(
         "settings: scenario=%s rounds=%d riders=%d drivers=%s repeat=%s spread=%g m watch=%g s sequential=%s keep_last_round=%s "
         "cleanup_only=%s seed=%s chaos=%s api=%s osrm=%s psql=%s/%s label=%s",
-        args.scenario, args.rounds, args.riders, args.drivers if args.scenario != "fleet" else "n/a",
+        args.scenario, args.rounds, args.riders, args.drivers if args.scenario not in ("fleet", "payments") else "n/a",
         args.repeat if args.scenario == "riders" else "n/a", args.spread_m, args.watch_seconds, args.sequential,
         args.keep_last_round, args.cleanup_only, args.seed,
         f"{args.chaos_seconds} s + settle {args.settle_seconds} s, tolerate_5xx={args.tolerate_5xx}, otp={args.otp}" if args.scenario == "chaos" else "n/a",
@@ -839,10 +1064,10 @@ async def main() -> int:
     )
 
     ctx = {
-        "args": args, "rng": random.Random(args.seed), "sem": asyncio.Semaphore(SETUP_CONCURRENCY), "tokens": {},
+        "args": args, "rng": random.Random(args.seed), "sem": asyncio.Semaphore(SETUP_CONCURRENCY), "tokens": {}, "user_ids": {}, "starting": {},
         "driver_emails": [], "rounds": [], "checks": 0, "latencies": {}, "per_rider": {}, "fleet": {"rides": 0, "no_driver": 0},
         "finished": False, "unsettled": False, "offers": {"got": 0, "expected": 0, "lost_rounds": 0},
-        "counters": collections.Counter(), "stuck": {}, "chaos": {"ride": {}, "offer": {}}, "left_active": 0,
+        "counters": collections.Counter(), "payment_problems": [], "stuck": {}, "chaos": {"ride": {}, "offer": {}}, "left_active": 0,
     }
     failure = None
     interrupted = False
@@ -882,7 +1107,10 @@ async def main() -> int:
                     raise RuntimeError(f"the center {ctx['center']} is outside the city bounds (south, west, north, east) = {ctx['bounds']}")
                 log.info("city %s, center %.5f,%.5f", city["city_name"], *ctx["center"])
 
-                scenario = {"drivers": scenario_drivers, "riders": scenario_riders, "fleet": scenario_fleet, "chaos": scenario_chaos}[args.scenario]
+                scenario = {
+                    "drivers": scenario_drivers, "riders": scenario_riders, "fleet": scenario_fleet, "chaos": scenario_chaos,
+                    "payments": scenario_payments,
+                }[args.scenario]
                 task = asyncio.create_task(scenario(ctx))
                 try:
                     asyncio.get_running_loop().add_signal_handler(signal.SIGINT, task.cancel)
@@ -913,7 +1141,7 @@ async def main() -> int:
         return 0
 
     if failure:
-        problem = ("INVARIANTS NOT CHECKED: " if failure.startswith("psql") else "STRESS TEST FAILED: ") + failure
+        problem = ("INVARIANTS NOT CHECKED: " if failure.startswith(("psql", "Stripe is not configured")) else "STRESS TEST FAILED: ") + failure
         if not ctx["rounds"]:  # failed before the first round: there is nothing to summarize
             log.error("%s", problem)
             return 2
@@ -961,6 +1189,19 @@ async def main() -> int:
         completed, fares, fees, fee_total = ctx["money"]
         log.info("  money: %d completed rides, final fares %d paise in all; %d cancelled rides with a fee, fees %d paise in all",
                  completed, fares, fees, fee_total)
+        wallet_done = {(row[0], row[1]): (int(row[2]), int(row[3])) for row in ctx["paid_rides"]}
+        log.info("  payments: wallet rides %d completed (charged %d paise) and %d cancelled (fees %d paise); cash rides %d completed "
+                 "(%d paise) and %d cancelled (fees %d paise)",
+                 *wallet_done.get(("wallet", "COMPLETED"), (0, 0)), *wallet_done.get(("wallet", "CANCELLED"), (0, 0)),
+                 *wallet_done.get(("cash", "COMPLETED"), (0, 0)), *wallet_done.get(("cash", "CANCELLED"), (0, 0)))
+        log.info("  admin: %d adjustments sent, %d created (%d paise credited in all), %d sent twice at once, %d replay mismatches; "
+                 "%d wallet rides requested, %d answered 402 (should be 0)",
+                 counters["adjustments_sent"], counters["adjustments_created"], ctx["adjustments"][1], counters["adjust_replays_sent"],
+                 counters["adjust_replay_mismatch"], counters["wallet_rides_requested"], counters["wallet_402"])
+        log.info("  wallets: final balance == starting balance + credits - wallet charges for %d of %d stress riders",
+                 len(ctx["starting"]) - len(ctx["wallet_mismatches"]), len(ctx["starting"]))
+        for mismatch in ctx["wallet_mismatches"]:
+            log.error("  WALLET MISMATCH %s", mismatch)
         surged, highest, surge_total = ctx["surge"]
         log.info("  surge: %d rides requested above 1.0x, highest multiplier %d percent, surge part of the completed trips %d paise in all",
                  surged, highest, surge_total)
@@ -975,7 +1216,8 @@ async def main() -> int:
             f"{code} {len(ctx['rounds'][0].get(name, {}))}" for name, (code, *_rest) in INVARIANTS.items()))
         log.info("  stuck rides after %d s of settling: %d; rides legitimately left active (assigned, arrived, in progress): %d",
                  args.settle_seconds, len(ctx["stuck"]), ctx["left_active"])
-        for what, label in (("duplicate_requests", "duplicate ride request"), ("rider_cancels_ok", "rider cancel"), ("driver_cancels", "driver cancel"),
+        for what, label in (("wallet_rides_requested", "wallet ride request"), ("adjust_replays_sent", "adjustment sent twice at once"),
+                            ("duplicate_requests", "duplicate ride request"), ("rider_cancels_ok", "rider cancel"), ("driver_cancels", "driver cancel"),
                             ("trips_completed", "completed trip"), ("offline_events", "driver going offline"), ("double_accepts", "double accept"),
                             ("rejects", "reject"), ("ignores", "ignored offer")):
             if not counters[what]:
@@ -983,6 +1225,10 @@ async def main() -> int:
         problems = [f"{code} in {len(ctx['rounds'][0][name])} offenders" for name, (code, *_rest) in INVARIANTS.items() if ctx["rounds"][0].get(name)]
         if ctx["stuck"]:
             problems.append(f"{len(ctx['stuck'])} stuck rides")
+        if counters["adjust_replay_mismatch"]:
+            problems.append(f"{counters['adjust_replay_mismatch']} adjustment replays with different entry ids")
+        if ctx["wallet_mismatches"]:
+            problems.append(f"{len(ctx['wallet_mismatches'])} wallets whose final balance does not add up")
         if server_errors and not args.tolerate_5xx:
             problems.append(f"{server_errors} server errors (5xx)")
         if counters["transport_errors"] and not args.tolerate_5xx:
@@ -994,6 +1240,25 @@ async def main() -> int:
             log.info("CHAOS FOUND PROBLEMS: %s", ", ".join(problems))
             return 1
         log.info("CHAOS CLEAN")
+        return 0
+
+    if args.scenario == "payments" and not failure:
+        counters = ctx["counters"]
+        by_answer = {label[8:]: count for label, count in sorted(counters.items()) if label.startswith("webhook_") and label != "webhook_deliveries"}
+        log.info("  top-ups: %d created (%d of %d create requests succeeded, %d retried after a 409 in progress)",
+                 counters["topups_created"], counters["topup_requests_ok"], counters["topup_requests"], counters["topup_409_retried"])
+        log.info("  webhook deliveries: %d, by answer: %s (one processed per top-up expected: %d top-ups)",
+                 counters["webhook_deliveries"], by_answer, counters["topups_created"])
+        log.info("  bad events: %d sent, %d refused with 400", counters["bad_events_sent"], counters["bad_events_refused"])
+        for problem in ctx["payment_problems"][:20]:
+            log.error("  PAYMENT PROBLEM %s", problem)
+        if ctx["checks"] == 0:
+            log.error("INVARIANTS NOT CHECKED: no snapshot was taken")
+            return 2
+        if violated or ctx["payment_problems"]:
+            log.info("PAYMENTS FOUND PROBLEMS: %s", ", ".join(violated + [f"{len(ctx['payment_problems'])} payment problems"] * bool(ctx["payment_problems"])))
+            return 1
+        log.info("PAYMENTS CLEAN")
         return 0
 
     if failure:

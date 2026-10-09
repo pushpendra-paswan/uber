@@ -45,6 +45,9 @@ services:
     volumes:
       - ./backend:/app
       - ./frontend:/frontend
+    # Lets the container reach a fake Stripe running on the host (simulator/fake_stripe.py) on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       db:
         condition: service_healthy
