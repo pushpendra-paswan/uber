@@ -367,6 +367,8 @@ async def test_cancelling_after_the_accept_has_no_offer_to_close(client, db, ope
 
     assert response.status_code == 200
     assert await offers_of(db, ride["id"]) == [(driver["driver"].id, "ACCEPTED")]
+    # No offer_closed (there is no offer to close). The only message is the news that the ride is cancelled.
+    assert await receive(driver_ws) == {"type": "ride_updated", "data": {"ride_id": ride["id"], "status": "CANCELLED"}}
     await assert_silent(driver_ws)
 
 

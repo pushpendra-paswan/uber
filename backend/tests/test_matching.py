@@ -205,7 +205,9 @@ async def test_a_driver_is_available_again_after_a_completed_ride(
     first = await request_ride(first_rider)
     await accept_offer(driver)
     for step in ("arrive", "start", "complete"):
-        assert (await client.post(f"/rides/{first['id']}/{step}", headers=driver["headers"])).status_code == 200
+        body = {"otp": "1234"} if step == "start" else None
+        response = await client.post(f"/rides/{first['id']}/{step}", json=body, headers=driver["headers"])
+        assert response.status_code == 200
 
     second = await request_ride(second_rider)
 

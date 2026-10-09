@@ -58,7 +58,7 @@ docker compose exec backend python create_admin.py --email admin@example.com --n
 
 ## Try a ride in the browser
 
-Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider, pick pickup and drop-off by searching (press Enter) or clicking the map, and request a ride. Once both points are set, the page shows the route and the estimated fare (base fare Rs 50, Rs 12 per km, Rs 2 per minute, Rs 80 minimum; the server works the fare out again when you request). The request is matched at once (see below). The driver tab then moves the ride through arrived, started, and completed.
+Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider, pick pickup and drop-off by searching (press Enter) or clicking the map, and request a ride. Once both points are set, the page shows the route and the estimated fare (base fare Rs 50, Rs 12 per km, Rs 2 per minute, Rs 80 minimum; the server works the fare out again when you request). The request is matched at once (see below). The driver tab then moves the ride through arrived, started (with the rider's trip code), and completed (see "Trip flow" below).
 
 ### Try matching by hand (M2.4, offers since M3.3)
 
@@ -66,7 +66,7 @@ Matching happens inside the ride request: the server picks the nearest online, a
 
 1. In the admin tab, approve two drivers.
 2. In two driver tabs (one account each), click the map at different distances from where the rider will pick up (for example 1 km and 2 km away) and press **Go online**.
-3. In a rider tab, choose a pickup and drop-off and press **Request ride**. The rider sees "Looking for a driver", and the nearer driver's tab shows the offer panel within about a second. When that driver accepts, the rider page shows "A driver has been assigned".
+3. In a rider tab, choose a pickup and drop-off and press **Request ride**. The rider sees "Looking for a driver", and the nearer driver's tab shows the offer panel within about a second. When that driver accepts, the rider page shows "Your driver is on the way" and the trip code.
 4. A second rider at the same pickup is not offered the nearer driver while the first offer is open (a driver deciding on an offer is busy), so the farther driver gets that one. A third rider sees "No drivers are available nearby right now" and can request again at once.
 5. When a driver completes or a rider cancels, that driver can be offered rides again. A driver who stops pinging (closed tab) is not offered rides after 30 seconds.
 
@@ -99,6 +99,7 @@ Run (the stack must be up and OSRM prepared):
 | `--seed` | none | Makes the starting points (and the answers to offers) repeatable |
 | `--accept-rate` | 0.7 | Share of offers a driver accepts |
 | `--reject-rate` | 0.15 | Share of offers a driver rejects. The rest (default 0.15) are ignored and run out after 15 seconds |
+| `--otp` | 1234 | The trip code the drivers send when they start a trip (see "Trip flow"). A wrong one makes every driver wait at the pickup and log "wrong trip code" once per ride |
 | `--response-delay-min`, `--response-delay-max` | 1, 6 | Seconds a driver waits before answering an offer, picked at random (always at least 2 seconds before the deadline). Answers are rounded up to the simulator's 3-second tick |
 
 The simulator exits with a message if a rate is negative, the two rates add up to more than 1, or the minimum delay is above the maximum. `--accept-rate 0 --reject-rate 0` makes every driver ignore every offer, so a ride walks through up to 5 offers (about 75 seconds) and ends as `NO_DRIVER_FOUND`.
@@ -162,6 +163,30 @@ POST /rides  ->  REQUESTED, offer to the nearest free driver
 5. Request again and cancel from the rider tab while the offer is showing: the panel closes with "The rider cancelled the request."
 
 By hand: `curl localhost:8000/drivers/me/offer -H "Authorization: Bearer $DRIVER"`, then `curl -X POST localhost:8000/offers/<id>/accept -H "Authorization: Bearer $DRIVER"` (or `/reject`). Look at the rows with `docker compose exec db psql -U uber -d uber -c 'SELECT id, ride_id, driver_id, status, pickup_distance_m, expires_at FROM ride_offers ORDER BY id DESC LIMIT 10;'`. Run the simulator with the rates above to see many offers answered at once. Known limit until M4: two simultaneous requests can still offer the same free driver two rides.
+
+### Trip flow (M3.5)
+
+From the accepted offer to the end of the trip:
+
+```
+rider requests -> REQUESTED (offer to a driver)
+driver accepts -> DRIVER_ASSIGNED   the rider's page shows the trip code
+driver arrives -> DRIVER_ARRIVED    POST /rides/{id}/arrive
+driver types the code the rider tells them -> IN_PROGRESS   POST /rides/{id}/start  {"otp": "1234"}
+driver completes -> COMPLETED       POST /rides/{id}/complete
+rider or driver cancels, before the trip starts -> CANCELLED   POST /rides/{id}/cancel
+```
+
+- **The trip code is fake on purpose: it is always `1234`.** It is the constant `FAKE_OTP` at the top of `backend/app/services/rides.py`. A real system would make four random digits per ride with Python's `secrets` module. The flow is the real one: the code is stored on the ride (`rides.otp`) when a driver is assigned, only the ride's rider can read it (`GET /rides/{id}/otp`), and the driver must send it to start the trip. It is cleared when the trip starts or the ride is cancelled, and it is never in `RideResponse`, the ride events, or a WebSocket message.
+- A wrong code gives `400 Incorrect trip code` and changes nothing. A start on a ride that is not `DRIVER_ARRIVED` gives `409`, with any code (the state is checked first). A code that is not exactly four digits gives `422`.
+- Every status change made by arrive, start, complete, and cancel sends `ride_updated {ride_id, status}` to BOTH the rider and the assigned driver after the commit, so both pages update within a second. The pages still poll every 3 seconds as a safety net.
+- Either side can cancel while the driver is on the way or waiting at the pickup (not after the trip starts). The other page shows who cancelled ("You cancelled this ride", "The driver cancelled this ride...", "The rider cancelled this ride").
+- There are no location checks (arrive and complete work from anywhere), no limit on wrong codes, no cancellation fee, and a driver who cancels does not trigger a new search. Those come later or are listed in `PROJECT_CONTEXT.md`.
+- The simulator sends the code itself. `--otp 0000` makes its drivers send a wrong one: each logs "wrong trip code for ride N" once, the ride stays `DRIVER_ARRIVED`, and the rider can cancel it.
+
+**Try it with two tabs (no simulator):** log in as a driver and click the map near where the rider will be picked up, then **Go online**. As a rider, request a ride. The driver accepts: the rider page shows "Your driver is on the way" and a large code (1234). The driver presses **I have arrived**: the rider page changes within a second. The driver types `0000` and presses Enter: "Incorrect trip code", nothing changes, and the typed text stays. The driver types `1234` and presses Enter: both pages show "Trip in progress" and the rider's code disappears. **Complete trip** ends it.
+
+By hand: `curl localhost:8000/rides/<id>/otp -H "Authorization: Bearer $RIDER"` (rider only), then `curl -X POST localhost:8000/rides/<id>/start -H "Authorization: Bearer $DRIVER" -H 'Content-Type: application/json' -d '{"otp":"1234"}'`.
 
 ## WebSockets (M3.1)
 

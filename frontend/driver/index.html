@@ -119,6 +119,7 @@
     <section id="ride-section" hidden>
       <h2>Ride #<span id="ride-id"></span></h2>
       <p><span id="ride-status" class="badge"></span> <span id="ride-status-text"></span></p>
+      <p id="ride-note" class="note" hidden></p>
       <dl>
         <div>
           <dt>Pickup</dt>
@@ -130,7 +131,11 @@
         </div>
       </dl>
       <button id="arrive-button" type="button" hidden>I have arrived</button>
-      <button id="start-button" type="button" hidden>Start trip</button>
+      <form id="start-form" hidden>
+        <label for="trip-code-input">Trip code from the rider</label>
+        <input id="trip-code-input" type="text" inputmode="numeric" maxlength="4" pattern="\d{4}" autocomplete="off" required>
+        <button id="start-button" type="submit">Start trip</button>
+      </form>
       <button id="complete-button" type="button" hidden>Complete trip</button>
       <button id="cancel-button" type="button" hidden>Cancel ride</button>
       <button id="done-button" type="button" hidden>Wait for a new ride</button>

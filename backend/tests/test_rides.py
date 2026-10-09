@@ -51,7 +51,8 @@ async def make_ride(client, insert_ride, assign_ride):
             return (await insert_ride(rider, RideStatus.REQUESTED)).id
         ride_id = (await assign_ride(rider, driver))["id"]
         for step in ("arrive", "start", "complete")[: HAPPY_PATH.index(target) - 1]:
-            response = await client.post(f"/rides/{ride_id}/{step}", headers=driver["headers"])
+            body = {"otp": "1234"} if step == "start" else None
+            response = await client.post(f"/rides/{ride_id}/{step}", json=body, headers=driver["headers"])
             assert response.status_code == 200
         return ride_id
 
@@ -93,7 +94,7 @@ async def test_happy_path(client, rider, driver, assign_ride):
     response = await client.post(f"/rides/{ride_id}/arrive", headers=driver["headers"])
     assert response.json()["status"] == "DRIVER_ARRIVED"
 
-    response = await client.post(f"/rides/{ride_id}/start", headers=driver["headers"])
+    response = await client.post(f"/rides/{ride_id}/start", json={"otp": "1234"}, headers=driver["headers"])
     assert response.json()["status"] == "IN_PROGRESS"
     assert response.json()["started_at"] is not None
     assert response.json()["completed_at"] is None

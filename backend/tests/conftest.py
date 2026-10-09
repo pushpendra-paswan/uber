@@ -198,13 +198,17 @@ async def assign_ride(client, put_online, accept_offer):
 
 @pytest_asyncio.fixture
 async def insert_ride(db: AsyncSession):
-    """Returns a function that inserts a ride straight into the database in the given status, with no matching."""
+    """Returns a function that inserts a ride straight into the database in the given status, with no matching.
+    DRIVER_ASSIGNED and DRIVER_ARRIVED rides get the trip code 1234, unless with_otp is False."""
 
-    async def create(rider: dict, status: RideStatus, driver: dict | None = None) -> Ride:
+    async def create(rider: dict, status: RideStatus, driver: dict | None = None, with_otp: bool = True) -> Ride:
+        # A ride that was assigned through the real flow has the trip code until the trip starts or is cancelled.
+        has_otp = with_otp and status in (RideStatus.DRIVER_ASSIGNED, RideStatus.DRIVER_ARRIVED)
         ride = Ride(
             rider_id=rider["user"].id,
             driver_id=driver["driver"].id if driver else None,
             status=status,
+            otp="1234" if has_otp else None,
             pickup_lat=settings.city_center_lat,
             pickup_lng=settings.city_center_lng,
             pickup_address="MG Road",

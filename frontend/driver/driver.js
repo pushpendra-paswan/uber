@@ -3,9 +3,9 @@ import { connect, disconnect, reconnectNow } from "/shared/ws.js";
 
 const STATUS_TEXT = {
   REQUESTED: "Waiting for a driver to be assigned",
-  DRIVER_ASSIGNED: "Go to the pickup point",
-  DRIVER_ARRIVED: "Waiting at pickup. Start the trip when the rider is in",
-  IN_PROGRESS: "Trip in progress",
+  DRIVER_ASSIGNED: "Drive to the pickup point",
+  DRIVER_ARRIVED: "Ask the rider for their trip code",
+  IN_PROGRESS: "Take the rider to the drop-off",
   COMPLETED: "Trip completed",
   CANCELLED: "Ride cancelled",
   NO_DRIVER_FOUND: "No driver was found",
@@ -106,10 +106,12 @@ const rideSection = document.getElementById("ride-section");
 const rideId = document.getElementById("ride-id");
 const rideStatus = document.getElementById("ride-status");
 const rideStatusText = document.getElementById("ride-status-text");
+const rideNote = document.getElementById("ride-note");
 const ridePickup = document.getElementById("ride-pickup");
 const rideDropoff = document.getElementById("ride-dropoff");
 const arriveButton = document.getElementById("arrive-button");
-const startButton = document.getElementById("start-button");
+const startForm = document.getElementById("start-form");
+const codeInput = document.getElementById("trip-code-input");
 const completeButton = document.getElementById("complete-button");
 const cancelButton = document.getElementById("cancel-button");
 const doneButton = document.getElementById("done-button");
@@ -131,6 +133,9 @@ const socketHandlers = {
       if (state.offer === null || state.offer.id === data.offer_id) state.notice = CLOSED_NOTICE[data.reason] || "";
       refresh().then(render);
     } else if (type === "offer_created") {
+      refresh().then(render);
+    } else if (type === "ride_updated") {
+      // A driver only receives these for their own ride.
       refresh().then(render);
     }
   },
@@ -394,10 +399,21 @@ function render() {
     rideId.textContent = state.ride.id;
     rideStatus.textContent = status;
     rideStatusText.textContent = STATUS_TEXT[status];
+
+    // Who cancelled comes from the last CANCELLED event: the actor is the driver (this user), the rider, or the system.
+    const cancelled = status === "CANCELLED" ? state.events.findLast((event) => event.to_status === "CANCELLED") : null;
+    let note = "";
+    if (cancelled) {
+      if (cancelled.actor_user_id === getSession().user.id) note = "You cancelled this ride.";
+      else if (cancelled.actor_user_id === null) note = "Ride cancelled.";
+      else note = "The rider cancelled this ride.";
+    }
+    rideNote.hidden = note === "";
+    rideNote.textContent = note;
     ridePickup.textContent = state.ride.pickup_address;
     rideDropoff.textContent = state.ride.dropoff_address;
     arriveButton.hidden = status !== "DRIVER_ASSIGNED";
-    startButton.hidden = status !== "DRIVER_ARRIVED";
+    startForm.hidden = status !== "DRIVER_ARRIVED"; // only shown or hidden: the typed code is never touched here
     completeButton.hidden = status !== "IN_PROGRESS";
     cancelButton.hidden = status !== "DRIVER_ASSIGNED" && status !== "DRIVER_ARRIVED";
     doneButton.hidden = !FINISHED.includes(status);
@@ -479,18 +495,34 @@ offlineButton.addEventListener("click", () => {
 });
 
 reconnectButton.addEventListener("click", () => act(() => reconnectNow()));
-acceptButton.addEventListener("click", () => act(() => api("POST", `/offers/${state.offer.id}/accept`)));
+acceptButton.addEventListener("click", () => {
+  codeInput.value = ""; // nothing typed for an earlier ride is left over for this one
+  act(() => api("POST", `/offers/${state.offer.id}/accept`));
+});
 rejectButton.addEventListener("click", () => act(() => api("POST", `/offers/${state.offer.id}/reject`)));
 
 arriveButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/arrive`)));
-startButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/start`)));
+
+// The code input is written only by handlers: cleared after a successful start, left alone after an error so the
+// driver can fix it. Polling calls render(), which never touches it.
+startForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  act(async () => {
+    await api("POST", `/rides/${state.ride.id}/start`, { otp: codeInput.value });
+    codeInput.value = "";
+  });
+});
+
 completeButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/complete`)));
 
 cancelButton.addEventListener("click", () => {
-  if (confirm("Cancel this ride?")) act(() => api("POST", `/rides/${state.ride.id}/cancel`));
+  if (!confirm("Cancel this ride?")) return;
+  codeInput.value = "";
+  act(() => api("POST", `/rides/${state.ride.id}/cancel`));
 });
 
 doneButton.addEventListener("click", () => {
+  codeInput.value = "";
   act(async () => {
     state.ride = null;
     state.rideId = null;

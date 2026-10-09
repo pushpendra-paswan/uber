@@ -3,8 +3,8 @@ import { connect, disconnect, reconnectNow } from "/shared/ws.js";
 
 const STATUS_TEXT = {
   REQUESTED: "Looking for a driver",
-  DRIVER_ASSIGNED: "A driver has been assigned",
-  DRIVER_ARRIVED: "Your driver has arrived",
+  DRIVER_ASSIGNED: "Your driver is on the way",
+  DRIVER_ARRIVED: "Your driver has arrived. Tell them your trip code to start the trip",
   IN_PROGRESS: "Trip in progress",
   COMPLETED: "Trip completed",
   CANCELLED: "Ride cancelled",
@@ -13,6 +13,7 @@ const STATUS_TEXT = {
 const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const TRACKING = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS"]; // the driver's position is shown only in these
+const CODE_STATUSES = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED"]; // the trip code is asked for and shown only in these
 const CLOSE_REPLACED = 4409; // ws.js reports it as "closed": this account has too many tabs
 const MEANWHILE = "Updating every few seconds meanwhile.";
 const TRACKING_TEXT = {
@@ -63,6 +64,8 @@ const state = {
   driver: null, // answer of GET /rides/{id}/driver
   driverLocation: null, // {lat, lng, updated_at} of the newest accepted update
   driverKey: null, // "rideId:driverId" the details were asked for; set before the call so a failure is not retried every poll
+  otp: null, // the trip code, from GET /rides/{id}/otp
+  otpKey: null, // the ride id the code was asked for; set before the call so a failure is not retried every poll
   error: "",
   busy: false,
 };
@@ -92,6 +95,9 @@ const rideSection = document.getElementById("ride-section");
 const rideId = document.getElementById("ride-id");
 const rideStatus = document.getElementById("ride-status");
 const rideStatusText = document.getElementById("ride-status-text");
+const rideNote = document.getElementById("ride-note");
+const codeSection = document.getElementById("code-section");
+const tripCode = document.getElementById("trip-code");
 const ridePickup = document.getElementById("ride-pickup");
 const rideDropoff = document.getElementById("ride-dropoff");
 const rideDriverRow = document.getElementById("ride-driver-row");
@@ -236,6 +242,17 @@ async function refresh() {
       }
     } else {
       state.driver = null;
+    }
+
+    // The code only exists while the driver is assigned or has arrived; it is gone once the trip starts or ends.
+    if (state.ride && CODE_STATUSES.includes(state.ride.status)) {
+      if (state.otpKey !== state.ride.id) {
+        state.otpKey = state.ride.id;
+        state.otp = (await api("GET", `/rides/${state.ride.id}/otp`)).otp;
+      }
+    } else {
+      state.otp = null;
+      state.otpKey = null;
     }
   } catch (err) {
     state.error = err.message;
@@ -471,6 +488,20 @@ function render() {
     rideId.textContent = state.ride.id;
     rideStatus.textContent = state.ride.status;
     rideStatusText.textContent = STATUS_TEXT[state.ride.status];
+
+    // Who cancelled comes from the last CANCELLED event: the actor is the rider (this user), the driver, or the system.
+    const cancelled = state.ride.status === "CANCELLED" ? state.events.findLast((event) => event.to_status === "CANCELLED") : null;
+    let note = "";
+    if (cancelled) {
+      if (cancelled.actor_user_id === getSession().user.id) note = "You cancelled this ride.";
+      else if (cancelled.actor_user_id === null) note = "Ride cancelled.";
+      else note = "The driver cancelled this ride. You can request a new one.";
+    }
+    rideNote.hidden = note === "";
+    rideNote.textContent = note;
+
+    codeSection.hidden = !CODE_STATUSES.includes(state.ride.status) || state.otp === null;
+    tripCode.textContent = state.otp === null ? "" : state.otp;
     ridePickup.textContent = state.ride.pickup_address;
     rideDropoff.textContent = state.ride.dropoff_address;
     rideTrip.textContent = formatTrip(state.ride.distance_m, state.ride.duration_s);
@@ -544,6 +575,8 @@ logoutButton.addEventListener("click", () => {
   state.driver = null;
   state.driverLocation = null;
   state.driverKey = null;
+  state.otp = null;
+  state.otpKey = null;
   render(); // removes the driver marker
   clearSession();
   location.reload();
@@ -603,6 +636,8 @@ newRideButton.addEventListener("click", () => {
     state.driver = null;
     state.driverLocation = null;
     state.driverKey = null;
+    state.otp = null;
+    state.otpKey = null;
     for (const kind of KINDS) inputs[kind].value = "";
     pickRadios.pickup.checked = true;
   });

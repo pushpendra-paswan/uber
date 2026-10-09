@@ -130,6 +130,16 @@ class RideCreate(EstimateRequest):
     dropoff_address: str = Field(min_length=1, max_length=255)
 
 
+class StartTripRequest(BaseModel):
+    # [0-9] and not \d: \d also matches digits of other scripts, which secrets.compare_digest cannot compare.
+    otp: str = Field(pattern=r"^[0-9]{4}$")
+
+
+# The only place the trip code leaves the backend. RideResponse must never get an otp field.
+class OtpResponse(BaseModel):
+    otp: str
+
+
 class RideResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

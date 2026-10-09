@@ -351,12 +351,16 @@ async def run_driver(n, args, world, sem, admin_token, api_client, osrm_client, 
             action = "complete"
         if action is not None:
             try:
-                r = await api(api_client, "POST", f"/rides/{plan[1]}/{action}", token)
+                body = {"otp": args.otp} if action == "start" else None
+                r = await api(api_client, "POST", f"/rides/{plan[1]}/{action}", token, body)
                 if r.status_code == 200:
                     log.info("ride %s: %s", plan[1], RIDE_ACTION_LOGS[action])
                     if action == "complete":
                         stats["completed"] += 1
                         finished_ride = plan[1]
+                elif r.status_code == 400 and action == "start":
+                    # The same text every tick, so it is logged once per ride; the next tick tries again.
+                    tick_problems["action"] = f"wrong trip code for ride {plan[1]}"
                 elif r.status_code != 409:
                     tick_problems["action"] = f"{action} answered {r.status_code}"
             except httpx.HTTPError as error:
@@ -445,6 +449,7 @@ async def main() -> None:
     parser.add_argument("--reject-rate", type=float, default=0.15, help="share of offers a driver rejects; the rest are ignored and expire")
     parser.add_argument("--response-delay-min", type=float, default=1, help="seconds before a driver answers an offer, at least")
     parser.add_argument("--response-delay-max", type=float, default=6, help="seconds before a driver answers an offer, at most")
+    parser.add_argument("--otp", default="1234", help="the trip code sent to start a trip (the backend's fake code is 1234)")
     args = parser.parse_args()
 
     if not 1 <= args.drivers <= MAX_DRIVERS:

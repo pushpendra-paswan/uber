@@ -3,7 +3,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Ride, RideEvent, RideStatus, User
-from app.schemas import EstimateRequest, EstimateResponse, RideCreate, RideDriverResponse, RideEventResponse, RideResponse
+from app.schemas import (
+    EstimateRequest,
+    EstimateResponse,
+    OtpResponse,
+    RideCreate,
+    RideDriverResponse,
+    RideEventResponse,
+    RideResponse,
+    StartTripRequest,
+)
 from app.security import get_current_user, require_role
 from app.services import rides as rides_service
 
@@ -42,6 +51,13 @@ async def get_ride_driver(
     return await rides_service.get_ride_driver(db, user, ride_id)
 
 
+@router.get("/{ride_id}/otp", response_model=OtpResponse)
+async def get_ride_otp(
+    ride_id: int, user: User = Depends(require_role("rider")), db: AsyncSession = Depends(get_db)
+) -> OtpResponse:
+    return await rides_service.get_otp(db, user, ride_id)
+
+
 @router.get("/{ride_id}/events", response_model=list[RideEventResponse])
 async def get_ride_events(
     ride_id: int, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
@@ -55,8 +71,10 @@ async def arrive(ride_id: int, user: User = Depends(require_role("driver")), db:
 
 
 @router.post("/{ride_id}/start", response_model=RideResponse)
-async def start(ride_id: int, user: User = Depends(require_role("driver")), db: AsyncSession = Depends(get_db)) -> Ride:
-    return await rides_service.driver_set_status(db, user, ride_id, RideStatus.IN_PROGRESS)
+async def start(
+    ride_id: int, data: StartTripRequest, user: User = Depends(require_role("driver")), db: AsyncSession = Depends(get_db)
+) -> Ride:
+    return await rides_service.driver_set_status(db, user, ride_id, RideStatus.IN_PROGRESS, data.otp)
 
 
 @router.post("/{ride_id}/complete", response_model=RideResponse)

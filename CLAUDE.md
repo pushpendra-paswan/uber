@@ -129,7 +129,7 @@ Services raise `HTTPException` directly. No custom exception hierarchy.
 
 **WebSockets:** the WebSocket router owns the socket registry (a module-level dict) and the Redis listener task. It may open its own short database session for authentication only, never a request-scoped one (`Depends(get_db)` would hold a Postgres connection for as long as the socket stays open). Services send events to users by calling `repositories/events.publish` directly; there is no service wrapper.
 
-**Events:** events are small "something changed" nudges with no personal data. Commands go over REST and REST is the source of truth, so a missed event is harmless. Events are published AFTER the commit, never before, so a client that refreshes sees the new data. `events.publish` is best-effort (it logs a warning and returns 0 when Redis fails), so a failed publish never fails or undoes a request that already committed.
+**Events:** events are small "something changed" nudges with no personal data. Commands go over REST and REST is the source of truth, so a missed event is harmless. Events are published AFTER the commit, never before, so a client that refreshes sees the new data. `events.publish` is best-effort (it logs a warning and returns 0 when Redis fails), so a failed publish never fails or undoes a request that already committed. Every ride status change made by arrive, start, complete, and cancel is published as `ride_updated` to both participants (the rider and the assigned driver), after the commit.
 
 **Offers sweeper:** `services/offers.py` runs one background asyncio task per backend process (`sweep_forever`, started in the lifespan) that expires offers past their deadline. It runs outside any request, so it is the second approved place that opens its own database sessions (the first is WebSocket authentication): a new session per offer, taken from `database.async_session` at call time so tests can replace it.
 
@@ -158,6 +158,7 @@ The code in this project is **simple and plain**. A beginner should be able to r
 
 - `ALLOWED_TRANSITIONS` dict and one `change_ride_status()` function in `services/rides.py`. Every ride status change goes through it, and it writes to `ride_events`.
 - `finish_offer()` in `services/offers.py`: closes an offer that was rejected or ran out of time, then offers the ride to the next driver or ends it. Used by reject and by expiry, so it is the one private helper in that file.
+- `notify_ride_updated()` in `services/rides.py`: after the commit, publishes `ride_updated` to the ride's rider and its assigned driver. Used by `driver_set_status` and `cancel`, so it is the one private helper in that file.
 - `get_current_user` and role-check dependencies in `security.py`, and `user_from_token` (the one place a JWT becomes a user, shared by HTTP and WebSocket auth).
 - `api.js` in `frontend/shared/`, since all three frontends call the backend.
 
@@ -180,6 +181,8 @@ REQUESTED → NO_DRIVER_FOUND
 ```
 
 `REQUESTED` means offers are being tried: the ride is offered to one driver at a time (table `ride_offers`). `DRIVER_ASSIGNED` happens only when a driver accepts an offer. `NO_DRIVER_FOUND` happens when nobody qualifies or the offers run out.
+
+**Trip code:** `change_ride_status()` sets `ride.otp` (the fake code `1234`, the constant `FAKE_OTP` in `services/rides.py`) when a ride becomes `DRIVER_ASSIGNED`, and clears it when the ride becomes `IN_PROGRESS` or `CANCELLED`. Starting a trip needs the code, and the state is checked before the code. Only the ride's rider can read it (`GET /rides/{id}/otp`); it never appears in `RideResponse`, ride events, or WebSocket events.
 
 ### Frontend conventions
 

@@ -64,7 +64,8 @@ async def ping(client, who: dict, lat: float = LAT, lng: float = LNG) -> dict:
 
 async def advance(client, trip: dict, status: str) -> None:
     for step in STEPS_TO[status]:
-        response = await client.post(f"/rides/{trip['ride_id']}/{step}", headers=trip["driver"]["headers"])
+        body = {"otp": "1234"} if step == "start" else None
+        response = await client.post(f"/rides/{trip['ride_id']}/{step}", json=body, headers=trip["driver"]["headers"])
         assert response.status_code == 200, response.text
 
 
@@ -105,6 +106,7 @@ async def test_a_ping_after_the_ride_ended_publishes_nothing(client, assigned, s
         await advance(client, assigned, "COMPLETED")
     else:
         await cancel(client, assigned)
+    await spy()  # the ride_updated events of the status changes above are not what this test is about
 
     await ping(client, assigned["driver"])
 

@@ -1,4 +1,5 @@
 import logging
+import secrets
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -10,11 +11,15 @@ from app.repositories import drivers as drivers_repo
 from app.repositories import events
 from app.repositories import offers as offers_repo
 from app.repositories import rides as rides_repo
-from app.schemas import DriverLocation, EstimateRequest, RideCreate, RideDriverResponse, VehicleResponse
+from app.schemas import DriverLocation, EstimateRequest, OtpResponse, RideCreate, RideDriverResponse, VehicleResponse
 from app.services import matching, pricing, routing
 from app.utils.geo import is_inside_bounds
 
 MIN_TRIP_DISTANCE_M = 200
+
+# Fake on purpose, so the flow can be learned and tested by hand. A real system would make four random digits
+# per ride with the secrets module. It is still stored per ride, shown only to the rider, and checked on start.
+FAKE_OTP = "1234"
 
 # uvicorn's logger, because it is the one that has a handler and prints INFO.
 logger = logging.getLogger("uvicorn.error")
@@ -37,6 +42,11 @@ async def change_ride_status(db: AsyncSession, ride: Ride, new_status: RideStatu
         raise HTTPException(status_code=409, detail=f"Cannot change ride from {old_status.value} to {new_status.value}")
 
     ride.status = new_status
+    # The only place the trip code changes: set on assignment, gone once the trip starts or the ride is cancelled.
+    if new_status == RideStatus.DRIVER_ASSIGNED:
+        ride.otp = FAKE_OTP
+    if new_status in (RideStatus.IN_PROGRESS, RideStatus.CANCELLED):
+        ride.otp = None
     if new_status == RideStatus.IN_PROGRESS:
         ride.started_at = datetime.now(timezone.utc)
     if new_status == RideStatus.COMPLETED:
@@ -138,10 +148,37 @@ async def get_active(db: AsyncSession, user: User) -> Ride:
     return ride
 
 
-async def driver_set_status(db: AsyncSession, user: User, ride_id: int, new_status: RideStatus) -> Ride:
+async def get_otp(db: AsyncSession, user: User, ride_id: int) -> OtpResponse:
+    ride = await load_ride_for_user(db, user, ride_id)
+    # Only the ride's own rider may see the code.
+    if ride.rider_id != user.id:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    if ride.status not in (RideStatus.DRIVER_ASSIGNED, RideStatus.DRIVER_ARRIVED) or ride.otp is None:
+        raise HTTPException(status_code=409, detail="Trip code is not available")
+    return OtpResponse(otp=ride.otp)
+
+
+async def notify_ride_updated(db: AsyncSession, ride: Ride) -> None:
+    """Tells both people on the ride that its status changed. Call it after the commit."""
+    data = {"ride_id": ride.id, "status": ride.status.value}
+    await events.publish(ride.rider_id, "ride_updated", data)
+    if ride.driver_id is not None:
+        driver_user_id = await drivers_repo.get_user_id(db, ride.driver_id)
+        await events.publish(driver_user_id, "ride_updated", data)
+
+
+async def driver_set_status(
+    db: AsyncSession, user: User, ride_id: int, new_status: RideStatus, otp: str | None = None
+) -> Ride:
     ride = await load_ride_for_user(db, user, ride_id, for_update=True)
+    # The state is checked first: a wrong code on a ride that cannot start gets the 409 from change_ride_status.
+    if new_status == RideStatus.IN_PROGRESS and ride.status == RideStatus.DRIVER_ARRIVED:
+        if ride.otp is None or not secrets.compare_digest(ride.otp, otp):
+            raise HTTPException(status_code=400, detail="Incorrect trip code")
     await change_ride_status(db, ride, new_status, user.id)
     await db.commit()
+
+    await notify_ride_updated(db, ride)
     return ride
 
 
@@ -160,4 +197,5 @@ async def cancel(db: AsyncSession, user: User, ride_id: int) -> Ride:
         await events.publish(
             driver_user_id, "offer_closed", {"offer_id": offer.id, "ride_id": ride.id, "reason": "ride_cancelled"}
         )
+    await notify_ride_updated(db, ride)
     return ride
