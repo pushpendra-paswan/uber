@@ -152,6 +152,24 @@ class RideResponse(BaseModel):
     completed_at: datetime | None
 
 
+# What a driver may know about an offered ride. The pickup and drop-off names are the same as in RideResponse
+# on purpose, so the driver page can draw an offer and a ride alike. No rider name, email, or phone.
+class OfferResponse(BaseModel):
+    id: int
+    ride_id: int
+    pickup_address: str
+    pickup_lat: float
+    pickup_lng: float
+    dropoff_address: str
+    dropoff_lat: float
+    dropoff_lng: float
+    trip_distance_m: int | None
+    trip_duration_s: int | None
+    fare_estimate: int | None  # paise
+    pickup_distance_m: int
+    expires_in: float  # seconds left, never negative
+
+
 class RideEventResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

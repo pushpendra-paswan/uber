@@ -9,19 +9,22 @@ from redis.exceptions import RedisError
 from sqlalchemy import text
 
 from app.database import engine, redis_client
-from app.routers import admin, auth, drivers, places, rides, websocket
+from app.routers import admin, auth, drivers, offers, places, rides, websocket
+from app.services import offers as offers_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # Starts even when Redis is down: the listener keeps retrying in the background.
-    listener = asyncio.create_task(websocket.listen_for_events())
+    # Starts even when Redis or Postgres is down: both tasks keep retrying in the background.
+    tasks = [asyncio.create_task(websocket.listen_for_events()), asyncio.create_task(offers_service.sweep_forever())]
     yield
-    listener.cancel()
-    try:
-        await listener
-    except asyncio.CancelledError:
-        pass
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Uber Clone", lifespan=lifespan)
@@ -57,6 +60,7 @@ app.include_router(auth.router)
 app.include_router(drivers.router)
 app.include_router(admin.router)
 app.include_router(rides.router)
+app.include_router(offers.router)
 app.include_router(places.router)
 app.include_router(websocket.router)
 

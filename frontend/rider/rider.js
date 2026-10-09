@@ -1,4 +1,5 @@
 import { api, clearSession, getSession, saveSession } from "/shared/api.js";
+import { connect, disconnect } from "/shared/ws.js";
 
 const STATUS_TEXT = {
   REQUESTED: "Looking for a driver",
@@ -13,7 +14,6 @@ const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const TRACKING = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS"]; // the driver's position is shown only in these
 const POLL_MS = 3000;
-const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
 const ANIMATION_MS = 3000; // equal to the drivers' ping interval, so one glide ends as the next update arrives
 const SNAP_DISTANCE_M = 500; // a bigger jump (the driver was moved by hand) is shown at once, not flown over the map
 const DRIVER_COLOR = "#1a56db";
@@ -60,7 +60,6 @@ const state = {
   busy: false,
 };
 let refreshing = false;
-let socket = null; // the current WebSocket; handlers of any other socket are ignored
 let driverMarker = null; // Leaflet marker, moved by animateDriver, never by render()
 let animation = null; // {from, to, start} of the glide in progress
 let animationFrame = null; // requestAnimationFrame id while the loop runs
@@ -119,40 +118,31 @@ async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
   saveSession(data.access_token, data.user);
   state.user = data.user;
-  openSocket();
+  if (state.user.role === "rider") {
+    state.socketStatus = "connecting";
+    connect(socketHandlers);
+  }
 }
 
-// Every handler first checks that its socket is still the current one, so an old socket can never change state.
-// No reconnect yet (M3.4): once it closes, tracking stops until the page is reloaded.
-function openSocket() {
-  if (state.user.role !== "rider") return;
-  const ws = new WebSocket(WS_URL);
-  socket = ws;
-  state.socketStatus = "connecting";
-  state.socketCode = null;
-  ws.onopen = () => {
-    if (socket === ws) ws.send(JSON.stringify({ type: "auth", data: { token: getSession().token } }));
-  };
-  ws.onmessage = (event) => {
-    if (socket !== ws) return;
-    const { type, data } = JSON.parse(event.data);
-    if (type === "auth_ok") {
-      state.socketStatus = "open";
-      render();
-    } else if (type === "driver_location") {
+// Events only say "something changed": the page reacts by asking the REST API, which is the source of truth.
+// A missed event is harmless, because the poll below catches up within 3 seconds.
+const socketHandlers = {
+  onEvent: (type, data) => {
+    if (type === "driver_location") {
       const valid = [data.lat, data.lng, data.updated_at].every(Number.isFinite);
       if (state.ride === null || data.ride_id !== state.ride.id || !valid) return;
       applyDriverLocation(data);
       render();
+    } else if (type === "ride_updated" && state.ride !== null && data.ride_id === state.ride.id) {
+      refresh().then(render);
     }
-  };
-  ws.onclose = (event) => {
-    if (socket !== ws) return;
-    state.socketStatus = "closed";
-    state.socketCode = event.code;
+  },
+  onStatus: (status, code) => {
+    state.socketStatus = status;
+    state.socketCode = status === "closed" ? code : null;
     render();
-  };
-}
+  },
+};
 
 // Used by the details fetch and by the socket. Only stores the position and starts a glide;
 // the marker itself is created by render() and moved by animateDriver().
@@ -526,9 +516,7 @@ registerForm.addEventListener("submit", (event) => {
 });
 
 logoutButton.addEventListener("click", () => {
-  const old = socket;
-  socket = null; // its handlers now ignore everything
-  if (old !== null) old.close();
+  disconnect();
   state.driver = null;
   state.driverLocation = null;
   state.driverKey = null;
@@ -603,6 +591,9 @@ setInterval(async () => {
   render();
 }, POLL_MS);
 
-if (state.user !== null) openSocket();
+if (state.user !== null && state.user.role === "rider") {
+  state.socketStatus = "connecting";
+  connect(socketHandlers);
+}
 render();
 refresh().then(render);

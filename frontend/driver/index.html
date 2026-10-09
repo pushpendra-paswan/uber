@@ -19,6 +19,8 @@
     </header>
 
     <p id="message" class="message" role="alert" hidden></p>
+    <p id="notice" class="note" role="status" hidden></p>
+    <p id="live-status" class="note" hidden></p>
 
     <section id="login-section" hidden>
       <h2>Log in</h2>
@@ -74,6 +76,29 @@
         <input id="vehicle-color" name="color" type="text" maxlength="30" required>
         <button type="submit">Save vehicle</button>
       </form>
+    </section>
+
+    <section id="offer-section" class="offer" hidden>
+      <h2>New ride request</h2>
+      <dl>
+        <div>
+          <dt>Pickup</dt>
+          <dd id="offer-pickup"></dd>
+        </div>
+        <div>
+          <dt>Drop-off</dt>
+          <dd id="offer-dropoff"></dd>
+        </div>
+      </dl>
+      <p id="offer-pickup-distance"></p>
+      <p id="offer-trip"></p>
+      <p id="offer-fare"></p>
+      <p id="offer-countdown"></p>
+      <progress id="offer-progress" max="15" value="15"></progress>
+      <div class="offer-buttons">
+        <button id="accept-button" type="button">Accept</button>
+        <button id="reject-button" type="button">Reject</button>
+      </div>
     </section>
 
     <section id="presence-section" hidden>

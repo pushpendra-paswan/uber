@@ -3,9 +3,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Driver, User
-from app.schemas import DriverProfileCreate, DriverResponse, LocationUpdate, PresenceResponse, VehicleCreate
+from app.schemas import DriverProfileCreate, DriverResponse, LocationUpdate, OfferResponse, PresenceResponse, VehicleCreate
 from app.security import require_role
 from app.services import drivers as drivers_service
+from app.services import offers as offers_service
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
 
@@ -51,3 +52,8 @@ async def update_location(
 @router.get("/me/presence", response_model=PresenceResponse)
 async def get_presence(user: User = Depends(require_role("driver")), db: AsyncSession = Depends(get_db)) -> PresenceResponse:
     return await drivers_service.get_presence(db, user)
+
+
+@router.get("/me/offer", response_model=OfferResponse)
+async def get_offer(user: User = Depends(require_role("driver")), db: AsyncSession = Depends(get_db)) -> OfferResponse:
+    return await offers_service.get_pending(db, user)

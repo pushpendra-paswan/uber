@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import redis_client
-from app.models import ACTIVE_RIDE_STATUSES, Driver, Ride, VerificationStatus, Vehicle
+from app.models import ACTIVE_RIDE_STATUSES, Driver, OfferStatus, Ride, RideOffer, VerificationStatus, Vehicle
 
 GEO_KEY = "drivers:geo"
 PRESENCE_KEY = "driver:{}:presence"
@@ -28,6 +28,12 @@ async def get_by_id(db: AsyncSession, driver_id: int) -> Driver | None:
         select(Driver).where(Driver.id == driver_id).options(*LOAD_DRIVER).execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
+
+
+async def get_user_id(db: AsyncSession, driver_id: int) -> int:
+    # The address of a driver's events: sockets are keyed by user id, not driver id.
+    result = await db.execute(select(Driver.user_id).where(Driver.id == driver_id))
+    return result.scalar_one()
 
 
 async def list_all(db: AsyncSession, status: VerificationStatus | None = None) -> list[Driver]:
@@ -116,9 +122,14 @@ async def get_available_ids(db: AsyncSession, driver_ids: list[int]) -> set[int]
     if not driver_ids:
         return set()
     has_active_ride = exists().where(Ride.driver_id == Driver.id, Ride.status.in_(ACTIVE_RIDE_STATUSES))
+    # A driver deciding on an offer is busy.
+    has_pending_offer = exists().where(RideOffer.driver_id == Driver.id, RideOffer.status == OfferStatus.PENDING)
     result = await db.execute(
         select(Driver.id).where(
-            Driver.id.in_(driver_ids), Driver.verification_status == VerificationStatus.approved, ~has_active_ride
+            Driver.id.in_(driver_ids),
+            Driver.verification_status == VerificationStatus.approved,
+            ~has_active_ride,
+            ~has_pending_offer,
         )
     )
     return set(result.scalars().all())

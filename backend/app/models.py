@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Enum, Float, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import CheckConstraint, DateTime, Enum, Float, ForeignKey, Index, Integer, String, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -38,6 +38,14 @@ ACTIVE_RIDE_STATUSES = (
     RideStatus.DRIVER_ARRIVED,
     RideStatus.IN_PROGRESS,
 )
+
+
+class OfferStatus(enum.Enum):
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
 
 
 class PaymentMethod(enum.Enum):
@@ -130,6 +138,29 @@ class RideEvent(Base):
     to_status: Mapped[RideStatus] = mapped_column(Enum(RideStatus, native_enum=False))
     actor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RideOffer(Base):
+    __tablename__ = "ride_offers"
+    __table_args__ = (
+        # A driver is never offered the same ride twice.
+        UniqueConstraint("ride_id", "driver_id", name="uq_ride_offers_ride_id_driver_id"),
+        # A ride has at most one open offer at a time. The condition matches the stored enum value.
+        Index("uq_ride_offers_one_pending_per_ride", "ride_id", unique=True, postgresql_where=text("status = 'PENDING'")),
+        # The sweeper's query: PENDING offers whose deadline has passed.
+        Index("ix_ride_offers_status_expires_at", "status", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ride_id: Mapped[int] = mapped_column(ForeignKey("rides.id"))
+    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id"), index=True)
+    status: Mapped[OfferStatus] = mapped_column(
+        Enum(OfferStatus, native_enum=False), default=OfferStatus.PENDING, server_default="PENDING"
+    )
+    pickup_distance_m: Mapped[int] = mapped_column(Integer)  # straight line, driver to pickup, when the offer was made
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # only ACCEPTED and REJECTED
 
 
 class Payment(Base):

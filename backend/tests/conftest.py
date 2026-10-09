@@ -27,6 +27,7 @@ from app.models import Driver, PricingRule, Ride, RideStatus, User, UserRole, Ve
 from app.routers import websocket as websocket_router  # noqa: E402
 from app.security import create_access_token  # noqa: E402
 from app.services import routing  # noqa: E402
+from test_rides import RIDE_BODY  # noqa: E402
 
 # Tests never touch the dev database: they use a copy of its name with a _test suffix.
 TEST_DB_URL = make_url(settings.postgres_url).set(database=settings.postgres_db + "_test")
@@ -74,6 +75,12 @@ async def clean_redis():
     assert settings.redis_db == TEST_REDIS_DB
     assert (await redis_client.client_info())["db"] == TEST_REDIS_DB, "Refusing to flush a Redis database that is not the test one"
     await redis_client.flushdb()
+
+
+@pytest.fixture(autouse=True)
+def use_test_session(test_engine, monkeypatch):
+    """Code that opens its own session (WebSocket authentication, the offer sweeper) uses the _test database, not dev data."""
+    monkeypatch.setattr(database, "async_session", async_sessionmaker(test_engine, expire_on_commit=False))
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +165,38 @@ async def put_online(client):
 
 
 @pytest_asyncio.fixture
+async def accept_offer(client):
+    """Returns a function that has a driver accept their pending offer through the real API. Returns the ride."""
+
+    async def accept(who: dict) -> dict:
+        offer = await client.get("/drivers/me/offer", headers=who["headers"])
+        assert offer.status_code == 200, offer.text
+        accepted = await client.post(f"/offers/{offer.json()['id']}/accept", headers=who["headers"])
+        assert accepted.status_code == 200, accepted.text
+        return accepted.json()
+
+    return accept
+
+
+@pytest_asyncio.fixture
+async def assign_ride(client, put_online, accept_offer):
+    """Returns a function that makes a DRIVER_ASSIGNED ride: the driver goes online at the pickup, the rider requests,
+    and the driver accepts the offer. Use it with a single driver, or the offer may go to a nearer one."""
+
+    async def assign(rider: dict, driver: dict) -> dict:
+        await put_online(driver, RIDE_BODY["pickup_lat"], RIDE_BODY["pickup_lng"])
+        created = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
+        assert created.status_code == 201, created.text
+        assert created.json()["status"] == "REQUESTED", created.text
+        ride = await accept_offer(driver)
+        assert ride["status"] == "DRIVER_ASSIGNED"
+        assert ride["id"] == created.json()["id"]
+        return ride
+
+    return assign
+
+
+@pytest_asyncio.fixture
 async def insert_ride(db: AsyncSession):
     """Returns a function that inserts a ride straight into the database in the given status, with no matching."""
 
@@ -222,14 +261,13 @@ async def wait_for_subscribers(count: int) -> None:
 
 
 @pytest_asyncio.fixture
-async def live_server(test_engine, monkeypatch):
+async def live_server(test_engine):
     """The real app under uvicorn on a free port in the test's own event loop. Returns its ws:// URL.
+    Its lifespan runs, so the WebSocket listener and the offer sweeper run too.
 
     httpx cannot speak WebSocket, and Starlette's TestClient runs the app in another thread and loop,
     which clashes with asyncpg and the Redis client.
     """
-    # The socket authenticates against the _test database, not dev data.
-    monkeypatch.setattr(database, "async_session", async_sessionmaker(test_engine, expire_on_commit=False))
     assert websocket_router.connections == {}
 
     server = QuietServer(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", ws_max_size=65536))

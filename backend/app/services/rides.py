@@ -1,17 +1,23 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import ACTIVE_RIDE_STATUSES, Ride, RideEvent, RideStatus, User, UserRole
+from app.models import ACTIVE_RIDE_STATUSES, OfferStatus, Ride, RideEvent, RideStatus, User, UserRole
 from app.repositories import drivers as drivers_repo
+from app.repositories import events
+from app.repositories import offers as offers_repo
 from app.repositories import rides as rides_repo
 from app.schemas import DriverLocation, EstimateRequest, RideCreate, RideDriverResponse, VehicleResponse
 from app.services import matching, pricing, routing
 from app.utils.geo import is_inside_bounds
 
 MIN_TRIP_DISTANCE_M = 200
+
+# uvicorn's logger, because it is the one that has a handler and prints INFO.
+logger = logging.getLogger("uvicorn.error")
 
 ALLOWED_TRANSITIONS = {
     RideStatus.REQUESTED: {RideStatus.DRIVER_ASSIGNED, RideStatus.CANCELLED, RideStatus.NO_DRIVER_FOUND},
@@ -65,15 +71,18 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
     ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])
     await rides_repo.add_event(db, ride.id, None, RideStatus.REQUESTED, rider.id)
 
-    # Matching runs in the same transaction, so a Redis or OSRM failure leaves no half-created ride.
-    # The system makes these changes, so the actor is null.
-    driver_id = await matching.find_driver(db, ride.pickup_lat, ride.pickup_lng)
-    if driver_id is None:
+    # The first offer is made in the same transaction, so a Redis or OSRM failure leaves no half-created ride.
+    # The system makes these changes, so the actor is null. The ride stays REQUESTED while offers are being tried.
+    offer = await matching.offer_to_next_driver(db, ride)
+    if offer is None:
         await change_ride_status(db, ride, RideStatus.NO_DRIVER_FOUND, actor_user_id=None)
     else:
-        await change_ride_status(db, ride, RideStatus.DRIVER_ASSIGNED, actor_user_id=None)
-        ride.driver_id = driver_id
+        driver_user_id = await drivers_repo.get_user_id(db, offer.driver_id)
     await db.commit()
+
+    if offer is not None:
+        logger.info("Offer %s created: ride %s to driver %s (%s m away)", offer.id, ride.id, offer.driver_id, offer.pickup_distance_m)
+        await events.publish(driver_user_id, "offer_created", {"offer_id": offer.id, "ride_id": ride.id})
     return ride
 
 
@@ -139,5 +148,16 @@ async def driver_set_status(db: AsyncSession, user: User, ride_id: int, new_stat
 async def cancel(db: AsyncSession, user: User, ride_id: int) -> Ride:
     ride = await load_ride_for_user(db, user, ride_id, for_update=True)
     await change_ride_status(db, ride, RideStatus.CANCELLED, user.id)
+    # The ride is locked, and every offer change locks the ride first, so nobody can answer this offer meanwhile.
+    offer = await offers_repo.get_pending_for_ride(db, ride.id)
+    if offer is not None:
+        await offers_repo.set_status(db, offer, OfferStatus.CANCELLED)
+        driver_user_id = await drivers_repo.get_user_id(db, offer.driver_id)
     await db.commit()
+
+    if offer is not None:
+        logger.info("Offer %s cancelled: ride %s was cancelled", offer.id, ride.id)
+        await events.publish(
+            driver_user_id, "offer_closed", {"offer_id": offer.id, "ride_id": ride.id, "reason": "ride_cancelled"}
+        )
     return ride

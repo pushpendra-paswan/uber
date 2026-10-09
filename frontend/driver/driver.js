@@ -1,4 +1,5 @@
 import { api, clearSession, getSession, saveSession } from "/shared/api.js";
+import { connect, disconnect } from "/shared/ws.js";
 
 const STATUS_TEXT = {
   REQUESTED: "Waiting for a driver to be assigned",
@@ -16,6 +17,10 @@ const VERIFICATION_TEXT = {
 };
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const POLL_MS = 3000;
+const COUNTDOWN_MS = 250;
+// Shown when an offer closes without the driver answering it. Accepted and rejected need no message.
+const CLOSED_NOTICE = { expired: "The offer expired.", ride_cancelled: "The rider cancelled the request." };
+const LIVE_TEXT = { connecting: "Live updates: connecting", open: "Live updates: connected" };
 const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 const MAX_ZOOM = 19;
@@ -26,6 +31,7 @@ const RIDE_KINDS = ["pickup", "dropoff"];
 const RIDE_MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
 const RIDE_MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
 const FIT_PADDING = [40, 40];
+const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
 const session = getSession();
 const state = {
@@ -38,16 +44,26 @@ const state = {
   map: null,
   marker: null,
   rideMarkers: { pickup: null, dropoff: null },
-  fittedRideId: null, // the map is fitted to a ride once, never on every poll
+  fittedKey: null, // "ride:7" or "offer:12": the map is fitted to each once, never on every poll
   ride: null,
   rideId: null, // remembered so a finished ride can still be shown after /rides/active returns 404
   events: [],
+  offer: null, // from GET /drivers/me/offer
+  deadline: 0, // performance.now() value at which the offer ends, worked out once when the offer is first seen
+  offerTotal: 0, // whole seconds the offer had when first seen, the maximum of the progress bar
+  secondsLeft: 0,
+  notice: "", // why an offer went away, cleared by the next action or the next offer
+  socketStatus: "connecting", // "connecting", "open", "closed"
+  socketCode: null, // close code once closed
   error: "",
   busy: false,
 };
 let refreshing = false;
+let countdownTimer = null; // setInterval id while an offer is showing
 
 const message = document.getElementById("message");
+const noticeText = document.getElementById("notice");
+const liveStatus = document.getElementById("live-status");
 const userBar = document.getElementById("user-bar");
 const userName = document.getElementById("user-name");
 const logoutButton = document.getElementById("logout-button");
@@ -68,6 +84,16 @@ const presenceStatus = document.getElementById("presence-status");
 const onlineButton = document.getElementById("online-button");
 const offlineButton = document.getElementById("offline-button");
 const offlineNote = document.getElementById("offline-note");
+const offerSection = document.getElementById("offer-section");
+const offerPickup = document.getElementById("offer-pickup");
+const offerDropoff = document.getElementById("offer-dropoff");
+const offerPickupDistance = document.getElementById("offer-pickup-distance");
+const offerTrip = document.getElementById("offer-trip");
+const offerFare = document.getElementById("offer-fare");
+const offerCountdown = document.getElementById("offer-countdown");
+const offerProgress = document.getElementById("offer-progress");
+const acceptButton = document.getElementById("accept-button");
+const rejectButton = document.getElementById("reject-button");
 const noRideSection = document.getElementById("no-ride-section");
 const rideSection = document.getElementById("ride-section");
 const rideId = document.getElementById("ride-id");
@@ -86,7 +112,30 @@ async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
   saveSession(data.access_token, data.user);
   state.user = data.user;
+  if (state.user.role === "driver") {
+    state.socketStatus = "connecting";
+    connect(socketHandlers);
+  }
 }
+
+// Events only say "something changed": the page reacts by asking the REST API, which is the source of truth.
+// A missed event is harmless, because the poll below catches up within 3 seconds.
+const socketHandlers = {
+  onEvent: (type, data) => {
+    if (type === "offer_closed") {
+      // An event about an older offer must not put its message on top of a newer one.
+      if (state.offer === null || state.offer.id === data.offer_id) state.notice = CLOSED_NOTICE[data.reason] || "";
+      refresh().then(render);
+    } else if (type === "offer_created") {
+      refresh().then(render);
+    }
+  },
+  onStatus: (status, code) => {
+    state.socketStatus = status;
+    state.socketCode = status === "closed" ? code : null;
+    render();
+  },
+};
 
 // GET that returns null on 404 (no profile yet, no active ride) and throws on anything else.
 async function getOrNull(path) {
@@ -122,17 +171,52 @@ async function refresh() {
         state.ride = await api("GET", `/rides/${state.rideId}`);
       }
       state.events = state.ride ? await api("GET", `/rides/${state.ride.id}/events`) : [];
+
+      // The safety net behind the socket: an offer is also found by polling. A driver on a ride has none.
+      const offer = active ? null : await getOrNull("/drivers/me/offer");
+      if (offer === null) {
+        state.offer = null;
+      } else if (state.offer === null || state.offer.id !== offer.id) {
+        // The deadline is set once, from the first sighting, so later polls of the same offer cannot restart the clock.
+        state.offer = offer;
+        state.deadline = performance.now() + offer.expires_in * 1000;
+        state.offerTotal = Math.ceil(offer.expires_in);
+        state.secondsLeft = state.offerTotal;
+        state.notice = "";
+      }
     } else {
       state.presence = null;
+      state.offer = null;
     }
     state.loaded = true;
   } catch (err) {
     state.error = err.message;
   }
+
+  if (state.offer !== null && countdownTimer === null) countdownTimer = setInterval(tickCountdown, COUNTDOWN_MS);
+  if (state.offer === null && countdownTimer !== null) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+}
+
+// Works from the clock, not from counting ticks, so a background tab shows the right value when you return.
+function tickCountdown() {
+  if (state.offer === null) return;
+  state.secondsLeft = Math.max(0, Math.ceil((state.deadline - performance.now()) / 1000));
+  if (state.secondsLeft === 0) {
+    state.offer = null;
+    state.notice = "The offer expired.";
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+    refresh().then(render);
+  }
+  render();
 }
 
 async function act(fn) {
   state.error = "";
+  state.notice = "";
   state.busy = true;
   render();
   try {
@@ -156,9 +240,18 @@ function render() {
   const showMap = approved && state.config !== null;
   const online = state.presence !== null && state.presence.online;
   const hasActiveRide = state.ride !== null && !FINISHED.includes(state.ride.status);
+  const showOffer = approved && state.offer !== null && !hasActiveRide;
 
   message.hidden = state.error === "";
   message.textContent = state.error;
+  noticeText.hidden = state.notice === "";
+  noticeText.textContent = state.notice;
+  liveStatus.hidden = !isDriver;
+  if (state.socketStatus === "closed") {
+    liveStatus.textContent = `Live updates: disconnected (code ${state.socketCode}). Offers still arrive within a few seconds by polling.`;
+  } else {
+    liveStatus.textContent = LIVE_TEXT[state.socketStatus];
+  }
 
   loginSection.hidden = loggedIn;
   userBar.hidden = !loggedIn;
@@ -174,8 +267,9 @@ function render() {
   profileSection.hidden = !isDriver || !state.loaded || hasProfile;
   vehicleSection.hidden = !hasProfile || hasVehicle;
   presenceSection.hidden = !showMap;
-  noRideSection.hidden = !approved || showRide;
+  noRideSection.hidden = !approved || showRide || showOffer;
   rideSection.hidden = !showRide;
+  offerSection.hidden = !showOffer;
 
   if (showMap) {
     const c = state.config;
@@ -224,11 +318,13 @@ function render() {
       state.marker.setLatLng([state.position.lat, state.position.lng]);
     }
 
-    // Pickup and drop-off of the active ride. Not interactive, so a click on them still moves the driver.
-    const wanted = hasActiveRide
+    // Pickup and drop-off of the active ride, or of the offer being considered (the field names are the same).
+    // Not interactive, so a click on them still moves the driver.
+    const shown = hasActiveRide ? state.ride : state.offer;
+    const wanted = shown
       ? {
-          pickup: { lat: state.ride.pickup_lat, lng: state.ride.pickup_lng },
-          dropoff: { lat: state.ride.dropoff_lat, lng: state.ride.dropoff_lng },
+          pickup: { lat: shown.pickup_lat, lng: shown.pickup_lng },
+          dropoff: { lat: shown.dropoff_lat, lng: shown.dropoff_lng },
         }
       : { pickup: null, dropoff: null };
     for (const kind of RIDE_KINDS) {
@@ -252,11 +348,12 @@ function render() {
         rideMarker.setLatLng([point.lat, point.lng]);
       }
     }
-    if (hasActiveRide && state.fittedRideId !== state.ride.id) {
-      const points = [[state.ride.pickup_lat, state.ride.pickup_lng], [state.ride.dropoff_lat, state.ride.dropoff_lng]];
+    const fitKey = shown ? `${hasActiveRide ? "ride" : "offer"}:${shown.id}` : null;
+    if (fitKey !== null && state.fittedKey !== fitKey) {
+      const points = [[shown.pickup_lat, shown.pickup_lng], [shown.dropoff_lat, shown.dropoff_lng]];
       if (state.position !== null) points.push([state.position.lat, state.position.lng]);
       state.map.fitBounds(points, { padding: FIT_PADDING, animate: false });
-      state.fittedRideId = state.ride.id;
+      state.fittedKey = fitKey;
     }
 
     presenceStatus.textContent = online
@@ -265,6 +362,21 @@ function render() {
     onlineButton.hidden = online;
     offlineButton.hidden = !online;
     offlineNote.hidden = !online || !hasActiveRide;
+  }
+
+  if (showOffer) {
+    const offer = state.offer;
+    offerPickup.textContent = offer.pickup_address;
+    offerDropoff.textContent = offer.dropoff_address;
+    offerPickupDistance.textContent = `Pickup is ${(offer.pickup_distance_m / 1000).toFixed(1)} km from you`;
+    offerTrip.textContent =
+      offer.trip_distance_m === null
+        ? "Trip: -"
+        : `Trip: ${(offer.trip_distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(offer.trip_duration_s / 60))} min`;
+    offerFare.textContent = offer.fare_estimate === null ? "Fare: -" : `Fare: ${money.format(offer.fare_estimate / 100)}`;
+    offerCountdown.textContent = `Respond within ${state.secondsLeft} second${state.secondsLeft === 1 ? "" : "s"}`;
+    offerProgress.max = state.offerTotal;
+    offerProgress.value = state.secondsLeft;
   }
 
   if (showRide) {
@@ -320,6 +432,8 @@ registerForm.addEventListener("submit", (event) => {
 });
 
 logoutButton.addEventListener("click", () => {
+  disconnect();
+  clearInterval(countdownTimer);
   clearSession();
   location.reload();
 });
@@ -354,6 +468,9 @@ offlineButton.addEventListener("click", () => {
   });
 });
 
+acceptButton.addEventListener("click", () => act(() => api("POST", `/offers/${state.offer.id}/accept`)));
+rejectButton.addEventListener("click", () => act(() => api("POST", `/offers/${state.offer.id}/reject`)));
+
 arriveButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/arrive`)));
 startButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/start`)));
 completeButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/complete`)));
@@ -370,7 +487,7 @@ doneButton.addEventListener("click", () => {
   });
 });
 
-// Polling keeps the page current for now; WebSockets replace this in M3.
+// The poll stays even when the socket works: it is the safety net for events that were missed.
 setInterval(async () => {
   if (refreshing || state.busy) return;
   refreshing = true;
@@ -379,5 +496,6 @@ setInterval(async () => {
   render();
 }, POLL_MS);
 
+if (state.user !== null && state.user.role === "driver") connect(socketHandlers);
 render();
 refresh().then(render);

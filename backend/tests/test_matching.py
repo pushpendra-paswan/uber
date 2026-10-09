@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.database import redis_client
-from app.models import Ride, RideEvent, RideStatus, VerificationStatus
+from app.models import Ride, RideEvent, RideOffer, RideStatus, VerificationStatus
 from app.repositories import drivers as drivers_repo
 from app.services import matching
 from test_rides import RIDE_BODY
@@ -43,12 +43,22 @@ async def request_ride(client):
     return create
 
 
+async def offers_of(db, ride_id: int) -> list[tuple]:
+    """(driver id, status) of every offer of the ride, oldest first. Columns only, so the session's identity map cannot hide a change."""
+    result = await db.execute(
+        select(RideOffer.driver_id, RideOffer.status).where(RideOffer.ride_id == ride_id).order_by(RideOffer.id)
+    )
+    return [(driver_id, status.value) for driver_id, status in result.all()]
+
+
 async def events_of(client, who: dict, ride_id: int) -> list[tuple]:
     response = await client.get(f"/rides/{ride_id}/events", headers=who["headers"])
     return [(event["from_status"], event["to_status"], event["actor_user_id"]) for event in response.json()]
 
 
-async def test_the_nearest_driver_is_assigned(client, rider, online_at, request_ride):
+async def test_the_nearest_driver_gets_the_offer_and_accepting_assigns_the_ride(
+    client, db, rider, online_at, request_ride, accept_offer
+):
     # Created far to near, so the nearest is neither the first nor the lowest id.
     far = await online_at(2500)
     middle = await online_at(1200)
@@ -56,12 +66,23 @@ async def test_the_nearest_driver_is_assigned(client, rider, online_at, request_
 
     ride = await request_ride(rider)
 
-    assert ride["status"] == "DRIVER_ASSIGNED"
-    assert ride["driver_id"] == nearest["driver"].id
-    assert ride["driver_id"] != nearest["user"].id  # drivers.id, not users.id
+    # Matching only offers: the ride stays REQUESTED and has no driver until the driver accepts.
+    assert ride["status"] == "REQUESTED"
+    assert ride["driver_id"] is None
+    assert await offers_of(db, ride["id"]) == [(nearest["driver"].id, "PENDING")]
+    assert await events_of(client, rider, ride["id"]) == [(None, "REQUESTED", rider["user"].id)]
+    assert (await client.get("/drivers/me/offer", headers=nearest["headers"])).status_code == 200
+    for other in (middle, far):
+        assert (await client.get("/drivers/me/offer", headers=other["headers"])).status_code == 404
+
+    accepted = await accept_offer(nearest)
+
+    assert accepted["status"] == "DRIVER_ASSIGNED"
+    assert accepted["driver_id"] == nearest["driver"].id
+    assert accepted["driver_id"] != nearest["user"].id  # drivers.id, not users.id
     assert await events_of(client, rider, ride["id"]) == [
         (None, "REQUESTED", rider["user"].id),
-        ("REQUESTED", "DRIVER_ASSIGNED", None),
+        ("REQUESTED", "DRIVER_ASSIGNED", nearest["user"].id),
     ]
     active = await client.get("/rides/active", headers=nearest["headers"])
     assert active.status_code == 200
@@ -88,13 +109,13 @@ async def test_a_driver_outside_the_radius_is_not_matched(client, rider, online_
     assert again.json()["status"] == "NO_DRIVER_FOUND"
 
 
-async def test_a_driver_just_inside_the_radius_is_matched(rider, online_at, request_ride):
+async def test_a_driver_just_inside_the_radius_is_offered_the_ride(db, rider, online_at, request_ride):
     inside = await online_at(2800)
 
     ride = await request_ride(rider)
 
-    assert ride["status"] == "DRIVER_ASSIGNED"
-    assert ride["driver_id"] == inside["driver"].id
+    assert ride["status"] == "REQUESTED"
+    assert await offers_of(db, ride["id"]) == [(inside["driver"].id, "PENDING")]
 
 
 async def test_nobody_online_means_no_driver_found(rider, request_ride):
@@ -103,32 +124,33 @@ async def test_nobody_online_means_no_driver_found(rider, request_ride):
     assert ride["status"] == "NO_DRIVER_FOUND"
 
 
-async def test_a_stale_geo_member_is_skipped_and_removed(rider, online_at, request_ride):
+async def test_a_stale_geo_member_is_skipped_and_removed(db, rider, online_at, request_ride):
     stale = await online_at(500)
     live = await online_at(1500)
     await redis_client.delete(f"driver:{stale['driver'].id}:presence")  # what the 30 s TTL does
 
     ride = await request_ride(rider)
 
-    assert ride["driver_id"] == live["driver"].id
+    assert await offers_of(db, ride["id"]) == [(live["driver"].id, "PENDING")]
     assert await redis_client.zscore(GEO_KEY, str(stale["driver"].id)) is None
     assert await redis_client.zscore(GEO_KEY, str(live["driver"].id)) is not None
 
 
-async def test_a_driver_with_an_active_ride_is_skipped(make_user, online_at, request_ride):
+async def test_a_driver_with_an_active_ride_is_skipped(db, make_user, online_at, request_ride, accept_offer):
     near = await online_at(500)
     far = await online_at(1500)
     first_rider = await make_user("rider")
     second_rider = await make_user("rider")
 
     first = await request_ride(first_rider)
+    assert (await accept_offer(near))["driver_id"] == near["driver"].id
     second = await request_ride(second_rider)
 
-    assert first["driver_id"] == near["driver"].id
-    assert second["driver_id"] == far["driver"].id
+    assert await offers_of(db, first["id"]) == [(near["driver"].id, "ACCEPTED")]
+    assert await offers_of(db, second["id"]) == [(far["driver"].id, "PENDING")]
 
 
-async def test_one_driver_cannot_take_two_rides_in_a_row(make_user, online_at, request_ride):
+async def test_a_driver_holding_an_offer_is_not_offered_a_second_ride(db, make_user, online_at, request_ride, accept_offer):
     only = await online_at(500)
     first_rider = await make_user("rider")
     second_rider = await make_user("rider")
@@ -136,8 +158,15 @@ async def test_one_driver_cannot_take_two_rides_in_a_row(make_user, online_at, r
     first = await request_ride(first_rider)
     second = await request_ride(second_rider)
 
-    assert first["driver_id"] == only["driver"].id
+    # The driver is still deciding on the first ride, so the second finds nobody.
+    assert first["status"] == "REQUESTED"
     assert second["status"] == "NO_DRIVER_FOUND"
+    assert await offers_of(db, second["id"]) == []
+
+    # And with the first ride accepted the driver is busy for the same reason.
+    await accept_offer(only)
+    third = await request_ride(await make_user("rider"))
+    assert third["status"] == "NO_DRIVER_FOUND"
 
 
 async def test_a_driver_who_is_not_approved_is_never_matched(db, rider, online_at, request_ride):
@@ -151,10 +180,11 @@ async def test_a_driver_who_is_not_approved_is_never_matched(db, rider, online_a
 
     driver["driver"].verification_status = VerificationStatus.approved
     await db.commit()
-    assert (await request_ride(rider))["driver_id"] == driver["driver"].id
+    ride = await request_ride(rider)
+    assert await offers_of(db, ride["id"]) == [(driver["driver"].id, "PENDING")]
 
 
-async def test_equal_distance_goes_to_the_lower_driver_id(make_user, put_online, rider, request_ride):
+async def test_equal_distance_goes_to_the_lower_driver_id(db, make_user, put_online, rider, request_ride):
     drivers = [await make_user("driver") for _ in range(10)]
     assert (drivers[8]["driver"].id, drivers[9]["driver"].id) == (9, 10)
     # Put 10 online first. As strings "10" sorts before "9", so only the tie-break can pick 9.
@@ -163,34 +193,40 @@ async def test_equal_distance_goes_to_the_lower_driver_id(make_user, put_online,
 
     ride = await request_ride(rider)
 
-    assert ride["driver_id"] == 9
+    assert await offers_of(db, ride["id"]) == [(9, "PENDING")]
 
 
-async def test_a_driver_is_available_again_after_a_completed_ride(client, make_user, online_at, request_ride):
+async def test_a_driver_is_available_again_after_a_completed_ride(
+    client, db, make_user, online_at, request_ride, accept_offer
+):
     driver = await online_at(500)
     first_rider = await make_user("rider")
     second_rider = await make_user("rider")
     first = await request_ride(first_rider)
+    await accept_offer(driver)
     for step in ("arrive", "start", "complete"):
         assert (await client.post(f"/rides/{first['id']}/{step}", headers=driver["headers"])).status_code == 200
 
     second = await request_ride(second_rider)
 
-    assert second["status"] == "DRIVER_ASSIGNED"
-    assert second["driver_id"] == driver["driver"].id
+    assert second["status"] == "REQUESTED"
+    assert await offers_of(db, second["id"]) == [(driver["driver"].id, "PENDING")]
 
 
-async def test_a_driver_is_available_again_after_the_rider_cancels(client, make_user, online_at, request_ride):
+async def test_a_driver_is_available_again_after_the_rider_cancels(
+    client, db, make_user, online_at, request_ride, accept_offer
+):
     driver = await online_at(500)
     first_rider = await make_user("rider")
     second_rider = await make_user("rider")
     first = await request_ride(first_rider)
+    await accept_offer(driver)
     assert (await client.post(f"/rides/{first['id']}/cancel", headers=first_rider["headers"])).status_code == 200
 
     second = await request_ride(second_rider)
 
-    assert second["status"] == "DRIVER_ASSIGNED"
-    assert second["driver_id"] == driver["driver"].id
+    assert second["status"] == "REQUESTED"
+    assert await offers_of(db, second["id"]) == [(driver["driver"].id, "PENDING")]
 
 
 async def test_a_redis_failure_leaves_no_ride_behind(client, db, rider, online_at, monkeypatch):
@@ -206,6 +242,7 @@ async def test_a_redis_failure_leaves_no_ride_behind(client, db, rider, online_a
     assert response.status_code == 503
     assert await db.scalar(select(func.count()).select_from(Ride)) == 0
     assert await db.scalar(select(func.count()).select_from(RideEvent)) == 0
+    assert await db.scalar(select(func.count()).select_from(RideOffer)) == 0
 
 
 async def test_a_rider_with_an_active_ride_gets_409_and_matching_is_not_called(
@@ -216,7 +253,7 @@ async def test_a_rider_with_an_active_ride_gets_409_and_matching_is_not_called(
     async def must_not_run(*args):
         pytest.fail("matching ran for a rider who already has an active ride")
 
-    monkeypatch.setattr(matching, "find_driver", must_not_run)
+    monkeypatch.setattr(matching, "offer_to_next_driver", must_not_run)
 
     response = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
 

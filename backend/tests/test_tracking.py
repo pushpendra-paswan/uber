@@ -50,13 +50,10 @@ async def spy():
 
 
 @pytest_asyncio.fixture
-async def assigned(client, rider, driver, put_online):
-    """A rider and a driver with a DRIVER_ASSIGNED ride, made by matching."""
-    await put_online(driver, LAT, LNG)
-    response = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
-    assert response.status_code == 201
-    assert response.json()["status"] == "DRIVER_ASSIGNED"
-    return {"rider": rider, "driver": driver, "ride_id": response.json()["id"]}
+async def assigned(rider, driver, assign_ride):
+    """A rider and a driver with a DRIVER_ASSIGNED ride, made by an offer that the driver accepted."""
+    ride = await assign_ride(rider, driver)
+    return {"rider": rider, "driver": driver, "ride_id": ride["id"]}
 
 
 async def ping(client, who: dict, lat: float = LAT, lng: float = LNG) -> dict:

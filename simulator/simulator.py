@@ -1,7 +1,8 @@
 """Fake driver fleet (M2.5). Runs on the host and uses only the public API and the local OSRM.
 
 Each driver registers (if needed), gets approved by the admin, goes online, wanders on real roads,
-pings its position every 3 seconds, and drives any ride that matching gives it from start to finish.
+pings its position every 3 seconds, and answers ride offers (M3.3): it accepts, rejects, or ignores each one
+by the chosen rates, after a random delay. A ride it accepts is driven from start to finish.
 
 Usage: python simulator/simulator.py --drivers 50 --admin-email ... --admin-password ...
 """
@@ -32,6 +33,7 @@ OSRM_TIMEOUT_S = 5
 DRIVER_PASSWORD = "sim-driver-pass"
 EMAIL_DOMAIN = "sim.example.com"
 METERS_PER_DEGREE = 111_320
+OFFER_SAFETY_MARGIN_S = 2  # an answer is planned at least this long before the offer's deadline
 RIDE_ACTION_LOGS = {"arrive": "arrived at pickup", "start": "trip started", "complete": "trip completed"}
 
 # Shared by all driver tasks (one thread, so plain counters are safe).
@@ -41,6 +43,10 @@ stats = {
     "pings_answered": 0,  # pings that got an HTTP answer; only these have a time
     "ping_ms": 0.0,
     "completed": 0,
+    "offers_seen": 0,
+    "offers_accepted": 0,
+    "offers_rejected": 0,
+    "offers_ignored": 0,
     "setup_finished": 0,
     "running": set(),
     "riding": set(),
@@ -181,6 +187,8 @@ async def run_driver(n, args, world, sem, admin_token, api_client, osrm_client, 
     target = None
     waited = 0
     finished_ride = None
+    decision = None  # {"offer_id", "action", "due"} for the offer being considered
+    decided_offer = None  # id of the newest offer seen, so an offer is decided on only once
     problems = {}
     rejected = False
     last_tick = loop.time()
@@ -244,6 +252,49 @@ async def run_driver(n, args, world, sem, admin_token, api_client, osrm_client, 
                     stats["riding"].discard(n)
                 else:
                     stats["riding"].add(n)
+
+        # (1b) Offers, only while there is no ride: a driver on a ride is never offered another.
+        if known and ride is None:
+            try:
+                r = await api(api_client, "GET", "/drivers/me/offer", token)
+                if r.status_code == 200:
+                    offer = r.json()
+                    if offer["id"] != decided_offer:
+                        decided_offer = offer["id"]
+                        roll = rng.random()
+                        if roll < args.accept_rate:
+                            action = "accept"
+                        elif roll < args.accept_rate + args.reject_rate:
+                            action = "reject"
+                        else:
+                            action = "ignore"
+                        delay = rng.uniform(args.response_delay_min, args.response_delay_max)
+                        delay = max(0.0, min(delay, offer["expires_in"] - OFFER_SAFETY_MARGIN_S))
+                        decision = {"offer_id": offer["id"], "action": action, "due": loop.time() + delay}
+                        stats["offers_seen"] += 1
+                        if action == "ignore":
+                            stats["offers_ignored"] += 1
+                        log.info("offer %s (ride %s): will %s after %.1f s", offer["id"], offer["ride_id"], action, delay)
+                elif r.status_code == 404:
+                    decision = None  # no offer any more
+                else:
+                    tick_problems["offer"] = f"GET /drivers/me/offer answered {r.status_code}"
+            except httpx.HTTPError as error:
+                tick_problems["offer"] = f"GET /drivers/me/offer failed ({type(error).__name__})"
+
+            if decision is not None and decision["action"] != "ignore" and loop.time() >= decision["due"]:
+                action, offer_id = decision["action"], decision["offer_id"]
+                try:
+                    r = await api(api_client, "POST", f"/offers/{offer_id}/{action}", token)
+                    if r.status_code in (200, 204):
+                        stats["offers_accepted" if action == "accept" else "offers_rejected"] += 1
+                    elif r.status_code not in (404, 409):  # those two mean the offer is gone: nothing more to say
+                        tick_problems["offer"] = f"{action} answered {r.status_code}"
+                    decision = None
+                except httpx.HTTPError as error:
+                    tick_problems["offer"] = f"{action} failed ({type(error).__name__})"
+        else:
+            decision = None
 
         # (2) Advance along the plan. A leg that has no route yet gets one first.
         if plan[0] in ("wander", "pickup", "dropoff") and path is None:
@@ -390,6 +441,10 @@ async def main() -> None:
     parser.add_argument("--radius-km", type=float, default=5)
     parser.add_argument("--speed-kmh", type=float, default=30)
     parser.add_argument("--seed", type=int, help="makes a run repeatable")
+    parser.add_argument("--accept-rate", type=float, default=0.7, help="share of offers a driver accepts")
+    parser.add_argument("--reject-rate", type=float, default=0.15, help="share of offers a driver rejects; the rest are ignored and expire")
+    parser.add_argument("--response-delay-min", type=float, default=1, help="seconds before a driver answers an offer, at least")
+    parser.add_argument("--response-delay-max", type=float, default=6, help="seconds before a driver answers an offer, at most")
     args = parser.parse_args()
 
     if not 1 <= args.drivers <= MAX_DRIVERS:
@@ -401,6 +456,12 @@ async def main() -> None:
         sys.exit("--center-lat and --center-lng must be given together")
     if args.radius_km <= 0 or args.speed_kmh <= 0:
         sys.exit("--radius-km and --speed-kmh must be positive")
+    if args.accept_rate < 0 or args.reject_rate < 0:
+        sys.exit("--accept-rate and --reject-rate must not be negative")
+    if args.accept_rate + args.reject_rate > 1 + 1e-9:
+        sys.exit(f"--accept-rate + --reject-rate must be at most 1 (got {args.accept_rate + args.reject_rate:g}); the rest ignore the offer")
+    if args.response_delay_min < 0 or args.response_delay_min > args.response_delay_max:
+        sys.exit("--response-delay-min must be between 0 and --response-delay-max")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", datefmt="%H:%M:%S")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # it logs every request at INFO
@@ -437,9 +498,12 @@ async def main() -> None:
             sys.exit(f"The center {center_lat},{center_lng} is more than {SNAP_RADIUS_M} m from a road. Choose another center.")
 
         log.info(
-            "settings: drivers=%d api=%s osrm=%s city=%s center=%.5f,%.5f radius=%.1f km speed=%.0f km/h seed=%s",
+            "settings: drivers=%d api=%s osrm=%s city=%s center=%.5f,%.5f radius=%.1f km speed=%.0f km/h seed=%s "
+            "accept=%.2f reject=%.2f ignore=%.2f delay=%g-%g s",
             args.drivers, args.api_url, args.osrm_url, city["city_name"], center_lat, center_lng,
             args.radius_km, args.speed_kmh, args.seed,
+            args.accept_rate, args.reject_rate, max(0.0, 1 - args.accept_rate - args.reject_rate),
+            args.response_delay_min, args.response_delay_max,
         )
 
         stop = asyncio.Event()
@@ -462,10 +526,12 @@ async def main() -> None:
                 except asyncio.TimeoutError:
                     answered = stats["pings_answered"] - last["answered"]
                     log.info(
-                        "summary: running %d/%d, on a ride %d, pings ok %d failed %d, avg ping %.0f ms, rides completed %d",
+                        "summary: running %d/%d, on a ride %d, pings ok %d failed %d, avg ping %.0f ms, rides completed %d, "
+                        "offers seen %d (accepted %d, rejected %d, ignored %d)",
                         len(stats["running"]), args.drivers, len(stats["riding"]),
                         stats["pings_ok"] - last["ok"], stats["pings_failed"] - last["failed"],
                         (stats["ping_ms"] - last["ms"]) / answered if answered else 0, stats["completed"],
+                        stats["offers_seen"], stats["offers_accepted"], stats["offers_rejected"], stats["offers_ignored"],
                     )
                     last = {"ok": stats["pings_ok"], "failed": stats["pings_failed"],
                             "answered": stats["pings_answered"], "ms": stats["ping_ms"]}
@@ -481,9 +547,11 @@ async def main() -> None:
             if task.exception() is not None:
                 log.error("a driver task crashed: %r", task.exception())
         log.info(
-            "final: ran %.0f s, pings ok %d failed %d, avg ping %.0f ms, rides completed %d",
+            "final: ran %.0f s, pings ok %d failed %d, avg ping %.0f ms, rides completed %d, "
+            "offers seen %d (accepted %d, rejected %d, ignored %d)",
             time.monotonic() - world["started"], stats["pings_ok"], stats["pings_failed"],
             stats["ping_ms"] / stats["pings_answered"] if stats["pings_answered"] else 0, stats["completed"],
+            stats["offers_seen"], stats["offers_accepted"], stats["offers_rejected"], stats["offers_ignored"],
         )
 
 

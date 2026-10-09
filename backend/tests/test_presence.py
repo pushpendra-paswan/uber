@@ -19,15 +19,6 @@ INSIDE = {"lat": settings.city_center_lat, "lng": settings.city_center_lng}
 OTHER_INSIDE = {"lat": (settings.city_center_lat + settings.city_south) / 2, "lng": (settings.city_center_lng + settings.city_east) / 2}
 OUTSIDE = {"lat": settings.city_south - 1, "lng": settings.city_center_lng}
 
-RIDE_BODY = {
-    "pickup_lat": INSIDE["lat"],
-    "pickup_lng": INSIDE["lng"],
-    "pickup_address": "MG Road",
-    "dropoff_lat": OTHER_INSIDE["lat"],
-    "dropoff_lng": OTHER_INSIDE["lng"],
-    "dropoff_address": "Koramangala",
-}
-
 PRESENCE_ROUTES = [
     ("POST", "/drivers/me/online", INSIDE),
     ("POST", "/drivers/me/offline", None),
@@ -176,12 +167,9 @@ async def test_go_offline_removes_both_keys_and_works_twice(client, driver):
     assert (await client.get("/drivers/me/presence", headers=driver["headers"])).json()["online"] is False
 
 
-async def test_going_offline_is_blocked_by_an_active_ride(client, rider, driver):
-    await client.post("/drivers/me/online", json=INSIDE, headers=driver["headers"])
-    # The ride comes from matching: the driver is the only one online and sits at the pickup.
-    ride = (await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])).json()
-    assert ride["status"] == "DRIVER_ASSIGNED"
-    ride_id = ride["id"]
+async def test_going_offline_is_blocked_by_an_active_ride(client, rider, driver, assign_ride):
+    # The ride comes from an accepted offer: the driver is the only one online and sits at the pickup.
+    ride_id = (await assign_ride(rider, driver))["id"]
 
     blocked = await client.post("/drivers/me/offline", headers=driver["headers"])
 

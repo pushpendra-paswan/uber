@@ -60,19 +60,19 @@ docker compose exec backend python create_admin.py --email admin@example.com --n
 
 Open `/admin/`, `/driver/`, and `/rider/` in three tabs of one browser (each tab keeps its own login). Register a driver, add a profile and vehicle, and approve it in the admin tab. Register a rider, pick pickup and drop-off by searching (press Enter) or clicking the map, and request a ride. Once both points are set, the page shows the route and the estimated fare (base fare Rs 50, Rs 12 per km, Rs 2 per minute, Rs 80 minimum; the server works the fare out again when you request). The request is matched at once (see below). The driver tab then moves the ride through arrived, started, and completed.
 
-### Try matching by hand (M2.4)
+### Try matching by hand (M2.4, offers since M3.3)
 
-Matching happens inside the ride request: the server assigns the nearest online, approved driver without an active ride within 3 km of the pickup (straight-line distance), or the ride ends as `NO_DRIVER_FOUND`. The driver has no say yet.
+Matching happens inside the ride request: the server picks the nearest online, approved driver without an active ride or a pending offer within 3 km of the pickup (straight-line distance) and offers them the ride (see "Offer flow" below), or the ride ends as `NO_DRIVER_FOUND` at once when nobody qualifies.
 
 1. In the admin tab, approve two drivers.
 2. In two driver tabs (one account each), click the map at different distances from where the rider will pick up (for example 1 km and 2 km away) and press **Go online**.
-3. In a rider tab, choose a pickup and drop-off and press **Request ride**. The ride shows "A driver has been assigned" with the nearer driver's id, and that driver's tab shows the ride within 3 seconds.
-4. A second rider at the same pickup gets the other driver. A third rider sees "No drivers are available nearby right now" and can request again at once.
-5. When a driver completes or a rider cancels, that driver can be matched again. A driver who stops pinging (closed tab) is not matched after 30 seconds.
+3. In a rider tab, choose a pickup and drop-off and press **Request ride**. The rider sees "Looking for a driver", and the nearer driver's tab shows the offer panel within about a second. When that driver accepts, the rider page shows "A driver has been assigned".
+4. A second rider at the same pickup is not offered the nearer driver while the first offer is open (a driver deciding on an offer is busy), so the farther driver gets that one. A third rider sees "No drivers are available nearby right now" and can request again at once.
+5. When a driver completes or a rider cancels, that driver can be offered rides again. A driver who stops pinging (closed tab) is not offered rides after 30 seconds.
 
 ### Run the driver simulator (M2.5)
 
-The simulator starts N fake drivers so there is a fleet to match against. Each one registers (once), gets approved by an admin, goes online, drives around on real roads from the local OSRM, and pings its position every 3 seconds. When matching assigns a ride to a fake driver, it drives to the pickup, arrives, starts the trip, drives to the drop-off, and completes it. It runs on your machine (not in Docker), uses only the public API and the local OSRM, and never calls Nominatim or any OpenStreetMap server.
+The simulator starts N fake drivers so there is a fleet to match against. Each one registers (once), gets approved by an admin, goes online, drives around on real roads from the local OSRM, and pings its position every 3 seconds. When a fake driver is offered a ride (see "Offer flow"), it accepts, rejects, or ignores the offer by the rates below; when it accepts, it drives to the pickup, arrives, starts the trip, drives to the drop-off, and completes it. It runs on your machine (not in Docker), uses only the public API and the local OSRM, and never calls Nominatim or any OpenStreetMap server.
 
 Install (once; it needs only `httpx`, and an admin account made with `create_admin.py` above):
 
@@ -96,11 +96,16 @@ Run (the stack must be up and OSRM prepared):
 | `--center-lat`, `--center-lng` | the city center | Center of the fleet area (give both or neither) |
 | `--radius-km` | 5 | Radius of the fleet area. Matching only looks 3 km around the pickup, so the fleet lives in a circle instead of the whole city |
 | `--speed-kmh` | 30 | Driving speed (each driver gets a random factor between 0.8 and 1.2). Use 90 to finish a trip in a couple of minutes |
-| `--seed` | none | Makes the starting points repeatable |
+| `--seed` | none | Makes the starting points (and the answers to offers) repeatable |
+| `--accept-rate` | 0.7 | Share of offers a driver accepts |
+| `--reject-rate` | 0.15 | Share of offers a driver rejects. The rest (default 0.15) are ignored and run out after 15 seconds |
+| `--response-delay-min`, `--response-delay-max` | 1, 6 | Seconds a driver waits before answering an offer, picked at random (always at least 2 seconds before the deadline). Answers are rounded up to the simulator's 3-second tick |
+
+The simulator exits with a message if a rate is negative, the two rates add up to more than 1, or the minimum delay is above the maximum. `--accept-rate 0 --reject-rate 0` makes every driver ignore every offer, so a ride walks through up to 5 offers (about 75 seconds) and ends as `NO_DRIVER_FOUND`.
 
 Drivers are `sim-driver-001@sim.example.com`, `sim-driver-002@...`, and so on, with the password `sim-driver-pass`. Running it again reuses the same accounts. A driver whose position is still in Redis (stopped less than 30 seconds ago) continues from there.
 
-**Try matching by hand:** start `--drivers 30` with the default center, open `/rider/`, pick a pickup near the city center and a drop-off about 2 km away, and press **Request ride**. The ride is assigned to the nearest simulated driver within a couple of seconds, and the rider page walks through assigned, arrived, in progress, and completed on its own (with `--speed-kmh 90`, a 3.7 km trip took about 4 minutes). The rider page shows the driver moving (see live tracking below). A pickup far outside the circle ends as `NO_DRIVER_FOUND`.
+**Try matching by hand:** start `--drivers 30` with the default center, open `/rider/`, pick a pickup near the city center and a drop-off about 2 km away, and press **Request ride**. The nearest simulated driver is offered the ride and usually accepts within a few seconds (a reject or an ignored offer moves on to the next driver), and the rider page walks through assigned, arrived, in progress, and completed on its own (with `--speed-kmh 90`, a 3.7 km trip took about 4 minutes). The rider page shows the driver moving (see live tracking below). A pickup far outside the circle ends as `NO_DRIVER_FOUND`.
 
 Every 15 seconds one summary line shows drivers running, drivers on a ride, pings ok and failed, the average ping time, and rides completed. **Ctrl+C** takes every driver offline and exits within a few seconds (a driver on a ride cannot go offline; its presence expires after 30 seconds).
 
@@ -130,9 +135,37 @@ docker compose exec redis redis-cli ZCARD drivers:geo
 
 The driver id is shown at the top of the driver page. The GEO set can keep a stale member after the presence key expires; the presence key is what says whether a driver is online.
 
+### Offer flow (M3.3)
+
+A ride is no longer assigned the moment it is requested. It is offered to ONE driver at a time, nearest first, and the driver has 15 seconds to answer.
+
+```
+POST /rides  ->  REQUESTED, offer to the nearest free driver
+                     |-- driver accepts          -> DRIVER_ASSIGNED
+                     |-- driver rejects          -> offer to the next nearest driver
+                     |-- 15 s pass (no answer)   -> offer to the next nearest driver
+                     '-- nobody left (or 5 offers made) -> NO_DRIVER_FOUND
+```
+
+- `REQUESTED` now means "offers are being tried"; the state machine itself did not change. A request with nobody in range still ends as `NO_DRIVER_FOUND` straight away.
+- Offers are rows in the table `ride_offers` (status `PENDING`, `ACCEPTED`, `REJECTED`, `EXPIRED`, `CANCELLED`), so they survive a restart and are an audit trail. A driver is never offered the same ride twice, a ride has at most 5 offers, and a driver with a pending offer is not offered another ride.
+- Commands are REST: `GET /drivers/me/offer` (the pending offer, 404 if none), `POST /offers/{id}/accept` (200 with the ride), `POST /offers/{id}/reject` (204). Accept refuses (409) after the 15 seconds even if the background sweeper has not marked the offer expired yet, and when the driver is offline or already on a ride (403 if not approved).
+- The WebSocket only nudges: `offer_created {offer_id, ride_id}` and `offer_closed {offer_id, ride_id, reason}` go to the offered driver, and `ride_updated {ride_id, status}` goes to the rider when a driver accepts or the offers run out. The pages answer an event by calling their REST refresh, and they also poll every 3 seconds, so a missed event only costs a few seconds.
+- A background task (one per backend process, polling the database every second) expires offers that ran out of time and moves the ride on.
+
+**Try it with two driver tabs:** approve two drivers; log in to `/driver/` in two tabs (one account each); click the map about 0.5 km from where the rider will pick up in tab A and about 1.2 km away in tab B; press **Go online** in both. In a rider tab, pick two points and press **Request ride**.
+
+1. Within about a second tab A shows a **New ride request** panel with the addresses, the distance to the pickup, the trip distance and time, the fare, "Respond within N seconds", a progress bar, and **Accept** and **Reject** buttons. The pickup (green) and drop-off (red) are drawn on the map.
+2. Press **Reject** in tab A: the panel closes and tab B shows the offer. The rider still sees "Looking for a driver".
+3. Leave tab B alone: when the countdown ends the panel closes with "The offer expired." and the rider page says "No drivers are available nearby right now" within about 2 seconds.
+4. Request again and press **Accept**: tab A switches to the ride view and the rider sees the driver and live tracking.
+5. Request again and cancel from the rider tab while the offer is showing: the panel closes with "The rider cancelled the request."
+
+By hand: `curl localhost:8000/drivers/me/offer -H "Authorization: Bearer $DRIVER"`, then `curl -X POST localhost:8000/offers/<id>/accept -H "Authorization: Bearer $DRIVER"` (or `/reject`). Look at the rows with `docker compose exec db psql -U uber -d uber -c 'SELECT id, ride_id, driver_id, status, pickup_distance_m, expires_at FROM ride_offers ORDER BY id DESC LIMIT 10;'`. Run the simulator with the rates above to see many offers answered at once. Known limit until M4: two simultaneous requests can still offer the same free driver two rides.
+
 ## WebSockets (M3.1)
 
-The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes events to logged-in users. Since M3.2 the rider page opens one socket after login and receives `driver_location` events on it; everything else (ride status, the driver and admin pages, the simulator) still polls. Ride offers (M3.3) will be sent on top of it too.
+The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes events to logged-in users. Since M3.2 the rider page opens one socket after login and receives `driver_location` events on it; since M3.3 the driver page opens one too (both through `frontend/shared/ws.js`) and gets the offer events. Everything else (ride status, the admin page, the simulator) still polls, and so do the rider and driver pages, as a safety net.
 
 **Flow:** connect, then send the token as the FIRST message (never in the URL). If it is valid, the server answers `auth_ok`. Every message, in both directions, is a JSON text frame `{"type": "<string>", "data": {...}}`.
 
@@ -144,6 +177,9 @@ The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes
 | server to client | `pong` | `{}` | Reply to `ping` |
 | server to client | `error` | `{detail}` | Unknown message type (the socket stays open) |
 | server to client | `driver_location` | `{ride_id, lat, lng, updated_at}` | M3.2: sent to the rider of a ride each time its driver pings (`updated_at` is epoch seconds). No other data about the driver |
+| server to client | `offer_created` | `{offer_id, ride_id}` | M3.3: sent to the driver who was just offered a ride |
+| server to client | `offer_closed` | `{offer_id, ride_id, reason}` | M3.3: sent to the offered driver when the offer ends. `reason` is `accepted`, `rejected`, `expired`, or `ride_cancelled` |
+| server to client | `ride_updated` | `{ride_id, status}` | M3.3: sent to the rider when a driver accepts (`DRIVER_ASSIGNED`) or the offers run out (`NO_DRIVER_FOUND`) |
 | server to client | anything else | anything | An event published for this user. `auth_ok`, `pong`, and `error` are reserved |
 
 | Close code | Meaning |
@@ -172,7 +208,7 @@ ws.onopen = () => ws.send(JSON.stringify({type: "auth", data: {token}}))
 docker compose exec redis redis-cli PUBLISH ws:events:0 '{"user_id": 5, "type": "test", "data": {"hello": "world"}}'
 ```
 
-The reply is the number of backend processes listening (1 in dev). Backend code sends events with `repositories/events.publish(user_id, type, data)`.
+The reply is the number of backend processes listening (1 in dev). Backend code sends events with `repositories/events.publish(user_id, type, data)`. Since M3.3 it is best-effort: if Redis fails it logs one warning and returns 0, and the request that sent the event is not affected.
 
 ## Run the tests
 

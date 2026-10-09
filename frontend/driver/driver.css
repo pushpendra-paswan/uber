@@ -20,3 +20,24 @@ dd {
   min-height: 260px;
   border-radius: 0.25rem;
 }
+
+.offer {
+  border: 2px solid #1a56db;
+}
+
+.offer progress {
+  width: 100%;
+}
+
+.offer-buttons {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.offer-buttons button {
+  flex: 1;
+}
+
+#reject-button {
+  background: #b42318;
+}

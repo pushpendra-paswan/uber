@@ -43,16 +43,13 @@ HAPPY_PATH = [
 
 
 @pytest_asyncio.fixture
-async def make_ride(client, put_online, insert_ride):
-    """Returns a function that gets a ride into the target status: REQUESTED is inserted, the rest come from matching."""
+async def make_ride(client, insert_ride, assign_ride):
+    """Returns a function that gets a ride into the target status: REQUESTED is inserted, the rest go through an offer."""
 
     async def create(rider, driver, target: RideStatus) -> int:
         if target == RideStatus.REQUESTED:
             return (await insert_ride(rider, RideStatus.REQUESTED)).id
-        await put_online(driver, RIDE_BODY["pickup_lat"], RIDE_BODY["pickup_lng"])
-        response = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
-        assert response.json()["status"] == "DRIVER_ASSIGNED"
-        ride_id = response.json()["id"]
+        ride_id = (await assign_ride(rider, driver))["id"]
         for step in ("arrive", "start", "complete")[: HAPPY_PATH.index(target) - 1]:
             response = await client.post(f"/rides/{ride_id}/{step}", headers=driver["headers"])
             assert response.status_code == 200
@@ -85,12 +82,8 @@ async def test_every_transition_pair(db, rider, from_status, to_status):
         assert await count_events() == 0
 
 
-async def test_happy_path(client, rider, driver, put_online):
-    await put_online(driver, RIDE_BODY["pickup_lat"], RIDE_BODY["pickup_lng"])
-
-    response = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
-    assert response.status_code == 201
-    ride = response.json()
+async def test_happy_path(client, rider, driver, assign_ride):
+    ride = await assign_ride(rider, driver)
     ride_id = ride["id"]
     assert ride["status"] == "DRIVER_ASSIGNED"
     assert ride["driver_id"] == driver["driver"].id
@@ -114,7 +107,7 @@ async def test_happy_path(client, rider, driver, put_online):
     events = [(event["from_status"], event["to_status"], event["actor_user_id"]) for event in response.json()]
     assert events == [
         (None, "REQUESTED", rider["user"].id),
-        ("REQUESTED", "DRIVER_ASSIGNED", None),
+        ("REQUESTED", "DRIVER_ASSIGNED", driver["user"].id),
         ("DRIVER_ASSIGNED", "DRIVER_ARRIVED", driver["user"].id),
         ("DRIVER_ARRIVED", "IN_PROGRESS", driver["user"].id),
         ("IN_PROGRESS", "COMPLETED", driver["user"].id),
@@ -142,16 +135,13 @@ async def test_cancel(client, rider, driver, make_ride, canceller, ride_status):
         assert response.json()["status"] == "CANCELLED"
 
 
-async def test_second_active_ride_is_rejected_until_the_first_is_cancelled(client, rider, driver, put_online):
-    await put_online(driver, RIDE_BODY["pickup_lat"], RIDE_BODY["pickup_lng"])
-    first = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
-    assert first.status_code == 201
-    assert first.json()["status"] == "DRIVER_ASSIGNED"
+async def test_second_active_ride_is_rejected_until_the_first_is_cancelled(client, rider, driver, assign_ride):
+    first = await assign_ride(rider, driver)
 
     second = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
     assert second.status_code == 409
 
-    await client.post(f"/rides/{first.json()['id']}/cancel", headers=rider["headers"])
+    await client.post(f"/rides/{first['id']}/cancel", headers=rider["headers"])
     third = await client.post("/rides", json=RIDE_BODY, headers=rider["headers"])
     assert third.status_code == 201
 
