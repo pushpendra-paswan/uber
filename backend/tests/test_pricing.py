@@ -31,6 +31,9 @@ async def test_fare_formula_with_the_seed_rule(db, distance_m, duration_s, dista
         "time_fare": time_fare,
         "fare_estimate": fare,
         "minimum_fare_applied": minimum_applied,
+        "normal_fare": fare,
+        "surge_percent": 100,
+        "surge_amount": 0,
     }
 
 
@@ -68,6 +71,7 @@ async def test_estimate_returns_route_and_a_breakdown_that_adds_up(client, rider
     assert estimate["duration_s"] == 900
     assert estimate["fare_estimate"] == 14000
     assert estimate["minimum_fare_applied"] is False
+    assert (estimate["normal_fare"], estimate["surge_percent"], estimate["surge_amount"]) == (14000, 100, 0)
     assert estimate["base_fare"] + estimate["distance_fare"] + estimate["time_fare"] == estimate["fare_estimate"]
     assert estimate["path"] == [
         [ESTIMATE_BODY["pickup_lat"], ESTIMATE_BODY["pickup_lng"]],

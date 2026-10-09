@@ -67,8 +67,9 @@ async def estimate_ride(db: AsyncSession, data: EstimateRequest) -> dict:
     if route["distance_m"] < MIN_TRIP_DISTANCE_M:
         raise HTTPException(status_code=422, detail="Pickup and drop-off are too close for a ride")
 
-    fare = await pricing.calculate_fare(db, route["distance_m"], route["duration_s"])
-    return {**route, **fare}
+    zone, surge_percent = await pricing.get_surge_percent(db, data.pickup_lat, data.pickup_lng)
+    fare = await pricing.calculate_fare(db, route["distance_m"], route["duration_s"], surge_percent)
+    return {**route, **fare, "zone": zone}
 
 
 async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
@@ -78,6 +79,15 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
 
     # The client never sends distance, time, or fare: the server always works them out itself.
     estimate = await estimate_ride(db, data)
+
+    # The rider is never charged a higher multiplier than the one they saw. A lower one is charged as it is, and no
+    # accepted value means "the current one". Checked before any lock, like every surge read.
+    if data.accepted_surge_percent is not None and estimate["surge_percent"] > data.accepted_surge_percent:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Prices have increased in your area (now {estimate['surge_percent'] / 100:.1f}x). "
+            "Please review the new fare and request again.",
+        )
 
     # Lock, then check as a separate statement, then write. The lock is the rider's user row (FOR UPDATE), taken after the
     # routing call so it is held only for the insert and the commit, never across OSRM. It lasts until the commit below.
@@ -97,7 +107,10 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
     # The unique indexes on active rides are the last line of defense behind the lock: if one fires, the whole request is undone.
     try:
         # Not routed through change_ride_status: there is no previous status.
-        ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])
+        ride = await rides_repo.create(
+            db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"],
+            estimate["zone"], estimate["surge_percent"],
+        )
         await rides_repo.add_event(db, ride.id, None, RideStatus.REQUESTED, rider.id)
 
         # The first offer is made in the same transaction, so a Redis or OSRM failure leaves no half-created ride.

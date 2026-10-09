@@ -1,4 +1,4 @@
--- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1). Read-only. One SELECT per invariant, one row per offender:
+-- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1, I12 since M5.2). Read-only. One SELECT per invariant, one row per offender:
 -- an empty result means the invariant holds. Used by simulator/stress.py, and runnable by hand:
 --   docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
 -- Statuses are stored as the enum names in upper case (VARCHAR, no CHECK constraint).
@@ -101,4 +101,20 @@ FROM rides
 WHERE status = 'COMPLETED'
   AND (fare_breakdown->>'kind') = 'trip'
   AND final_fare > fare_estimate * 150 / 100
+ORDER BY id;
+
+\echo '== surge_settlement_mismatch'
+-- I12: a settled trip used the multiplier locked on the ride, and its surge arithmetic adds up. Only trips whose breakdown
+-- HAS a surge_percent key are checked (rides settled before M5.2 have none). Settlement is in the ride's own transaction,
+-- so this can never be violated even for an instant. The 100 to 200 range is enforced by a check constraint instead.
+SELECT id AS ride_id, surge_percent AS ride_surge, (fare_breakdown->>'surge_percent')::int AS breakdown_surge,
+       (fare_breakdown->>'normal_fare')::int AS normal_fare, (fare_breakdown->>'surge_amount')::int AS surge_amount,
+       (fare_breakdown->>'computed_fare')::int AS computed_fare
+FROM rides
+WHERE status = 'COMPLETED'
+  AND (fare_breakdown->>'kind') = 'trip'
+  AND fare_breakdown ? 'surge_percent'
+  AND ((fare_breakdown->>'surge_percent')::int <> surge_percent
+       OR (fare_breakdown->>'normal_fare')::int + (fare_breakdown->>'surge_amount')::int <> (fare_breakdown->>'computed_fare')::int
+       OR ((fare_breakdown->>'normal_fare')::int * surge_percent + 50) / 100 <> (fare_breakdown->>'computed_fare')::int)
 ORDER BY id;

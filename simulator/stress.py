@@ -74,6 +74,9 @@ INVARIANTS = {
     "cancelled_without_settlement": ("I9", "rides", None, ("ride_id", "final_fare", "kind", "fee")),
     "fare_on_unsettled_ride": ("I10", "rides", None, ("ride_id", "status", "final_fare", "kind")),
     "fare_over_cap": ("I11", "rides", None, ("ride_id", "final_fare", "fare_estimate")),
+    "surge_settlement_mismatch": (
+        "I12", "rides", None, ("ride_id", "ride_surge", "breakdown_surge", "normal_fare", "surge_amount", "computed_fare")
+    ),
 }
 
 log = logging.getLogger("stress")
@@ -243,7 +246,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I11 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I12 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -256,7 +259,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all eleven invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all twelve invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -270,7 +273,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I11 ok"
+    return ", ".join(parts) or "I1-I12 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -510,13 +513,23 @@ async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict,
                     "dropoff_lat": dropoff[0], "dropoff_lng": dropoff[1], "dropoff_address": "Stress drop-off",
                 }
                 duplicate = rng.random() < 0.10
+                if rng.random() < 0.20:
+                    # Like the rider page: ask for the price first and accept exactly that multiplier.
+                    quoted = await api(client, "POST", rng.choice(urls) + "/rides/estimate", token, {
+                        key: value for key, value in body.items() if not key.endswith("address")
+                    })
+                    if quoted.status_code == 200:
+                        body["accepted_surge_percent"] = quoted.json()["surge_percent"]
                 counters["rides_requested"] += 1
                 answers = await asyncio.gather(
                     *[api(client, "POST", rng.choice(urls) + "/rides", token, body) for _ in range(2 if duplicate else 1)]
                 )
+                # The price went up between the quote and the request: normal, not a failure.
+                price_up = [answer for answer in answers if answer.status_code == 409 and str(answer.json().get("detail", "")).startswith("Prices have increased")]
+                counters["surge_409"] += len(price_up)
                 if duplicate:
                     counters["duplicate_requests"] += 1
-                    counters["duplicates_refused"] += sum(1 for answer in answers if answer.status_code == 409)
+                    counters["duplicates_refused"] += sum(1 for answer in answers if answer.status_code == 409) - len(price_up)
                 created = [answer for answer in answers if answer.status_code == 201]
                 if created:
                     ride_id, cancelled = created[0].json()["id"], False
@@ -631,7 +644,7 @@ async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Rando
 
 
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I11 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I12 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -736,6 +749,16 @@ async def scenario_chaos(ctx: dict) -> None:
         f"FROM rides r WHERE {mine}",
     )
     ctx["money"] = [int(value) for value in money[0].split("|")]
+    # Surge, read-only: rides that were quoted above 1.0x, the highest multiplier, and the surge part of the settled trips
+    # (only trips whose breakdown has the key).
+    surge = await sql(
+        ctx,
+        "SELECT count(*) FILTER (WHERE r.surge_percent > 100), COALESCE(max(r.surge_percent), 100), "
+        "COALESCE(sum((r.fare_breakdown->>'surge_amount')::int) FILTER (WHERE r.status = 'COMPLETED' "
+        "AND (r.fare_breakdown->>'kind') = 'trip' AND r.fare_breakdown ? 'surge_percent'), 0) "
+        f"FROM rides r WHERE {mine}",
+    )
+    ctx["surge"] = [int(value) for value in surge[0].split("|")]
 
 
 async def main() -> int:
@@ -929,6 +952,7 @@ async def main() -> int:
                  "(%d answers were 409); %d trips completed", counters["rides_requested"], counters["rider_cancels"],
                  counters["rider_cancels_ok"], counters["driver_cancels"], counters["duplicate_requests"],
                  counters["duplicates_refused"], counters["trips_completed"])
+        log.info("  %d requests were refused because the price went up after the quote (surge_409, normal)", counters["surge_409"])
         log.info("  offers answered: %d accepts won, %d accepts refused, %d double accepts (%d returned exactly one 200), %d rejects, "
                  "%d ignored, %d drivers went offline", counters["accepts_won"], counters["accepts_refused"], counters["double_accepts"],
                  counters["double_accepts_one_200"], counters["rejects"], counters["ignores"], counters["offline_events"])
@@ -937,6 +961,11 @@ async def main() -> int:
         completed, fares, fees, fee_total = ctx["money"]
         log.info("  money: %d completed rides, final fares %d paise in all; %d cancelled rides with a fee, fees %d paise in all",
                  completed, fares, fees, fee_total)
+        surged, highest, surge_total = ctx["surge"]
+        log.info("  surge: %d rides requested above 1.0x, highest multiplier %d percent, surge part of the completed trips %d paise in all",
+                 surged, highest, surge_total)
+        if not surged:
+            log.warning("  no ride had surge in this run: it proves nothing about the surge path")
         log.info("  final offers by status: %s", dict(sorted(ctx["chaos"]["offer"].items())))
         log.info("  5xx answers: %d, connection errors: %d%s", server_errors, counters["transport_errors"],
                  " (tolerated)" if args.tolerate_5xx else "")

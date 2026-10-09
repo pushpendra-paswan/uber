@@ -85,11 +85,16 @@
       <section id="estimate-section" hidden>
         <h3>Trip estimate</h3>
         <p id="estimate-trip"></p>
+        <p id="estimate-surge" class="note" hidden></p>
         <p>Estimated fare: <strong id="estimate-fare"></strong></p>
         <ul class="breakdown">
           <li>Base fare: <span id="estimate-base"></span></li>
           <li>Distance: <span id="estimate-distance-fare"></span></li>
           <li>Time: <span id="estimate-time-fare"></span></li>
+        </ul>
+        <ul id="estimate-surge-lines" class="breakdown" hidden>
+          <li>Normal fare: <span id="estimate-normal"></span></li>
+          <li>High-demand pricing: +<span id="estimate-surge-amount"></span></li>
         </ul>
         <p id="estimate-minimum" class="note" hidden>Minimum fare applies</p>
       </section>
@@ -123,7 +128,7 @@
         </div>
         <div>
           <dt>Estimated fare</dt>
-          <dd id="ride-fare"></dd>
+          <dd><span id="ride-fare"></span> <span id="ride-fare-surge" class="note" hidden></span></dd>
         </div>
         <div id="ride-driver-row" hidden>
           <dt>Driver id</dt>
@@ -135,7 +140,8 @@
         <h3>Fare</h3>
         <div id="fare-trip" hidden>
           <p>Total fare: <strong id="fare-total"></strong></p>
-          <p>Estimated fare: <span id="fare-estimate"></span></p>
+          <p>Estimated fare: <span id="fare-estimate"></span> <span id="fare-estimate-surge" class="note" hidden></span></p>
+          <p id="fare-surge" hidden></p>
           <p>Distance: <span id="fare-distance"></span> <span id="fare-distance-note" hidden>(estimated, tracking was not available)</span></p>
           <p>Time: <span id="fare-time"></span></p>
           <ul class="breakdown">

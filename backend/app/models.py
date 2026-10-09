@@ -115,6 +115,9 @@ class Ride(Base):
             "uq_rides_one_active_per_rider", "rider_id", unique=True,
             postgresql_where=text("status IN ('REQUESTED', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'IN_PROGRESS')"),
         ),
+        CheckConstraint("surge_percent BETWEEN 100 AND 200", name="surge_percent_range"),
+        # The surge demand query: rides created in the last few minutes.
+        Index("ix_rides_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -131,7 +134,11 @@ class Ride(Base):
     )
     distance_m: Mapped[int | None] = mapped_column(Integer)
     duration_s: Mapped[int | None] = mapped_column(Integer)
-    fare_estimate: Mapped[int | None] = mapped_column(Integer)  # paise
+    fare_estimate: Mapped[int | None] = mapped_column(Integer)  # paise, with the surge multiplier of surge_percent
+    # The geohash cell of the pickup (NULL for rides from before M5.2) and the multiplier locked at request time, in
+    # integer percent: 100 is no surge, 150 is 1.5x. Settlement reuses this multiplier, never the current one.
+    pickup_zone: Mapped[str | None] = mapped_column(String(12))
+    surge_percent: Mapped[int] = mapped_column(Integer, default=100, server_default="100")
     # What the rider owes, set once when the ride is settled: the trip fare (COMPLETED) or the cancellation fee (CANCELLED).
     final_fare: Mapped[int | None] = mapped_column(Integer)  # paise
     actual_distance_m: Mapped[int | None] = mapped_column(Integer)  # the distance that was billed

@@ -98,6 +98,13 @@ def fake_route(monkeypatch):
     monkeypatch.setattr(routing, "get_route", get_route)
 
 
+@pytest.fixture(autouse=True)
+def no_surge(monkeypatch):
+    """Surge needs this many unmet riders in a zone, so with a huge number the rest of the suite never sees surge.
+    test_surge.py puts the real value back."""
+    monkeypatch.setattr(pricing, "MIN_DEMAND_FOR_SURGE", 10**9)
+
+
 @pytest.fixture
 def fake_clock(monkeypatch):
     """Replaces the `time` module inside services/pricing.py (the trip meter's clock) with an object whose time() is

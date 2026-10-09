@@ -25,7 +25,8 @@ TRIP_KEY = "ride:{}:trip"
 
 TRIP_KEYS = {
     "kind", "distance_m", "duration_s", "distance_source", "fallback_reason", "tracked_pings", "jumps_ignored", "base_fare",
-    "distance_fare", "time_fare", "minimum_fare_applied", "computed_fare", "fare_cap", "capped",
+    "distance_fare", "time_fare", "minimum_fare_applied", "computed_fare", "normal_fare", "surge_percent", "surge_amount",
+    "fare_cap", "capped",
 }
 
 
@@ -132,6 +133,7 @@ async def test_a_tracked_trip_is_billed_by_its_measured_distance_and_time(client
     assert breakdown["base_fare"] == 5000
     assert breakdown["distance_fare"] + breakdown["time_fare"] + 5000 == breakdown["computed_fare"] == ride["final_fare"]
     assert breakdown["fare_cap"] == 21000 and breakdown["capped"] is False
+    assert (breakdown["normal_fare"], breakdown["surge_percent"], breakdown["surge_amount"]) == (breakdown["computed_fare"], 100, 0)
     # What the response says is what is stored.
     stored_row = await row(db, trip["id"])
     assert (stored_row.final_fare, stored_row.actual_distance_m, stored_row.actual_duration_s) == (

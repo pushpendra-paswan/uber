@@ -126,10 +126,16 @@ const estimateBase = document.getElementById("estimate-base");
 const estimateDistanceFare = document.getElementById("estimate-distance-fare");
 const estimateTimeFare = document.getElementById("estimate-time-fare");
 const estimateMinimum = document.getElementById("estimate-minimum");
+const estimateSurge = document.getElementById("estimate-surge");
+const estimateSurgeLines = document.getElementById("estimate-surge-lines");
+const estimateNormal = document.getElementById("estimate-normal");
+const estimateSurgeAmount = document.getElementById("estimate-surge-amount");
 const fareSection = document.getElementById("fare-section");
 const fareTrip = document.getElementById("fare-trip");
 const fareTotal = document.getElementById("fare-total");
 const fareEstimate = document.getElementById("fare-estimate");
+const fareEstimateSurge = document.getElementById("fare-estimate-surge");
+const fareSurge = document.getElementById("fare-surge");
 const fareDistance = document.getElementById("fare-distance");
 const fareDistanceNote = document.getElementById("fare-distance-note");
 const fareTime = document.getElementById("fare-time");
@@ -143,6 +149,7 @@ const fareFee = document.getElementById("fare-fee");
 const fareReason = document.getElementById("fare-reason");
 const rideTrip = document.getElementById("ride-trip");
 const rideFare = document.getElementById("ride-fare");
+const rideFareSurge = document.getElementById("ride-fare-surge");
 
 // "5.2 km, 14 min". Used by the estimate panel and the ride view. Old rides have null values.
 function formatTrip(distanceM, durationS) {
@@ -303,8 +310,15 @@ function setPoint(kind, lat, lng, address) {
   state.results[kind] = null;
   if (state.points[other] === null) pickRadios[other].checked = true;
 
-  // A new point makes the old route and estimate wrong, so drop them now. Only the latest answer is applied.
+  // A new point makes the old route and estimate wrong, so drop them now.
   state.estimate = null;
+  fetchEstimate();
+  render();
+}
+
+// Asks for the estimate of the chosen points. Used by setPoint and by a refused request (the price may have changed).
+// Only the latest answer is applied.
+function fetchEstimate() {
   const requestNumber = ++state.estimateRequest;
   const { pickup, dropoff } = state.points;
   state.estimating = pickup !== null && dropoff !== null;
@@ -316,7 +330,10 @@ function setPoint(kind, lat, lng, address) {
       dropoff_lng: dropoff.lng,
     })
       .then((estimate) => {
-        if (requestNumber === state.estimateRequest) state.estimate = estimate;
+        if (requestNumber !== state.estimateRequest) return;
+        // The same route again: keep the old array, because render() redraws the line and moves the map for a new one.
+        if (state.estimate !== null && JSON.stringify(state.estimate.path) === JSON.stringify(estimate.path)) estimate.path = state.estimate.path;
+        state.estimate = estimate;
       })
       .catch((err) => {
         if (requestNumber === state.estimateRequest) state.error = err.message;
@@ -326,7 +343,6 @@ function setPoint(kind, lat, lng, address) {
         render();
       });
   }
-  render();
 }
 
 function onMapClick(event) {
@@ -504,6 +520,13 @@ function render() {
     estimateDistanceFare.textContent = money.format(estimate.distance_fare / 100);
     estimateTimeFare.textContent = money.format(estimate.time_fare / 100);
     estimateMinimum.hidden = !estimate.minimum_fare_applied;
+    estimateSurge.hidden = estimate.surge_percent <= 100;
+    estimateSurgeLines.hidden = estimate.surge_percent <= 100;
+    if (estimate.surge_percent > 100) {
+      estimateSurge.textContent = `High demand in your area: fares are ${(estimate.surge_percent / 100).toFixed(1)}x higher right now.`;
+      estimateNormal.textContent = money.format(estimate.normal_fare / 100);
+      estimateSurgeAmount.textContent = money.format(estimate.surge_amount / 100);
+    }
   }
 
   if (showRide) {
@@ -531,6 +554,14 @@ function render() {
     if (!fareTrip.hidden) {
       fareTotal.textContent = money.format(state.ride.final_fare / 100);
       fareEstimate.textContent = money.format(state.ride.fare_estimate / 100);
+      fareEstimateSurge.hidden = state.ride.surge_percent <= 100;
+      fareEstimateSurge.textContent = `(includes ${(state.ride.surge_percent / 100).toFixed(1)}x high-demand pricing)`;
+      // Rides settled before M5.2 have no surge keys in the breakdown.
+      const surged = breakdown.surge_percent !== undefined && breakdown.surge_percent > 100;
+      fareSurge.hidden = !surged;
+      if (surged) {
+        fareSurge.textContent = `High-demand pricing: ${(breakdown.surge_percent / 100).toFixed(1)}x (+${money.format(breakdown.surge_amount / 100)} on a normal fare of ${money.format(breakdown.normal_fare / 100)})`;
+      }
       fareDistance.textContent = `${(breakdown.distance_m / 1000).toFixed(1)} km`;
       fareDistanceNote.hidden = breakdown.distance_source !== "estimate";
       fareTime.textContent = `${Math.floor(breakdown.duration_s / 60)} min ${breakdown.duration_s % 60} s`;
@@ -552,6 +583,8 @@ function render() {
     rideDropoff.textContent = state.ride.dropoff_address;
     rideTrip.textContent = formatTrip(state.ride.distance_m, state.ride.duration_s);
     rideFare.textContent = state.ride.fare_estimate === null ? "-" : money.format(state.ride.fare_estimate / 100);
+    rideFareSurge.hidden = state.ride.surge_percent <= 100;
+    rideFareSurge.textContent = `(includes ${(state.ride.surge_percent / 100).toFixed(1)}x high-demand pricing)`;
     rideDriverRow.hidden = state.ride.driver_id === null;
     rideDriver.textContent = state.ride.driver_id;
     driverSection.hidden = state.driver === null;
@@ -646,17 +679,24 @@ for (const kind of KINDS) {
 
 requestButton.addEventListener("click", () => {
   const { pickup, dropoff } = state.points;
+  const acceptedSurgePercent = state.estimate.surge_percent; // the price the rider is looking at
   act(async () => {
     // Matching happens inside this request. A ride that found no driver is already over, so /rides/active
     // would answer 404 for it: remember the ride from this answer instead.
-    state.ride = await api("POST", "/rides", {
-      pickup_address: pickup.address,
-      pickup_lat: pickup.lat,
-      pickup_lng: pickup.lng,
-      dropoff_address: dropoff.address,
-      dropoff_lat: dropoff.lat,
-      dropoff_lng: dropoff.lng,
-    });
+    try {
+      state.ride = await api("POST", "/rides", {
+        pickup_address: pickup.address,
+        pickup_lat: pickup.lat,
+        pickup_lng: pickup.lng,
+        dropoff_address: dropoff.address,
+        dropoff_lat: dropoff.lat,
+        dropoff_lng: dropoff.lng,
+        accepted_surge_percent: acceptedSurgePercent,
+      });
+    } catch (err) {
+      fetchEstimate(); // for example "Prices have increased": the panel shows the current price, the message stays
+      throw err;
+    }
     state.rideId = state.ride.id;
   });
 });

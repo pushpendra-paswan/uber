@@ -115,11 +115,14 @@ class EstimateRequest(BaseModel):
 class EstimateResponse(BaseModel):
     distance_m: int
     duration_s: int
-    fare_estimate: int  # paise
-    base_fare: int
+    fare_estimate: int  # paise, the total with surge
+    base_fare: int  # base_fare, distance_fare and time_fare are the normal parts, before surge
     distance_fare: int
     time_fare: int
     minimum_fare_applied: bool
+    normal_fare: int  # after the minimum fare, before surge
+    surge_percent: int  # 100 is no surge, 150 is 1.5x
+    surge_amount: int  # fare_estimate - normal_fare
     path: list[list[float]]  # [lat, lng] pairs
 
 
@@ -128,6 +131,8 @@ class RideCreate(EstimateRequest):
 
     pickup_address: str = Field(min_length=1, max_length=255)
     dropoff_address: str = Field(min_length=1, max_length=255)
+    # The multiplier the rider saw in the estimate. Absent means "accept the current one" (scripts and simulators).
+    accepted_surge_percent: int | None = Field(default=None, ge=100, le=200)
 
 
 class StartTripRequest(BaseModel):
@@ -156,6 +161,7 @@ class RideResponse(BaseModel):
     distance_m: int | None
     duration_s: int | None
     fare_estimate: int | None
+    surge_percent: int
     final_fare: int | None
     actual_distance_m: int | None
     actual_duration_s: int | None
@@ -181,6 +187,20 @@ class OfferResponse(BaseModel):
     fare_estimate: int | None  # paise
     pickup_distance_m: int
     expires_in: float  # seconds left, never negative
+
+
+class SurgeZoneResponse(BaseModel):
+    zone: str
+    demand: int
+    supply: int
+    pressure_percent: int
+    surge_percent: int  # the step value, before the cap of the pricing rule
+
+
+class SurgeSnapshotResponse(BaseModel):
+    computed_at: int  # epoch seconds
+    age_seconds: int
+    zones: list[SurgeZoneResponse]
 
 
 class CancellationFeeResponse(BaseModel):

@@ -273,6 +273,8 @@ fare = max(base + per_km x distance + per_min x time, minimum fare)         # se
 final fare = min(fare, 150 percent of the estimate)
 ```
 
+Since M5.2 the fare is multiplied by the ride's surge multiplier after the minimum fare is applied (see "Surge pricing" below); the examples in this section have no surge.
+
 Worked example (a real simulator trip): 2977 m and 402 s give 5000 + (1200 x 2977 + 500) // 1000 + (200 x 402 + 30) // 60 = 5000 + 3572 + 1340 = **9912** paise (Rs 99.12), against an estimate of 9696 and a cap of 14544.
 
 - **Time** is `completed_at - started_at` on the server (at least 1 s).
@@ -297,6 +299,41 @@ Cancelling a trip in progress is not possible. The rider can ask first: `GET /ri
 docker compose exec -T db psql -U uber -d uber -c "SELECT id, status, final_fare, fare_breakdown FROM rides ORDER BY id DESC LIMIT 10"
 docker compose exec redis redis-cli HGETALL ride:<id>:trip      # the distance counter while a trip is in progress
 ```
+
+## Surge pricing (M5.2)
+
+When many riders in an area are waiting and few drivers are free, fares rise by a multiplier. It is rule-based, from counts only (no ML), and it is shown in the estimate, locked on the ride when it is requested, and used again when the trip is settled. All multipliers are integer percents: 100 is no surge, 150 is 1.5x.
+
+**Zones.** A zone is the geohash of the PICKUP point at precision 5 (`ZONE_PRECISION` in `services/pricing.py`, the encoder is `geohash_encode` in `utils/geo.py`, no library). For the configured city (Bengaluru, 12.83 to 13.14 north, 77.45 to 77.75 east) a cell is 0.0439 degrees on each side: **4.89 km tall and 4.77 km wide**, and **72 zones** cover the city box. Longitude cells get narrower the further a city is from the equator.
+
+**Demand** in a zone is the number of DISTINCT riders who have a ride with that pickup zone created in the last 180 seconds that is still REQUESTED or ended NO_DRIVER_FOUND (unmet demand). A rider who was served used up a driver, a rider who cancelled is not counted, and one account requesting again and again counts once. **Supply** is the number of AVAILABLE drivers whose position is in the zone: the same definition matching uses (online, approved, no active ride, no pending offer).
+
+**Pressure** is `demand * 100 // max(supply, 1)`. The multiplier comes from a table, not a formula, so quotes stay stable. Fewer than 3 unmet riders in a zone never cause surge.
+
+| Pressure up to | Multiplier |
+|---|---|
+| 100 | 1.0x (100) |
+| 150 | 1.2x (120) |
+| 200 | 1.5x (150) |
+| 300 | 1.8x (180) |
+| above 300 | 2.0x (200) |
+
+Worked example (a real run): 9 unmet riders and 3 free drivers in a zone give pressure 300, so 1.8x. A normal fare of 9696 paise becomes `(9696 * 180 + 50) // 100` = **17453** paise, of which 7757 is the high-demand part. Surge multiplies the whole normal fare after the minimum fare, and the cancellation fee is never surged.
+
+**The cap** is the pricing rule's `surge_cap` (2.0 in the seed rule, read at quote time as `max(100, round(surge_cap * 100))` percent), so a changed rule takes effect at once. The snapshot stores the uncapped table value.
+
+**The snapshot.** Once every 15 seconds at most, one city-wide snapshot of every zone is computed (one Postgres query for demand, one Redis read of the online drivers' positions, one Postgres query for availability) and cached in Redis under `surge:snapshot`. Everyone asking within those 15 seconds sees the same numbers, so a quote can be up to 15 seconds old. If Redis fails, quotes carry no surge (one warning is logged); requesting a ride still needs Redis for matching and answers 503.
+
+**The rider is never charged more than they saw.** `POST /rides` takes an optional `accepted_surge_percent` (100 to 200): the multiplier of the estimate on screen. If the current multiplier is higher the answer is `409 Prices have increased in your area (now 1.5x). Please review the new fare and request again.` and nothing is created. If it is equal or lower, the ride is created at the CURRENT multiplier (the rider pays the lower price). Without the field the current multiplier is accepted (scripts, the simulators and the stress tool). The multiplier is stored on the ride (`surge_percent`, with the zone in `pickup_zone`) and used again at completion, never the current one; the 150 percent cap works on the surged estimate. A rider's own request is not part of their own price.
+
+**See the snapshot** (admin only; `refresh=true` recomputes and overwrites the cache):
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "localhost:8000/admin/surge?refresh=true"
+docker compose exec redis redis-cli GET surge:snapshot
+```
+
+**Make surge for a demo:** with no driver online, request rides from 3 or more different rider accounts at the same pickup (each ends NO_DRIVER_FOUND, which is unmet demand), wait up to 15 seconds, then change the pickup a little on the rider page: the estimate shows the high-demand lines. The demand ages out 3 minutes after the last request. **Stress and chaos runs leave NO_DRIVER_FOUND rides that raise surge in their zone for 3 minutes.** That is harmless to the invariants, but it changes the fares you see in the next run.
 
 ## Concurrency stress test (M4.1, M4.2, M4.3)
 
@@ -359,8 +396,9 @@ The container has no `pkill`; `docker compose up -d --force-recreate backend` st
 | I9 `cancelled_without_settlement` | every CANCELLED ride has a `cancellation` breakdown and a `final_fare` (the fee, which may be 0) equal to the fee in it (legacy rides left out) |
 | I10 `fare_on_unsettled_ride` | no ride that is neither COMPLETED nor CANCELLED (active, or NO_DRIVER_FOUND) has a fare, a billed distance or duration, or a breakdown |
 | I11 `fare_over_cap` | no trip fare is above 150 percent of the ride's estimate (integer division, like the code) |
+| I12 `surge_settlement_mismatch` | a settled trip used the multiplier locked on its ride, and `normal_fare + surge_amount = computed_fare` (trips settled before M5.2 have no surge keys and are left out) |
 
-I4 to I11 cannot be legitimately violated even for an instant (each pair of changes, and each status change with its settlement, is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
+I4 to I12 cannot be legitimately violated even for an instant (each pair of changes, and each status change with its settlement, is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
 
 ```bash
 docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql

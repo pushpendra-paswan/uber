@@ -115,6 +115,24 @@ async def get_online_ids(driver_ids: list[int]) -> set[int]:
     return {driver_id for driver_id, value in zip(driver_ids, values) if value is not None}
 
 
+async def get_online_positions() -> dict[int, tuple[float, float]]:
+    """{driver_id: (lat, lng)} for every GEO member that has a presence key. Redis only: no rules about rides or approval."""
+    members = await redis_client.zrange(GEO_KEY, 0, -1)
+    if not members:
+        return {}
+    values = await redis_client.mget([PRESENCE_KEY.format(member) for member in members])
+    online = [member for member, value in zip(members, values) if value is not None]
+    if not online:
+        return {}
+    found = await redis_client.geopos(GEO_KEY, *online)
+    positions = {}
+    for member, position in zip(online, found):
+        if position is not None:  # the member was removed between the two reads
+            lng, lat = position
+            positions[int(member)] = (lat, lng)
+    return positions
+
+
 async def remove_from_geo(driver_ids: list[int]) -> None:
     await redis_client.zrem(GEO_KEY, *[str(driver_id) for driver_id in driver_ids])
 

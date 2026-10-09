@@ -84,21 +84,21 @@ uber-clone/
 │   │   │   ├── rides.py       # ride lifecycle and state machine
 │   │   │   ├── matching.py    # finds drivers and creates offers
 │   │   │   ├── offers.py      # accept, reject, expiry, and the offers sweeper
-│   │   │   ├── pricing.py     # fare estimate, final fare, surge
+│   │   │   ├── pricing.py     # fare estimate, final fare, surge snapshot and multiplier
 │   │   │   ├── payments.py
 │   │   │   ├── places.py      # Nominatim search/reverse proxy, map config
 │   │   │   └── routing.py     # OSRM route: distance, duration, path as [lat, lng]
 │   │   ├── repositories/      # all database and Redis access
 │   │   │   ├── users.py       # includes lock(): FOR UPDATE on the user's row (M4.2)
-│   │   │   ├── drivers.py     # includes driver locations in Redis GEO, and try_lock() / lock(): FOR UPDATE on the driver's row (M4.2)
+│   │   │   ├── drivers.py     # includes driver locations in Redis GEO, get_online_positions() for the surge snapshot (M5.2), and try_lock() / lock(): FOR UPDATE on the driver's row (M4.2)
 │   │   │   ├── events.py      # WebSocket events: Redis pub/sub publish and subscribe
 │   │   │   ├── offers.py
-│   │   │   ├── rides.py
+│   │   │   ├── rides.py       # includes count_unmet_demand_by_zone() for surge (M5.2)
 │   │   │   ├── payments.py
 │   │   │   ├── places.py      # Redis cache and rate-limit slot for Nominatim
-│   │   │   ├── pricing.py     # pricing rule lookup
+│   │   │   ├── pricing.py     # pricing rule lookup, and the surge snapshot in Redis (get_snapshot / save_snapshot, M5.2)
 │   │   │   └── ratings.py
-│   │   └── utils/             # small generic pure functions (geo.py: is_inside_bounds, money.py, ...)
+│   │   └── utils/             # small generic pure functions (geo.py: is_inside_bounds, geohash_encode for surge zones, money.py, ...)
 │   └── tests/
 ├── osrm/
 │   ├── prepare.sh             # run once: download the map, clip to the city, build OSRM data
@@ -110,8 +110,8 @@ uber-clone/
 │   └── admin/                 # index.html, admin.js, admin.css
 └── simulator/
     ├── simulator.py           # fake drivers (M2.5)
-    ├── stress.py              # fires simultaneous requests and checks eleven database invariants; scenarios drivers, riders, fleet (M4.1) and chaos (M4.3)
-    ├── invariants.sql         # the eleven invariants I1 to I11, read-only SQL, run by stress.py or by hand
+    ├── stress.py              # fires simultaneous requests and checks twelve database invariants; scenarios drivers, riders, fleet (M4.1) and chaos (M4.3)
+    ├── invariants.sql         # the twelve invariants I1 to I12, read-only SQL, run by stress.py or by hand
     └── requirements.txt       # httpx only
 ```
 
@@ -153,7 +153,7 @@ Three places read "is this free?" and then write: `create_ride` (the rider has n
 - **`IntegrityError` is caught narrowly, only at the three places that can hit an index**, and never becomes a 500: `create_ride` wraps the ride creation through the commit (rollback, 409 "You already have an active ride"); `matching.offer_to_next_driver` wraps the offer insert in a savepoint (`async with db.begin_nested():`), catches the error outside it, logs WARNING `offer skipped for driver <id>: <error text>` and moves to the next candidate; `accept` wraps everything from the first change through the commit (rollback, 409). The warning means a lock failed; with the locks working it never fires. Any new code that reads availability or an active-ride count and then writes gets the lock AND handles the index it can hit.
 - **The sweeper withdraws offers of vanished drivers.** `expire_due_offers` reads all PENDING offers (`offers_repo.list_pending(db, limit)`), does ONE `drivers.get_online_ids` call (never with an empty list), and closes an offer when its deadline has passed (reason `expired`) or else when its driver has no presence key (reason `driver_offline`: offline, rejected by an admin, or the page died; time wins when both apply). Each offer is handled in a new session that locks the ride, then the offer, and re-checks that it is still pending and still due. A failing offer is logged once per offer id and the pass goes on; outage errors (`RedisError`, `OSError`, `InterfaceError`, `OperationalError`) abort the pass.
 - **`offer_closed` reasons:** accepted, rejected, expired, ride_cancelled, driver_offline. Nothing may assume a fixed list of three.
-- **Invariants I1 to I11** (`simulator/invariants.sql`, checked by every `simulator/stress.py` scenario): I1 one live pending offer per driver, I2 one active ride per driver, I3 one active ride per rider, I4 no REQUESTED ride without a PENDING offer, I5 no PENDING offer more than 10 s overdue, I6 no PENDING offer on a ride that is not REQUESTED, I7 every assigned, arrived, or in-progress ride has an ACCEPTED offer for its own driver, and since M5.1 I8 every COMPLETED ride has its fare and a `trip` breakdown, I9 every CANCELLED ride has its fee and a `cancellation` breakdown, I10 no unsettled ride has a fare, I11 no trip fare is above 150 percent of the estimate (rides marked `legacy` are left out of I8 and I9). None can be legitimately violated even for an instant, so any sighting counts. The `chaos` scenario (random riders and drivers, a settle period, STUCK = a REQUESTED ride or PENDING offer left after it) must end `CHAOS CLEAN`; every scenario is expected to exit 0.
+- **Invariants I1 to I12** (`simulator/invariants.sql`, checked by every `simulator/stress.py` scenario): I1 one live pending offer per driver, I2 one active ride per driver, I3 one active ride per rider, I4 no REQUESTED ride without a PENDING offer, I5 no PENDING offer more than 10 s overdue, I6 no PENDING offer on a ride that is not REQUESTED, I7 every assigned, arrived, or in-progress ride has an ACCEPTED offer for its own driver, and since M5.1 I8 every COMPLETED ride has its fare and a `trip` breakdown, I9 every CANCELLED ride has its fee and a `cancellation` breakdown, I10 no unsettled ride has a fare, I11 no trip fare is above 150 percent of the estimate (rides marked `legacy` are left out of I8 and I9), and since M5.2 I12 a settled trip used the surge multiplier locked on its ride and its surge arithmetic adds up (trips whose breakdown has no `surge_percent` key are left out). None can be legitimately violated even for an instant, so any sighting counts. The `chaos` scenario (random riders and drivers, a settle period, STUCK = a REQUESTED ride or PENDING offer left after it) must end `CHAOS CLEAN`; every scenario is expected to exit 0.
 - **Tests that need the forbidden state** (two pending offers for one driver, two active rides for one rider) cannot insert it any more: reach the code another way, or use the `locks_disabled` fixture to prove what the indexes alone do.
 
 ### Money rules (M5.1)
@@ -165,7 +165,16 @@ Three places read "is this free?" and then write: `create_ride` (the rider has n
 - **The breakdown (`rides.fare_breakdown`, JSONB) stores amounts, not rates**, so a later rule change leaves old rides alone. Kinds: `trip`, `cancellation`, and `legacy` (a data migration marks rides settled before M5.1; invariants and receipts skip them).
 - **Actual distance comes from the driver's pings while the ride is IN_PROGRESS** (there is no location history). Each ping is added to the Redis hash `ride:{ride_id}:trip` (`distance_m`, `lat`, `lng`, `ts`, `pings`, `jumps`; TTL 24 h, never deleted): pings less than `MIN_PING_GAP_S` apart are ignored, a segment faster than `MAX_PLAUSIBLE_SPEED_MS` counts as a jump and adds no distance. Recording never fails a ping (a `RedisError` is logged and swallowed).
 - **The estimated distance is billed when tracking is missing or unreliable** (`no_tracking`, `unreliable_tracking`), because it is the route the rider agreed to. The fare is capped at `FARE_CAP_PERCENT` of the estimate; there is no lower bound.
-- **The cancellation quote and the real cancel call the same function** (`pricing.cancellation_fee`), so they cannot disagree. A driver never causes a fee.
+- **The cancellation quote and the real cancel call the same function** (`pricing.cancellation_fee`), so they cannot disagree. A driver never causes a fee. **Cancellation fees are never surged.**
+
+### Surge rules (M5.2)
+
+- **Multipliers are integer percents** (100 is no surge, 150 is 1.5x), never floats. The only floats are the pricing rule's `surge_cap` and the Redis GEO positions.
+- **A zone is the geohash of the PICKUP at `ZONE_PRECISION` 5** (`utils/geo.geohash_encode`, in-house). Demand = DISTINCT riders with a REQUESTED or NO_DRIVER_FOUND ride created in the last `DEMAND_WINDOW_S` (180 s) in the zone; supply = AVAILABLE drivers (matching's own definition, `get_available_ids`) whose position is in the zone. Pressure = `demand * 100 // max(supply, 1)`; the multiplier comes from the `SURGE_STEPS` table, and below `MIN_DEMAND_FOR_SURGE` (3) there is never surge.
+- **One city-wide snapshot** (`pricing.get_surge_snapshot`) is cached in Redis (`surge:snapshot`, `SURGE_CACHE_TTL_S` 15 s) and stores the UNCAPPED step values. `get_surge_percent` applies the cap from the pricing rule (`max(100, int(surge_cap * 100 + 0.5))`) at lookup time. A TTL of 0 turns the cache off. Surge code uses `datetime.now(timezone.utc)`, never the `time` module.
+- **Redis failure means no surge:** a quote whose snapshot cannot be read or written logs one warning and uses 100. Postgres errors are not caught.
+- **Surge multiplies the whole normal fare after the minimum fare** (`(normal_fare * surge_percent + 50) // 100`, half up). The multiplier is **locked on the ride at request time** (`rides.surge_percent`, with `pickup_zone`; a check constraint keeps it between 100 and 200) and `settle_completed_ride` reuses it, never the current one; the 150 percent cap works on the surged estimate.
+- **The accepted-multiplier rule:** `RideCreate.accepted_surge_percent` (optional, 100 to 200). If present and the current multiplier is higher, `POST /rides` answers 409 "Prices have increased..." and creates nothing; if equal or lower the ride is created at the CURRENT multiplier; if absent the current one is accepted. The check is in `create_ride` after the early active-ride 409 and after `estimate_ride`, and before any lock: **all surge reads happen before any lock is taken.** A rider's own request is not part of their own price.
 
 ## Coding style
 
@@ -225,7 +234,7 @@ REQUESTED → NO_DRIVER_FOUND
 - Call `fetch` through `shared/api.js` (it adds the JWT header). `shared/ws.js` owns the connection (reconnect, backoff, heartbeat, watchdog): pages only pass `onEvent` and `onStatus`, never create a `WebSocket` themselves, and re-fetch their state over REST after a reconnected open. The allowed functions inside `ws.js` are `connect`, `disconnect`, `reconnectNow`, `openSocket`, `sendPing`, and `connectionLost`.
 - On WebSocket reconnect, re-fetch the current ride state from the REST API.
 - The rider and driver pages open one WebSocket when a session starts. Socket handlers only update `state` and call `render()`, or react to an event by calling the page's existing REST refresh (events say "something changed", REST says what). Polling stays as the safety net. The driver marker is moved by `requestAnimationFrame` outside `render()`.
-- Allowed functions besides `act()`: `tickCountdown` in `driver.js` (the offer countdown), `applyDriverLocation` and `animateDriver` in `rider.js`.
+- Allowed functions besides `act()`: `tickCountdown` in `driver.js` (the offer countdown), `applyDriverLocation`, `animateDriver`, and `fetchEstimate` (the estimate call shared by the point selection and a refused request, M5.2) in `rider.js`.
 - Keep HTML semantic and CSS simple. No CSS frameworks.
 
 ## Commands
@@ -285,7 +294,7 @@ Done when: a stress test shows zero double assignments and no stuck rides.
 
 ### Phase 5: Pricing and Payments
 - **M5.1 Final fare:** final fare from tracked distance and actual time with a cap, and cancellation fees
-- **M5.2 Surge pricing:** geohash zones, multiplier from the open-requests-to-available-drivers ratio, with a cap
+- **M5.2 Surge pricing:** geohash zones (precision 5, in-house encoder), a step-table multiplier from unmet demand (distinct riders, 180 s) against available drivers, shown in the estimate, locked on the ride at request time and reused at settlement, capped by the pricing rule's `surge_cap`; `accepted_surge_percent` so a rider is never charged more than they saw; an admin snapshot endpoint
 - **M5.3 Payments:** internal wallet first, then Stripe test mode, with idempotency keys and a webhook handler
 - **M5.4 Money views:** driver earnings, platform commission, rider receipts
 

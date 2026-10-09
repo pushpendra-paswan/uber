@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import redis_client
@@ -11,7 +11,8 @@ TRIP_KEY = "ride:{}:trip"
 
 
 async def create(
-    db: AsyncSession, rider_id: int, data: RideCreate, distance_m: int, duration_s: int, fare_estimate: int
+    db: AsyncSession, rider_id: int, data: RideCreate, distance_m: int, duration_s: int, fare_estimate: int,
+    pickup_zone: str, surge_percent: int,
 ) -> Ride:
     ride = Ride(
         rider_id=rider_id,
@@ -19,7 +20,9 @@ async def create(
         distance_m=distance_m,
         duration_s=duration_s,
         fare_estimate=fare_estimate,
-        **data.model_dump(),
+        pickup_zone=pickup_zone,
+        surge_percent=surge_percent,
+        **data.model_dump(exclude={"accepted_surge_percent"}),
     )
     db.add(ride)
     await db.flush()
@@ -42,6 +45,20 @@ async def get_active_for_rider(db: AsyncSession, rider_id: int) -> Ride | None:
 async def get_active_for_driver(db: AsyncSession, driver_id: int) -> Ride | None:
     result = await db.execute(select(Ride).where(Ride.driver_id == driver_id, Ride.status.in_(ACTIVE_RIDE_STATUSES)))
     return result.scalars().first()
+
+
+async def count_unmet_demand_by_zone(db: AsyncSession, since: datetime) -> dict[str, int]:
+    """{zone: number of DISTINCT riders} with a REQUESTED or NO_DRIVER_FOUND ride created since `since`."""
+    result = await db.execute(
+        select(Ride.pickup_zone, func.count(distinct(Ride.rider_id)))
+        .where(
+            Ride.created_at >= since,
+            Ride.status.in_((RideStatus.REQUESTED, RideStatus.NO_DRIVER_FOUND)),
+            Ride.pickup_zone.is_not(None),
+        )
+        .group_by(Ride.pickup_zone)
+    )
+    return {zone: count for zone, count in result.all()}
 
 
 async def add_event(
