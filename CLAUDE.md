@@ -109,7 +109,9 @@ uber-clone/
 │   ├── driver/                # index.html, driver.js, driver.css
 │   └── admin/                 # index.html, admin.js, admin.css
 └── simulator/
-    ├── simulator.py           # fake drivers (M2.5); a load script is added in M4.1
+    ├── simulator.py           # fake drivers (M2.5)
+    ├── stress.py              # fires simultaneous requests and checks four database invariants (M4.1)
+    ├── invariants.sql         # the four invariants, read-only SQL, run by stress.py or by hand
     └── requirements.txt       # httpx only
 ```
 
@@ -204,6 +206,7 @@ docker compose exec backend alembic upgrade head
 docker compose exec backend alembic revision --autogenerate -m "message"
 docker compose exec backend pytest
 python simulator/simulator.py --drivers 50 --admin-email ... --admin-password ...   # on the host, in a venv with simulator/requirements.txt
+python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...   # M4.1: simultaneous requests + invariant checks; exit 1 = race reproduced (expected until M4.2); --cleanup-only clears it
 ```
 
 ## Milestones
@@ -243,7 +246,7 @@ Done when: a rider picks two points, sees the estimate, requests, and gets match
 Done when: an entire trip completes across two browser windows with live movement and no page refreshes.
 
 ### Phase 4: Concurrency Hardening
-- **M4.1 Reproduce the bug:** fire many simultaneous ride requests at the simulator fleet and observe double assignments
+- **M4.1 Reproduce the bug:** stress tool that fires simultaneous requests and checks four database invariants
 - **M4.2 Fix and compare:** Redis lock (`SET NX PX`) vs Postgres `FOR UPDATE SKIP LOCKED`, and keep the better one
 - **M4.3 Edge cases:** driver disconnects mid-offer, rider cancels during assignment, accept-after-timeout, duplicate accepts, all covered by tests
 

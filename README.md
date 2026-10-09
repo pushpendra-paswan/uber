@@ -162,7 +162,7 @@ POST /rides  ->  REQUESTED, offer to the nearest free driver
 4. Request again and press **Accept**: tab A switches to the ride view and the rider sees the driver and live tracking.
 5. Request again and cancel from the rider tab while the offer is showing: the panel closes with "The rider cancelled the request."
 
-By hand: `curl localhost:8000/drivers/me/offer -H "Authorization: Bearer $DRIVER"`, then `curl -X POST localhost:8000/offers/<id>/accept -H "Authorization: Bearer $DRIVER"` (or `/reject`). Look at the rows with `docker compose exec db psql -U uber -d uber -c 'SELECT id, ride_id, driver_id, status, pickup_distance_m, expires_at FROM ride_offers ORDER BY id DESC LIMIT 10;'`. Run the simulator with the rates above to see many offers answered at once. Known limit until M4: two simultaneous requests can still offer the same free driver two rides.
+By hand: `curl localhost:8000/drivers/me/offer -H "Authorization: Bearer $DRIVER"`, then `curl -X POST localhost:8000/offers/<id>/accept -H "Authorization: Bearer $DRIVER"` (or `/reject`). Look at the rows with `docker compose exec db psql -U uber -d uber -c 'SELECT id, ride_id, driver_id, status, pickup_distance_m, expires_at FROM ride_offers ORDER BY id DESC LIMIT 10;'`. Run the simulator with the rates above to see many offers answered at once. Known limit until M4.2: two simultaneous requests can still offer the same free driver two rides (reproduced and measured by the stress test below).
 
 ### Trip flow (M3.5)
 
@@ -263,6 +263,52 @@ docker compose exec redis redis-cli PUBLISH ws:events:0 '{"user_id": 5, "type": 
 ```
 
 The reply is the number of backend processes listening (1 in dev). Backend code sends events with `repositories/events.publish(user_id, type, data)`. Since M3.3 it is best-effort: if Redis fails it logs one warning and returns 0, and the request that sent the event is not affected.
+
+## Concurrency stress test (M4.1)
+
+`simulator/stress.py` fires many requests at the same instant and then looks in the database for broken invariants. It exists to show a known bug: the offer flow checks "is this driver free?" and writes the offer in separate steps, with no lock in between. **It only reproduces and measures the bug; nothing is fixed until M4.2.** So **exit code 1 ("race reproduced") is the expected result for the default scenarios until M4.2**, and the same commands must give exit code 0 after it.
+
+It runs on the host (same venv as the simulator, `httpx` only), changes state only through the public API, and reads the database with read-only SELECTs through `docker compose exec db psql`, so it needs `docker compose` and access to the `db` service from the repository root. It never calls Nominatim or any OpenStreetMap server. Accounts `stress-driver-NN@sim.example.com` and `stress-rider-NNN@sim.example.com` are created once and reused (nothing deletes them). An admin made with `create_admin.py` is needed.
+
+```bash
+export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --admin-password
+
+# I1 and I2: 20 riders request at once while 3 drivers are free, then every offer is accepted at once.
+# STOP the simulator first: its drivers would receive offers and dilute the test.
+.venv-sim/bin/python simulator/stress.py --scenario drivers --rounds 20
+
+# I3: every rider sends the same request twice at once (also stop the simulator)
+.venv-sim/bin/python simulator/stress.py --scenario riders --rounds 10
+
+# against the running fleet (start it first: simulator.py --drivers 30 --speed-kmh 30 --seed 1); watches 30 s per round
+.venv-sim/bin/python simulator/stress.py --scenario fleet --rounds 5 --riders 20
+
+# control run: one request after another, no race expected, exit code 0
+.venv-sim/bin/python simulator/stress.py --scenario drivers --sequential --rounds 3 --riders 10
+
+# leave the broken state of the last round to look at (psql, curl), then clear it
+.venv-sim/bin/python simulator/stress.py --scenario drivers --rounds 1 --keep-last-round
+.venv-sim/bin/python simulator/stress.py --cleanup-only   # cancels every active ride of the stress riders, takes the stress drivers offline
+```
+
+Other flags: `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url`, `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
+
+**The invariants** (`simulator/invariants.sql`, plain SQL you can also run by hand, one row per offender, an empty section means it holds):
+
+| Name | Meaning |
+|---|---|
+| I1 `driver_pending_offers` | no driver has more than one live PENDING offer |
+| I2 `driver_active_rides` | no driver has more than one ride in DRIVER_ASSIGNED, DRIVER_ARRIVED, or IN_PROGRESS (the real double assignment) |
+| I3 `rider_active_rides` | no rider has more than one ride in REQUESTED, DRIVER_ASSIGNED, DRIVER_ARRIVED, or IN_PROGRESS |
+| I4 `stuck_requested` | no REQUESTED ride without a PENDING offer (expected to hold; the baseline for M4.3) |
+
+```bash
+docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
+```
+
+**Exit codes:** 0 no violation observed, 1 at least one invariant broke (`RACE REPRODUCED: I1 in 4 of 5 rounds, ...`), 2 the tool could not do its job (setup or login failed, the API is unreachable, `INVARIANTS NOT CHECKED: ...` when psql cannot run, the fleet scenario found no fleet or every ride ended NO_DRIVER_FOUND). A clean result is never printed when the check did not run. The snapshots are samples (after the burst, after the accepts, about every second in the fleet scenario), so a violation that disappears before the next snapshot would be missed.
+
+On this machine one default run (20 riders, 3 drivers) broke I1 and I2 in every round (up to 10 offers and 9 active rides on one driver); the numbers are in `PROJECT_CONTEXT.md` under "Baseline for M4.2".
 
 ## Run the tests
 
