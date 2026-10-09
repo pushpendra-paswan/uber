@@ -3,7 +3,8 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy.exc import DBAPIError
+from redis.exceptions import RedisError
+from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import database
@@ -18,7 +19,8 @@ from app.services.drivers import get_me
 from app.services.rides import change_ride_status
 
 OFFER_SWEEP_INTERVAL_SECONDS = 1
-DUE_BATCH_SIZE = 50
+OUTAGE_ERRORS = (RedisError, OperationalError, InterfaceError, OSError)
+PENDING_BATCH_SIZE = 200
 
 # Lock order everywhere: the ride row first, then the offer row. Accept, reject, expiry, and cancel all follow it,
 # so two of them can wait for each other's ride lock but never for each other's offer lock (no deadlock).
@@ -27,6 +29,10 @@ DUE_BATCH_SIZE = 50
 
 # uvicorn's logger, because it is the one that has a handler and prints INFO.
 logger = logging.getLogger("uvicorn.error")
+
+# Offers whose handling failed for a reason of their own (not an outage). Each is logged once, then forgotten when it is
+# no longer pending, so a permanently failing offer does not fill the log every second.
+failed_offer_ids: set[int] = set()
 
 
 async def get_pending(db: AsyncSession, user: User) -> OfferResponse:
@@ -87,10 +93,16 @@ async def accept(db: AsyncSession, user: User, offer_id: int) -> Ride:
     if await drivers_repo.get_presence(driver.id) is None:
         raise HTTPException(status_code=409, detail="You are offline. Go online first.")
 
-    await offers_repo.set_status(db, offer, OfferStatus.ACCEPTED, now)
-    await change_ride_status(db, ride, RideStatus.DRIVER_ASSIGNED, user.id)
-    ride.driver_id = driver.id
-    await db.commit()
+    # The unique index on active rides per driver is the last line of defense behind the lock. Any flush from the first
+    # change to the commit can raise it, and then nothing of this accept is kept.
+    try:
+        await offers_repo.set_status(db, offer, OfferStatus.ACCEPTED, now)
+        await change_ride_status(db, ride, RideStatus.DRIVER_ASSIGNED, user.id)
+        ride.driver_id = driver.id
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="You already have an active ride")
 
     logger.info("Offer %s accepted: ride %s assigned to driver %s", offer.id, ride.id, driver.id)
     await events.publish(ride.rider_id, "ride_updated", {"ride_id": ride.id, "status": ride.status.value})
@@ -144,19 +156,48 @@ async def finish_offer(db: AsyncSession, ride: Ride, offer: RideOffer, new_statu
 
 
 async def expire_due_offers() -> None:
+    """One sweeper pass: closes every PENDING offer that is past its deadline (reason "expired") or whose driver has no
+    presence key any more (reason "driver_offline"). Time wins when both apply."""
     # Own sessions, looked up at call time (tests replace database.async_session): this runs outside any request.
     async with database.async_session() as db:
-        due = await offers_repo.list_due(db, datetime.now(timezone.utc), DUE_BATCH_SIZE)
+        pending = await offers_repo.list_pending(db, PENDING_BATCH_SIZE)
+    failed_offer_ids.intersection_update(row.offer_id for row in pending)
+    if not pending:  # MGET with no keys is an error
+        return
 
-    for offer_id, ride_id in due:
-        # A new session per offer: one failure rolls back only that offer, and locks are held for the shortest time.
-        async with database.async_session() as db:
-            ride = await rides_repo.get_by_id(db, ride_id, for_update=True)
-            offer = await offers_repo.get_by_id(db, offer_id, for_update=True)
-            # Answered or cancelled since the list was read, or (clock aside) not due after all: nothing to do.
-            if offer.status != OfferStatus.PENDING or offer.expires_at > datetime.now(timezone.utc):
-                continue
-            await finish_offer(db, ride, offer, OfferStatus.EXPIRED, "expired")
+    # One call for all of them. A driver is gone when the presence key is gone: they went offline, an admin rejected them
+    # (which removes presence), or they stopped pinging and the key expired. The sweeper does not care which.
+    online_ids = await drivers_repo.get_online_ids(list({row.driver_id for row in pending}))
+    now = datetime.now(timezone.utc)
+
+    for offer_id, ride_id, driver_id, expires_at in pending:
+        if expires_at <= now:
+            reason = "expired"
+        elif driver_id not in online_ids:
+            reason = "driver_offline"
+        else:
+            continue
+
+        try:
+            # A new session per offer: one failure rolls back only that offer, and locks are held for the shortest time.
+            async with database.async_session() as db:
+                ride = await rides_repo.get_by_id(db, ride_id, for_update=True)
+                offer = await offers_repo.get_by_id(db, offer_id, for_update=True)
+                # Answered or cancelled since the list was read: nothing to do.
+                if offer.status != OfferStatus.PENDING:
+                    continue
+                if reason == "expired" and offer.expires_at > datetime.now(timezone.utc):
+                    continue
+                # The driver may have come back since the list was read.
+                if reason == "driver_offline" and await drivers_repo.get_online_ids([driver_id]):
+                    continue
+                await finish_offer(db, ride, offer, OfferStatus.EXPIRED, reason)
+        except OUTAGE_ERRORS:
+            raise  # Redis or Postgres is down: the whole pass stops, sweep_forever logs it once
+        except Exception as error:
+            if offer_id not in failed_offer_ids:
+                failed_offer_ids.add(offer_id)
+                logger.warning("Offer sweeper could not handle offer %s (ride %s): %r", offer_id, ride_id, error)
 
 
 async def sweep_forever() -> None:

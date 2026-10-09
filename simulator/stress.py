@@ -8,8 +8,10 @@ Everything that changes state goes through the public API. The only direct datab
 through `docker compose exec db psql`. It never touches Redis, Nominatim, or OpenStreetMap (only our API and OSRM).
 
 Usage: python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...
-Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulator.py fleet).
-Stop simulator.py for the drivers and riders scenarios: its drivers would join the test.
+Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulator.py fleet), chaos (M4.3: riders and
+drivers acting at random for a while, then a settle period; looks for any invariant violation and for stuck rides).
+Stop simulator.py for the drivers, riders and chaos scenarios: its drivers would join the test.
+Exit codes: 0 no violation (expected for every scenario), 1 a violation, a stuck ride, or a 5xx, 2 the check could not run.
 --api-url takes several comma-separated URLs (two backend processes): requests are spread over them round-robin.
 """
 import argparse
@@ -55,6 +57,9 @@ METERS_PER_DEGREE = 111_320
 ACTIVE_STATUSES = "'REQUESTED', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'IN_PROGRESS'"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 INVARIANTS_FILE = ROOT / "simulator" / "invariants.sql"
+CHAOS_PLACES = 60  # pickup / drop-off pairs, snapped once before the agents start
+CHAOS_STATUS_INTERVAL_S = 10
+FINISHED_STATUSES = ("COMPLETED", "CANCELLED", "NO_DRIVER_FOUND")
 
 # section name in invariants.sql -> (short name, what an offender is, what the count counts, columns of a row)
 INVARIANTS = {
@@ -62,10 +67,14 @@ INVARIANTS = {
     "driver_active_rides": ("I2", "drivers", "rides", ("driver_id", "count", "ride_ids", "statuses")),
     "rider_active_rides": ("I3", "riders", "rides", ("rider_id", "count", "ride_ids", "statuses")),
     "stuck_requested": ("I4", "rides", None, ("ride_id", "created_at")),
+    "overdue_pending_offers": ("I5", "offers", None, ("offer_id", "ride_id", "driver_id", "expires_at")),
+    "orphan_pending_offers": ("I6", "offers", None, ("offer_id", "ride_id", "driver_id", "ride_status")),
+    "assigned_without_accepted_offer": ("I7", "rides", None, ("ride_id", "driver_id", "status")),
 }
 
 log = logging.getLogger("stress")
 status_counts = collections.Counter()  # every HTTP answer of the whole run, by status code
+bodies_5xx = []  # (method, path, status, body) of the first server errors, to print in the summary
 
 
 async def api(
@@ -78,6 +87,8 @@ async def api(
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     response = await client.request(method, path, json=body, headers=headers)
     status_counts[response.status_code] += 1
+    if response.status_code >= 500 and len(bodies_5xx) < 5:
+        bodies_5xx.append((method, path, response.status_code, response.text[:300]))
     return response
 
 
@@ -228,7 +239,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I2 ok, I3 ok, I4 ok' for everything seen in the round so far."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I7 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -241,7 +252,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all four invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all seven invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -251,13 +262,11 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             if row[0] not in offenders:  # the full row is logged once per round
                 log.warning("%s %s offender: %s", code, name, " ".join(f"{column}={value}" for column, value in zip(columns, row)))
             offenders[row[0]] = max(offenders.get(row[0], 0), int(row[1]) if what else 1)
-        if not offenders:
-            parts.append(f"{code} ok")
-        elif what:
+        if what and offenders:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
-        else:
+        elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts)
+    return ", ".join(parts) or "I1-I7 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -482,9 +491,243 @@ async def scenario_fleet(ctx: dict) -> None:
             await cleanup(ctx)
 
 
+async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict, deadline: float) -> None:
+    """One rider until the deadline: requests a ride (sometimes the same request twice at once), cancels a quarter of
+    them after a few seconds, follows the rest to the end (cancelling after 90 s), pauses, and requests again."""
+    client, token, urls = ctx["api"], ctx["tokens"][email], ctx["args"].api_urls
+    ride_id = cancel_at = None
+    cancelled = False
+    while time.monotonic() < deadline:
+        try:
+            if ride_id is None:
+                pickup, dropoff = rng.choice(ctx["places"])
+                body = {
+                    "pickup_lat": pickup[0], "pickup_lng": pickup[1], "pickup_address": "Stress pickup",
+                    "dropoff_lat": dropoff[0], "dropoff_lng": dropoff[1], "dropoff_address": "Stress drop-off",
+                }
+                duplicate = rng.random() < 0.10
+                counters["rides_requested"] += 1
+                answers = await asyncio.gather(
+                    *[api(client, "POST", rng.choice(urls) + "/rides", token, body) for _ in range(2 if duplicate else 1)]
+                )
+                if duplicate:
+                    counters["duplicate_requests"] += 1
+                    counters["duplicates_refused"] += sum(1 for answer in answers if answer.status_code == 409)
+                created = [answer for answer in answers if answer.status_code == 201]
+                if created:
+                    ride_id, cancelled = created[0].json()["id"], False
+                    cancel_at = time.monotonic() + (rng.uniform(0, 10) if rng.random() < 0.25 else 90)
+                    continue
+                # Refused, for example because an earlier request whose answer was lost made a ride: follow that one.
+                active = await api(client, "GET", rng.choice(urls) + "/rides/active", token)
+                if active.status_code == 200:
+                    ride_id, cancelled, cancel_at = active.json()["id"], False, time.monotonic() + 90
+                else:
+                    await asyncio.sleep(rng.uniform(0, 3))
+            else:
+                await asyncio.sleep(2 if cancelled else max(0, min(2, cancel_at - time.monotonic())))
+                if not cancelled and time.monotonic() >= cancel_at:
+                    cancelled = True
+                    answer = await api(client, "POST", rng.choice(urls) + f"/rides/{ride_id}/cancel", token)
+                    counters["rider_cancels"] += 1
+                    counters["rider_cancels_ok"] += answer.status_code == 200
+                active = await api(client, "GET", rng.choice(urls) + "/rides/active", token)
+                if active.status_code == 404:
+                    final = await api(client, "GET", rng.choice(urls) + f"/rides/{ride_id}", token)
+                    counters[f"ride_{final.json().get('status')}"] += final.status_code == 200
+                    ride_id = None
+                    await asyncio.sleep(rng.uniform(0, 3))
+        except httpx.HTTPError:
+            counters["transport_errors"] += 1
+            await asyncio.sleep(1)
+
+
+async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Random, counters: dict, deadline: float) -> None:
+    """One driver until the deadline, a tick every second: pings its location every 3 s, takes the next step of its ride
+    after a short pause (sometimes cancelling instead), and answers an offer at random: accept 50, reject 15, ignore 15,
+    go offline for 2 to 5 s 10, accept twice at the same moment 10 (percent)."""
+    client, token, urls, otp = ctx["api"], ctx["tokens"][email], ctx["args"].api_urls, ctx["args"].otp
+    here = {"lat": location[0], "lng": location[1]}
+    online, offline_until, last_ping = True, 0.0, time.monotonic()
+    plan = None  # (ride id, status, when to act): the step to take on the active ride
+    ignored = set()
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        now = time.monotonic()
+        try:
+            if not online:
+                if now >= offline_until:
+                    online = (await api(client, "POST", rng.choice(urls) + "/drivers/me/online", token, here)).status_code == 200
+                    last_ping = now
+                continue
+            if now - last_ping >= 3:
+                last_ping = now
+                ping = await api(client, "POST", rng.choice(urls) + "/drivers/me/location", token, here)
+                if ping.status_code == 409:  # the presence key is gone (for example Redis was restarted): come back
+                    await api(client, "POST", rng.choice(urls) + "/drivers/me/online", token, here)
+
+            active = await api(client, "GET", rng.choice(urls) + "/rides/active", token)
+            if active.status_code == 200:
+                ride = active.json()
+                if plan is None or plan[:2] != (ride["id"], ride["status"]):
+                    pause = rng.uniform(1, 4) if ride["status"] == "IN_PROGRESS" else rng.uniform(0, 3)
+                    plan = (ride["id"], ride["status"], now + pause)
+                elif now >= plan[2]:
+                    step = f"{rng.choice(urls)}/rides/{ride['id']}"
+                    if ride["status"] != "IN_PROGRESS" and rng.random() < 0.10:
+                        await api(client, "POST", step + "/cancel", token)
+                        counters["driver_cancels"] += 1
+                    elif ride["status"] == "DRIVER_ASSIGNED":
+                        await api(client, "POST", step + "/arrive", token)
+                    elif ride["status"] == "DRIVER_ARRIVED":
+                        await api(client, "POST", step + "/start", token, {"otp": otp})
+                    elif ride["status"] == "IN_PROGRESS":
+                        counters["trips_completed"] += (await api(client, "POST", step + "/complete", token)).status_code == 200
+                continue
+
+            plan = None
+            offer = await api(client, "GET", rng.choice(urls) + "/drivers/me/offer", token)
+            if offer.status_code != 200 or offer.json()["id"] in ignored:
+                continue
+            offer_id = offer.json()["id"]
+            roll = rng.random() * 100
+            if roll < 50:
+                answers = [await api(client, "POST", rng.choice(urls) + f"/offers/{offer_id}/accept", token)]
+            elif roll < 65:
+                counters["rejects"] += (await api(client, "POST", rng.choice(urls) + f"/offers/{offer_id}/reject", token)).status_code == 204
+                answers = []
+            elif roll < 80:
+                ignored.add(offer_id)
+                counters["ignores"] += 1
+                answers = []
+            elif roll < 90:
+                if (await api(client, "POST", rng.choice(urls) + "/drivers/me/offline", token)).status_code == 200:
+                    counters["offline_events"] += 1
+                    online, offline_until = False, now + rng.uniform(2, 5)
+                answers = []
+            else:
+                answers = list(await asyncio.gather(
+                    api(client, "POST", rng.choice(urls) + f"/offers/{offer_id}/accept", token),
+                    api(client, "POST", rng.choice(urls) + f"/offers/{offer_id}/accept", token),
+                ))
+                counters["double_accepts"] += 1
+                counters["double_accepts_one_200"] += sorted(answer.status_code for answer in answers).count(200) == 1
+            counters["accepts_won"] += sum(1 for answer in answers if answer.status_code == 200)
+            counters["accepts_refused"] += sum(1 for answer in answers if answer.status_code != 200)
+        except httpx.HTTPError:
+            counters["transport_errors"] += 1
+
+    # The deadline: a trip still in progress is finished, because a driver in the middle of a trip cannot be cleaned up.
+    try:
+        active = await api(client, "GET", urls[0] + "/rides/active", token)
+        if active.status_code == 200 and active.json()["status"] == "IN_PROGRESS":
+            counters["trips_completed"] += (await api(client, "POST", urls[0] + f"/rides/{active.json()['id']}/complete", token)).status_code == 200
+    except httpx.HTTPError:
+        counters["transport_errors"] += 1
+
+
+async def scenario_chaos(ctx: dict) -> None:
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I7 every 2 s. Then the agents stop and
+    the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
+    Rides legitimately left assigned, arrived, or in progress are not stuck."""
+    args = ctx["args"]
+    ctx["driver_emails"] = [DRIVER_EMAIL.format(n=n) for n in range(1, args.drivers + 1)]
+    started = time.monotonic()
+    await asyncio.gather(
+        *[setup_accounts(ctx, "driver", n) for n in range(1, args.drivers + 1)],
+        *[setup_accounts(ctx, "rider", n) for n in range(1, args.riders + 1)],
+    )
+    log.info("setup of %d drivers and %d riders took %.1f s", args.drivers, args.riders, time.monotonic() - started)
+    await cleanup(ctx)
+
+    seen = {}
+    ctx["rounds"].append(seen)
+    locations = {}
+    pings = []
+    for email in ctx["driver_emails"]:
+        locations[email] = await snap(ctx, 0, DRIVER_DISC_M, on_road=False)
+        body = {"lat": locations[email][0], "lng": locations[email][1]}
+        pings.append(api(ctx["api"], "POST", "/drivers/me/online", ctx["tokens"][email], body))
+    for answer in await asyncio.gather(*pings):
+        if answer.status_code != 200:
+            raise RuntimeError(f"a stress driver could not go online: {answer.status_code} {answer.text}")
+    ctx["places"] = [(await snap(ctx, 0, args.spread_m), await snap(ctx, DROPOFF_MIN_M, DROPOFF_MAX_M)) for _ in range(CHAOS_PLACES)]
+
+    since = (await sql(ctx, "SELECT now()"))[0]
+    mine = f"r.created_at >= '{since}' AND r.rider_id IN (SELECT id FROM users WHERE email LIKE '{RIDER_LIKE}')"
+    counters = ctx["counters"]
+    seed = args.seed if args.seed is not None else random.randrange(1_000_000)
+    log.info("chaos: %d riders and %d drivers for %d s (then up to %d s to settle), agent seed %d",
+             args.riders, args.drivers, args.chaos_seconds, args.settle_seconds, seed)
+    start = time.monotonic()
+    deadline = start + args.chaos_seconds
+    agents = [
+        asyncio.create_task(chaos_rider(ctx, RIDER_EMAIL.format(n=n), random.Random(f"{seed}-rider-{n}"), counters, deadline))
+        for n in range(1, args.riders + 1)
+    ] + [
+        asyncio.create_task(chaos_driver(ctx, email, locations[email], random.Random(f"{seed}-driver-{n}"), counters, deadline))
+        for n, email in enumerate(ctx["driver_emails"], 1)
+    ]
+    settle_deadline = None
+    next_status = start + CHAOS_STATUS_INTERVAL_S
+    try:
+        while True:
+            await check_invariants(ctx, seen)
+            rows = await sql(
+                ctx,
+                f"SELECT 'ride', r.status, count(*) FROM rides r WHERE {mine} GROUP BY r.status UNION ALL "
+                f"SELECT 'offer', o.status, count(*) FROM ride_offers o JOIN rides r ON r.id = o.ride_id WHERE {mine} GROUP BY o.status",
+            )
+            ctx["chaos"] = {"ride": {}, "offer": {}}
+            for row in rows:
+                kind, status, number = row.split("|")
+                ctx["chaos"][kind][status] = int(number)
+            now = time.monotonic()
+            if now >= next_status:
+                next_status += CHAOS_STATUS_INTERVAL_S
+                sent = sum(status_counts.values()) + counters["transport_errors"]
+                server_errors = sum(number for code, number in status_counts.items() if isinstance(code, int) and code >= 500)
+                log.info("chaos %3.0f s: %d requests, rides %s, offers %s, 409 x%d, 5xx %d, violations %d", now - start, sent,
+                         dict(sorted(ctx["chaos"]["ride"].items())), dict(sorted(ctx["chaos"]["offer"].items())),
+                         status_counts[409], server_errors, sum(len(offenders) for offenders in seen.values()))
+            if all(agent.done() for agent in agents):
+                settle_deadline = settle_deadline or now + args.settle_seconds
+                if ctx["chaos"]["ride"].get("REQUESTED", 0) + ctx["chaos"]["offer"].get("PENDING", 0) == 0 or now >= settle_deadline:
+                    break
+            await asyncio.sleep(1)
+    finally:
+        for agent in agents:
+            agent.cancel()  # only does something when the run is interrupted
+    for agent in agents:
+        if agent.exception() is not None:
+            raise RuntimeError(f"a chaos agent crashed: {agent.exception()!r}")
+
+    # What is left after the settle period.
+    rows = await sql(
+        ctx,
+        "SELECT r.id, r.status, o.id, o.driver_id, o.status, o.expires_at FROM rides r LEFT JOIN ride_offers o ON o.ride_id = r.id "
+        f"WHERE {mine} AND (r.status = 'REQUESTED' OR EXISTS (SELECT 1 FROM ride_offers p WHERE p.ride_id = r.id AND p.status = 'PENDING')) "
+        "ORDER BY r.id, o.id",
+    )
+    for row in rows:
+        ride_id, ride_status, offer_id, driver_id, offer_status, expires_at = row.split("|")
+        ctx["stuck"].setdefault(ride_id, {"status": ride_status, "offers": []})
+        ctx["stuck"][ride_id]["offers"].append(f"offer {offer_id} driver {driver_id} {offer_status} expires {expires_at}")
+    for ride_id, stuck in ctx["stuck"].items():
+        log.error("STUCK ride %s (%s): %s", ride_id, stuck["status"], "; ".join(stuck["offers"]) or "no offers")
+    ctx["left_active"] = sum(ctx["chaos"]["ride"].get(status, 0) for status in ("DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS"))
+    other = await sql(
+        ctx,
+        f"SELECT count(*) FROM ride_offers o JOIN rides r ON r.id = o.ride_id JOIN drivers d ON d.id = o.driver_id JOIN users u ON u.id = d.user_id "
+        f"WHERE {mine} AND u.email NOT LIKE '{DRIVER_LIKE}'",
+    )
+    if other[0] != "0":
+        log.warning("%s offers went to drivers that are not stress drivers: other drivers are online, the run is diluted", other[0])
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Concurrency stress test: fires simultaneous requests and checks database invariants")
-    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet"], default="drivers")
+    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos"], default="drivers")
     parser.add_argument("--admin-email", default=os.environ.get("SIM_ADMIN_EMAIL"), help="or env SIM_ADMIN_EMAIL")
     parser.add_argument("--admin-password", default=os.environ.get("SIM_ADMIN_PASSWORD"), help="or env SIM_ADMIN_PASSWORD")
     parser.add_argument("--api-url", default="http://127.0.0.1:8000", help="one URL, or several separated by commas (two backend processes)")
@@ -492,12 +735,16 @@ async def main() -> int:
     parser.add_argument("--center-lat", type=float, help="default: the city center")
     parser.add_argument("--center-lng", type=float, help="default: the city center")
     parser.add_argument("--rounds", type=int, default=5, help="1 to 50")
-    parser.add_argument("--riders", type=int, default=20, help="2 to 100")
-    parser.add_argument("--drivers", type=int, help="1 to 100; default 3 (drivers), 2 x riders (riders), unused (fleet)")
+    parser.add_argument("--riders", type=int, help="2 to 100; default 20 (30 for chaos)")
+    parser.add_argument("--drivers", type=int, help="1 to 100; default 3 (drivers), 2 x riders (riders), 10 (chaos), unused (fleet)")
     parser.add_argument("--repeat", type=int, default=2, help="riders scenario: the same request this many times at once, 2 to 5")
     parser.add_argument("--spread-m", type=float, default=150, help="pickups are this far from the center at most")
     parser.add_argument("--watch-seconds", type=float, default=30, help="fleet scenario: how long to watch after the burst")
-    parser.add_argument("--seed", type=int, help="makes the random points repeatable")
+    parser.add_argument("--chaos-seconds", type=int, default=60, help="chaos scenario: how long the agents act, 10 to 600")
+    parser.add_argument("--settle-seconds", type=int, default=45, help="chaos scenario: how long the system gets to finish after the agents stop, 30 to 300")
+    parser.add_argument("--tolerate-5xx", action="store_true", help="chaos scenario: count 5xx answers and report them, but they do not decide the exit code")
+    parser.add_argument("--otp", default="1234", help="chaos scenario: the trip code sent to start a trip (the backend's fake code is 1234)")
+    parser.add_argument("--seed", type=int, help="makes the random points (and the chaos agents' choices) repeatable")
     parser.add_argument("--sequential", action="store_true", help="control run: one request after another, no race expected")
     parser.add_argument("--keep-last-round", action="store_true", help="skip the cleanup after the last round")
     parser.add_argument("--cleanup-only", action="store_true", help="only cancel the stress riders' rides and take the stress drivers offline")
@@ -521,10 +768,16 @@ async def main() -> int:
                      "The admin must already exist (backend/create_admin.py).")
     if not 1 <= args.rounds <= 50:
         parser.error("--rounds must be between 1 and 50")
+    if args.riders is None:
+        args.riders = 30 if args.scenario == "chaos" else 20
     if not 2 <= args.riders <= 100:
         parser.error("--riders must be between 2 and 100")
     if args.drivers is None:
-        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0}[args.scenario]
+        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10}[args.scenario]
+    if not 10 <= args.chaos_seconds <= 600:
+        parser.error("--chaos-seconds must be between 10 and 600")
+    if not 30 <= args.settle_seconds <= 300:
+        parser.error("--settle-seconds must be between 30 and 300")
     if args.scenario != "fleet" and not 1 <= args.drivers <= 100:
         parser.error("--drivers must be between 1 and 100")
     if not 2 <= args.repeat <= 5:
@@ -541,17 +794,19 @@ async def main() -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # it logs every request at INFO
     log.info(
         "settings: scenario=%s rounds=%d riders=%d drivers=%s repeat=%s spread=%g m watch=%g s sequential=%s keep_last_round=%s "
-        "cleanup_only=%s seed=%s api=%s osrm=%s psql=%s/%s label=%s",
+        "cleanup_only=%s seed=%s chaos=%s api=%s osrm=%s psql=%s/%s label=%s",
         args.scenario, args.rounds, args.riders, args.drivers if args.scenario != "fleet" else "n/a",
         args.repeat if args.scenario == "riders" else "n/a", args.spread_m, args.watch_seconds, args.sequential,
-        args.keep_last_round, args.cleanup_only, args.seed, ",".join(args.api_urls), args.osrm_url, args.psql_user, args.psql_db,
-        args.label or "-",
+        args.keep_last_round, args.cleanup_only, args.seed,
+        f"{args.chaos_seconds} s + settle {args.settle_seconds} s, tolerate_5xx={args.tolerate_5xx}, otp={args.otp}" if args.scenario == "chaos" else "n/a",
+        ",".join(args.api_urls), args.osrm_url, args.psql_user, args.psql_db, args.label or "-",
     )
 
     ctx = {
         "args": args, "rng": random.Random(args.seed), "sem": asyncio.Semaphore(SETUP_CONCURRENCY), "tokens": {},
         "driver_emails": [], "rounds": [], "checks": 0, "latencies": {}, "per_rider": {}, "fleet": {"rides": 0, "no_driver": 0},
         "finished": False, "unsettled": False, "offers": {"got": 0, "expected": 0, "lost_rounds": 0},
+        "counters": collections.Counter(), "stuck": {}, "chaos": {"ride": {}, "offer": {}}, "left_active": 0,
     }
     failure = None
     interrupted = False
@@ -591,7 +846,7 @@ async def main() -> int:
                     raise RuntimeError(f"the center {ctx['center']} is outside the city bounds (south, west, north, east) = {ctx['bounds']}")
                 log.info("city %s, center %.5f,%.5f", city["city_name"], *ctx["center"])
 
-                scenario = {"drivers": scenario_drivers, "riders": scenario_riders, "fleet": scenario_fleet}[args.scenario]
+                scenario = {"drivers": scenario_drivers, "riders": scenario_riders, "fleet": scenario_fleet, "chaos": scenario_chaos}[args.scenario]
                 task = asyncio.create_task(scenario(ctx))
                 try:
                     asyncio.get_running_loop().add_signal_handler(signal.SIGINT, task.cancel)
@@ -629,7 +884,7 @@ async def main() -> int:
 
     rounds_run = len(ctx["rounds"])
     log.info("summary%s: scenario=%s, %d of %d rounds run%s, %d invariant checks, %d API process(es)",
-             f" [{args.label}]" if args.label else "", args.scenario, rounds_run, args.rounds,
+             f" [{args.label}]" if args.label else "", args.scenario, rounds_run, 1 if args.scenario == "chaos" else args.rounds,
              " (interrupted)" if interrupted else "", ctx["checks"], len(args.api_urls))
     violated = []
     for name, (code, who, what, _) in INVARIANTS.items():
@@ -653,6 +908,48 @@ async def main() -> int:
             f"{n:03d}:{c[201]}/{c[409]}/{sum(c.values()) - c[201] - c[409]}" for n, c in sorted(ctx["per_rider"].items())))
     if args.scenario == "fleet" and ctx["fleet"]["rides"]:
         log.info("  fleet rides: %d, of them NO_DRIVER_FOUND: %d", ctx["fleet"]["rides"], ctx["fleet"]["no_driver"])
+
+    if args.scenario == "chaos" and not failure:
+        counters = ctx["counters"]
+        server_errors = sum(number for code, number in status_counts.items() if isinstance(code, int) and code >= 500)
+        log.info("  actions: %d rides requested; %d cancels by riders (%d accepted) and %d by drivers; %d duplicate ride requests "
+                 "(%d answers were 409); %d trips completed", counters["rides_requested"], counters["rider_cancels"],
+                 counters["rider_cancels_ok"], counters["driver_cancels"], counters["duplicate_requests"],
+                 counters["duplicates_refused"], counters["trips_completed"])
+        log.info("  offers answered: %d accepts won, %d accepts refused, %d double accepts (%d returned exactly one 200), %d rejects, "
+                 "%d ignored, %d drivers went offline", counters["accepts_won"], counters["accepts_refused"], counters["double_accepts"],
+                 counters["double_accepts_one_200"], counters["rejects"], counters["ignores"], counters["offline_events"])
+        log.info("  riders saw their rides end as: %s", dict(sorted((k[5:], v) for k, v in counters.items() if k.startswith("ride_"))))
+        log.info("  final rides by status: %s", dict(sorted(ctx["chaos"]["ride"].items())))
+        log.info("  final offers by status: %s", dict(sorted(ctx["chaos"]["offer"].items())))
+        log.info("  5xx answers: %d, connection errors: %d%s", server_errors, counters["transport_errors"],
+                 " (tolerated)" if args.tolerate_5xx else "")
+        for method, path, status, body in bodies_5xx:
+            log.info("    first 5xx: %s %s -> %d %s", method, path, status, body)
+        log.info("  violations per invariant (offenders seen): %s", ", ".join(
+            f"{code} {len(ctx['rounds'][0].get(name, {}))}" for name, (code, *_rest) in INVARIANTS.items()))
+        log.info("  stuck rides after %d s of settling: %d; rides legitimately left active (assigned, arrived, in progress): %d",
+                 args.settle_seconds, len(ctx["stuck"]), ctx["left_active"])
+        for what, label in (("duplicate_requests", "duplicate ride request"), ("rider_cancels_ok", "rider cancel"), ("driver_cancels", "driver cancel"),
+                            ("trips_completed", "completed trip"), ("offline_events", "driver going offline"), ("double_accepts", "double accept"),
+                            ("rejects", "reject"), ("ignores", "ignored offer")):
+            if not counters[what]:
+                log.warning("  no %s happened in this run: it proves nothing about that case", label)
+        problems = [f"{code} in {len(ctx['rounds'][0][name])} offenders" for name, (code, *_rest) in INVARIANTS.items() if ctx["rounds"][0].get(name)]
+        if ctx["stuck"]:
+            problems.append(f"{len(ctx['stuck'])} stuck rides")
+        if server_errors and not args.tolerate_5xx:
+            problems.append(f"{server_errors} server errors (5xx)")
+        if counters["transport_errors"] and not args.tolerate_5xx:
+            problems.append(f"{counters['transport_errors']} connection errors")
+        if ctx["checks"] == 0:
+            log.error("INVARIANTS NOT CHECKED: no snapshot was taken")
+            return 2
+        if problems:
+            log.info("CHAOS FOUND PROBLEMS: %s", ", ".join(problems))
+            return 1
+        log.info("CHAOS CLEAN")
+        return 0
 
     if failure:
         log.error("%s", problem)

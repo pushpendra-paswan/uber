@@ -103,6 +103,18 @@ class Vehicle(Base):
 
 class Ride(Base):
     __tablename__ = "rides"
+    __table_args__ = (
+        # Safety net behind the row locks: even if a lock is missed, the database refuses a second active ride.
+        # The conditions match the stored enum values (upper-case names, plain strings).
+        Index(
+            "uq_rides_one_active_per_driver", "driver_id", unique=True,
+            postgresql_where=text("status IN ('DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'IN_PROGRESS')"),
+        ),
+        Index(
+            "uq_rides_one_active_per_rider", "rider_id", unique=True,
+            postgresql_where=text("status IN ('REQUESTED', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'IN_PROGRESS')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     rider_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
@@ -147,7 +159,10 @@ class RideOffer(Base):
         UniqueConstraint("ride_id", "driver_id", name="uq_ride_offers_ride_id_driver_id"),
         # A ride has at most one open offer at a time. The condition matches the stored enum value.
         Index("uq_ride_offers_one_pending_per_ride", "ride_id", unique=True, postgresql_where=text("status = 'PENDING'")),
-        # The sweeper's query: PENDING offers whose deadline has passed.
+        # A driver has at most one open offer at a time. It counts an offer past its deadline that the sweeper has not
+        # handled yet, because now() cannot appear in an index condition; availability counts it too.
+        Index("uq_ride_offers_one_pending_per_driver", "driver_id", unique=True, postgresql_where=text("status = 'PENDING'")),
+        # The sweeper's query: PENDING offers, oldest deadline first.
         Index("ix_ride_offers_status_expires_at", "status", "expires_at"),
     )
 

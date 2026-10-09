@@ -123,7 +123,8 @@ async def get_available_ids(db: AsyncSession, driver_ids: list[int]) -> set[int]
     if not driver_ids:
         return set()
     has_active_ride = exists().where(Ride.driver_id == Driver.id, Ride.status.in_(ACTIVE_RIDE_STATUSES))
-    # A driver deciding on an offer is busy.
+    # A driver deciding on an offer is busy. ANY pending offer counts, even one past its deadline that the sweeper has not
+    # handled yet: that is what uq_ride_offers_one_pending_per_driver forbids a second one next to.
     has_pending_offer = exists().where(RideOffer.driver_id == Driver.id, RideOffer.status == OfferStatus.PENDING)
     result = await db.execute(
         select(Driver.id).where(

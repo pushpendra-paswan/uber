@@ -19,7 +19,11 @@ const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const POLL_MS = 3000;
 const COUNTDOWN_MS = 250;
 // Shown when an offer closes without the driver answering it. Accepted and rejected need no message.
-const CLOSED_NOTICE = { expired: "The offer expired.", ride_cancelled: "The rider cancelled the request." };
+const CLOSED_NOTICE = {
+  expired: "The offer expired.",
+  ride_cancelled: "The rider cancelled the request.",
+  driver_offline: "The offer was withdrawn because you went offline.",
+};
 const CLOSE_REPLACED = 4409; // ws.js reports it as "closed": this account has too many tabs
 const STILL_ARRIVE = "New offers still arrive within a few seconds.";
 const LIVE_TEXT = {

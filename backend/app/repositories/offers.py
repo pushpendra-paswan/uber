@@ -54,10 +54,11 @@ async def get_oldest_pending_for_driver(db: AsyncSession, driver_id: int, now: d
     return result.scalar_one_or_none()
 
 
-async def list_due(db: AsyncSession, now: datetime, limit: int) -> list[Row]:
+async def list_pending(db: AsyncSession, limit: int) -> list[Row]:
+    # Every PENDING offer, not only the late ones: the sweeper also withdraws the offers of drivers who are gone.
     result = await db.execute(
-        select(RideOffer.id, RideOffer.ride_id)
-        .where(RideOffer.status == OfferStatus.PENDING, RideOffer.expires_at <= now)
+        select(RideOffer.id.label("offer_id"), RideOffer.ride_id, RideOffer.driver_id, RideOffer.expires_at)
+        .where(RideOffer.status == OfferStatus.PENDING)
         .order_by(RideOffer.expires_at)
         .limit(limit)
     )

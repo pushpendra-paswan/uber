@@ -3,7 +3,7 @@ import secrets
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -94,18 +94,23 @@ async def create_ride(db: AsyncSession, rider: User, data: RideCreate) -> Ride:
     if await rides_repo.get_active_for_rider(db, rider.id) is not None:
         raise HTTPException(status_code=409, detail="You already have an active ride")
 
-    # Not routed through change_ride_status: there is no previous status.
-    ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])
-    await rides_repo.add_event(db, ride.id, None, RideStatus.REQUESTED, rider.id)
+    # The unique indexes on active rides are the last line of defense behind the lock: if one fires, the whole request is undone.
+    try:
+        # Not routed through change_ride_status: there is no previous status.
+        ride = await rides_repo.create(db, rider.id, data, estimate["distance_m"], estimate["duration_s"], estimate["fare_estimate"])
+        await rides_repo.add_event(db, ride.id, None, RideStatus.REQUESTED, rider.id)
 
-    # The first offer is made in the same transaction, so a Redis or OSRM failure leaves no half-created ride.
-    # The system makes these changes, so the actor is null. The ride stays REQUESTED while offers are being tried.
-    offer = await matching.offer_to_next_driver(db, ride)
-    if offer is None:
-        await change_ride_status(db, ride, RideStatus.NO_DRIVER_FOUND, actor_user_id=None)
-    else:
-        driver_user_id = await drivers_repo.get_user_id(db, offer.driver_id)
-    await db.commit()
+        # The first offer is made in the same transaction, so a Redis or OSRM failure leaves no half-created ride.
+        # The system makes these changes, so the actor is null. The ride stays REQUESTED while offers are being tried.
+        offer = await matching.offer_to_next_driver(db, ride)
+        if offer is None:
+            await change_ride_status(db, ride, RideStatus.NO_DRIVER_FOUND, actor_user_id=None)
+        else:
+            driver_user_id = await drivers_repo.get_user_id(db, offer.driver_id)
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="You already have an active ride")
 
     if offer is not None:
         logger.info("Offer %s created: ride %s to driver %s (%s m away)", offer.id, ride.id, offer.driver_id, offer.pickup_distance_m)

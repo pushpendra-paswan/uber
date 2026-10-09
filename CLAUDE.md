@@ -110,8 +110,8 @@ uber-clone/
 │   └── admin/                 # index.html, admin.js, admin.css
 └── simulator/
     ├── simulator.py           # fake drivers (M2.5)
-    ├── stress.py              # fires simultaneous requests and checks four database invariants (M4.1)
-    ├── invariants.sql         # the four invariants, read-only SQL, run by stress.py or by hand
+    ├── stress.py              # fires simultaneous requests and checks seven database invariants; scenarios drivers, riders, fleet (M4.1) and chaos (M4.3)
+    ├── invariants.sql         # the seven invariants I1 to I7, read-only SQL, run by stress.py or by hand
     └── requirements.txt       # httpx only
 ```
 
@@ -147,6 +147,14 @@ Three places read "is this free?" and then write: `create_ride` (the rider has n
 - **Lock order.** Blocking locks are taken only as: ride row, offer row, driver row (accept); or the rider's user row and nothing else that blocks (create_ride). Every lock taken while another is held in matching is non-blocking (`SKIP LOCKED`), so no cycle can form.
 - **Offers skip busy drivers, riders and accepts wait.** If a candidate's row is locked, matching moves on to the next candidate: someone else is deciding about that driver right now, and waiting would line up the whole city behind one driver. `users.lock` and `drivers.lock` wait at most `database.LOCK_WAIT_MS` (3000 ms, `SET LOCAL lock_timeout`) and the service answers 503 `Busy, please retry` (it catches only SQLSTATE 55P03, nothing broader).
 - **Tests widen the race window with `widen()`** in `tests/conftest.py` (a repository function sleeps after computing its result), never with a sleep in production code. A new lock needs a test that fails without it.
+
+**Safety net (M4.3).** The locks prevent wasted work; three partial unique indexes make the bad states impossible even if a lock is ever missed: `uq_ride_offers_one_pending_per_driver` (one PENDING offer per driver), `uq_rides_one_active_per_driver` (DRIVER_ASSIGNED, DRIVER_ARRIVED, IN_PROGRESS), `uq_rides_one_active_per_rider` (REQUESTED and those three). They are declared in `models.py` with `postgresql_where`, written to match the stored enum values (upper-case names). The pending-offer index counts an offer past its deadline that the sweeper has not handled yet (`now()` cannot be in an index condition), so `get_available_ids` excludes a driver with ANY pending offer.
+
+- **`IntegrityError` is caught narrowly, only at the three places that can hit an index**, and never becomes a 500: `create_ride` wraps the ride creation through the commit (rollback, 409 "You already have an active ride"); `matching.offer_to_next_driver` wraps the offer insert in a savepoint (`async with db.begin_nested():`), catches the error outside it, logs WARNING `offer skipped for driver <id>: <error text>` and moves to the next candidate; `accept` wraps everything from the first change through the commit (rollback, 409). The warning means a lock failed; with the locks working it never fires. Any new code that reads availability or an active-ride count and then writes gets the lock AND handles the index it can hit.
+- **The sweeper withdraws offers of vanished drivers.** `expire_due_offers` reads all PENDING offers (`offers_repo.list_pending(db, limit)`), does ONE `drivers.get_online_ids` call (never with an empty list), and closes an offer when its deadline has passed (reason `expired`) or else when its driver has no presence key (reason `driver_offline`: offline, rejected by an admin, or the page died; time wins when both apply). Each offer is handled in a new session that locks the ride, then the offer, and re-checks that it is still pending and still due. A failing offer is logged once per offer id and the pass goes on; outage errors (`RedisError`, `OSError`, `InterfaceError`, `OperationalError`) abort the pass.
+- **`offer_closed` reasons:** accepted, rejected, expired, ride_cancelled, driver_offline. Nothing may assume a fixed list of three.
+- **Invariants I1 to I7** (`simulator/invariants.sql`, checked by every `simulator/stress.py` scenario): I1 one live pending offer per driver, I2 one active ride per driver, I3 one active ride per rider, I4 no REQUESTED ride without a PENDING offer, I5 no PENDING offer more than 10 s overdue, I6 no PENDING offer on a ride that is not REQUESTED, I7 every assigned, arrived, or in-progress ride has an ACCEPTED offer for its own driver. None can be legitimately violated even for an instant, so any sighting counts. The `chaos` scenario (random riders and drivers, a settle period, STUCK = a REQUESTED ride or PENDING offer left after it) must end `CHAOS CLEAN`; every scenario is expected to exit 0.
+- **Tests that need the forbidden state** (two pending offers for one driver, two active rides for one rider) cannot insert it any more: reach the code another way, or use the `locks_disabled` fixture to prove what the indexes alone do.
 
 ## Coding style
 
@@ -218,7 +226,7 @@ docker compose exec backend alembic upgrade head
 docker compose exec backend alembic revision --autogenerate -m "message"
 docker compose exec backend pytest
 python simulator/simulator.py --drivers 50 --admin-email ... --admin-password ...   # on the host, in a venv with simulator/requirements.txt
-python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...   # M4.1/M4.2: simultaneous requests + invariant checks; exit 0 = no violation (expected), exit 1 = an invariant broke; --api-url takes two comma-separated URLs; --cleanup-only clears it
+python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...   # M4.1/M4.2: simultaneous requests + invariant checks; exit 0 = no violation (expected for every scenario, chaos included: --scenario chaos), exit 1 = an invariant broke or a ride is stuck; --api-url takes two comma-separated URLs; --cleanup-only clears it
 ```
 
 ## Milestones
@@ -260,7 +268,7 @@ Done when: an entire trip completes across two browser windows with live movemen
 ### Phase 4: Concurrency Hardening
 - **M4.1 Reproduce the bug:** stress tool that fires simultaneous requests and checks four database invariants
 - **M4.2 Fix and compare:** Redis lock (`SET NX PX`) vs Postgres `FOR UPDATE SKIP LOCKED`, and keep the better one
-- **M4.3 Edge cases:** driver disconnects mid-offer, rider cancels during assignment, accept-after-timeout, duplicate accepts, all covered by tests
+- **M4.3 Edge cases:** partial unique indexes as a safety net behind the locks (IntegrityError becomes a 409 or a skipped candidate), the sweeper withdraws the offers of vanished drivers and isolates failing offers, cancel/expiry/reject/accept races, duplicate accepts and accept-after-timeout covered by tests, and a chaos stress scenario that finds no stuck ride and no invariant violation
 
 Done when: a stress test shows zero double assignments and no stuck rides.
 

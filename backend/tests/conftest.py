@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import contextlib
 import os
 import time
@@ -24,6 +25,8 @@ from app.config import settings  # noqa: E402
 from app.database import Base, get_db, redis_client  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Driver, PricingRule, Ride, RideStatus, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
+from app.repositories import drivers as drivers_repo  # noqa: E402
+from app.repositories import users as users_repo  # noqa: E402
 from app.routers import websocket as websocket_router  # noqa: E402
 from app.security import create_access_token  # noqa: E402
 from app.services import routing  # noqa: E402
@@ -108,6 +111,29 @@ def widen(monkeypatch, module, name: str, seconds: float, first_call_only: bool 
         return result
 
     monkeypatch.setattr(module, name, slow)
+
+
+@pytest.fixture
+def locks_disabled(monkeypatch):
+    """Turns the three row locks of M4.2 into nothing: they never block, never skip a driver, and never fail. What is left
+    is the unique indexes of M4.3 (the safety net). Returns how often each lock function was called, so a test can check
+    that the code under test really went through the place where the lock would be."""
+    calls = collections.Counter()
+
+    async def lock_user(db, user_id):
+        calls["users.lock"] += 1
+
+    async def lock_driver(db, driver_id):
+        calls["drivers.lock"] += 1
+
+    async def try_lock_driver(db, driver_id):
+        calls["drivers.try_lock"] += 1
+        return True
+
+    monkeypatch.setattr(users_repo, "lock", lock_user)
+    monkeypatch.setattr(drivers_repo, "lock", lock_driver)
+    monkeypatch.setattr(drivers_repo, "try_lock", try_lock_driver)
+    return calls
 
 
 @pytest_asyncio.fixture

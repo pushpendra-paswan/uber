@@ -1,5 +1,7 @@
+import logging
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Ride, RideOffer
@@ -10,6 +12,9 @@ SEARCH_RADIUS_M = 3000
 MAX_CANDIDATES = 50
 OFFER_TIMEOUT_SECONDS = 15
 MAX_OFFERS_PER_RIDE = 5
+
+# uvicorn's logger, because it is the one that has a handler and prints WARNING.
+logger = logging.getLogger("uvicorn.error")
 
 
 async def offer_to_next_driver(db: AsyncSession, ride: Ride) -> RideOffer | None:
@@ -52,5 +57,12 @@ async def offer_to_next_driver(db: AsyncSession, ride: Ride) -> RideOffer | None
             continue
 
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=OFFER_TIMEOUT_SECONDS)
-        return await offers_repo.create(db, ride.id, driver_id, round(distance_m), expires_at)
+        # The unique index on pending offers per driver is the last line of defense. With the lock working it never fires,
+        # so a warning here means a lock failed. The savepoint undoes only the insert: the transaction, and the locks and
+        # rows of the request, stay valid and matching moves on to the next candidate.
+        try:
+            async with db.begin_nested():
+                return await offers_repo.create(db, ride.id, driver_id, round(distance_m), expires_at)
+        except IntegrityError as error:
+            logger.warning("offer skipped for driver %s: %s", driver_id, error.orig)
     return None

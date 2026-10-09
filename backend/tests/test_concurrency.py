@@ -1,7 +1,6 @@
 import asyncio
 import collections
 import time
-from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -14,7 +13,7 @@ from app.repositories import drivers as drivers_repo
 from app.repositories import offers as offers_repo
 from app.repositories import rides as rides_repo
 from conftest import widen
-from test_matching import offers_of, online_at  # noqa: F401  (online_at is a fixture)
+from test_matching import offers_of, online_at, request_ride  # noqa: F401  (the last two are fixtures)
 from test_rides import RIDE_BODY
 
 
@@ -133,32 +132,22 @@ async def test_one_rider_sending_four_requests_gets_one_ride(client, db, rider, 
     assert active == 1
 
 
-async def test_two_offers_of_one_driver_accepted_at_once_assign_one_ride(
-    client, db, driver, make_user, insert_ride, put_online, monkeypatch
-):
-    await put_online(driver, RIDE_BODY["pickup_lat"], RIDE_BODY["pickup_lng"])
-    rides = [await insert_ride(await make_user("rider"), RideStatus.REQUESTED) for _ in range(2)]
-    offer_ids = []
-    for ride in rides:
-        offer = RideOffer(
-            ride_id=ride.id, driver_id=driver["driver"].id, status=OfferStatus.PENDING, pickup_distance_m=100,
-            expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
-        )
-        db.add(offer)
-        await db.flush()
-        offer_ids.append(offer.id)
-    await db.commit()
+async def test_one_offer_accepted_twice_at_once_assigns_one_ride(client, db, rider, online_at, request_ride, monkeypatch):
+    """Since M4.3 a driver cannot hold two pending offers (unique index), so the old setup of this test, two offers of one
+    driver accepted at once, can no longer exist. The same driver accepting the same offer twice reaches the same code:
+    the driver lock and the "no active ride" check of accept, here made stale by a delay after the check."""
+    who = await online_at(500)
+    ride = await request_ride(rider)
+    offer_id = await db.scalar(select(RideOffer.id).where(RideOffer.ride_id == ride["id"]))
     widen(monkeypatch, rides_repo, "get_active_for_driver", 0.05)
 
-    responses = await asyncio.gather(*[client.post(f"/offers/{offer_id}/accept", headers=driver["headers"]) for offer_id in offer_ids])
+    responses = await asyncio.gather(*[client.post(f"/offers/{offer_id}/accept", headers=who["headers"]) for _ in range(2)])
 
     assert sorted(response.status_code for response in responses) == [200, 409]
     active = await db.scalar(
-        select(func.count()).select_from(Ride).where(Ride.driver_id == driver["driver"].id, Ride.status.in_(ACTIVE_RIDE_STATUSES))
+        select(func.count()).select_from(Ride).where(Ride.driver_id == who["driver"].id, Ride.status.in_(ACTIVE_RIDE_STATUSES))
     )
     assert active == 1
-    loser = rides[0] if responses[0].status_code == 409 else rides[1]
-    assert await db.scalar(select(Ride.status).where(Ride.id == loser.id)) == RideStatus.REQUESTED
 
 
 async def test_a_driver_held_by_someone_else_is_skipped_not_failed(client, db, make_user, online_at, hold_row):
