@@ -121,6 +121,7 @@
       <p><span id="ride-status" class="badge"></span> <span id="ride-status-text"></span></p>
       <p id="ride-note" class="note" hidden></p>
       <p id="ride-fare" hidden></p>
+      <p id="ride-earning" hidden></p>
       <dl>
         <div>
           <dt>Pickup</dt>
@@ -150,6 +151,28 @@
           <tbody id="events"></tbody>
         </table>
       </div>
+    </section>
+
+    <section id="earnings-section" hidden>
+      <h2>Earnings</h2>
+      <div class="period-buttons">
+        <button type="button" data-period="today">Today</button>
+        <button type="button" data-period="week">Last 7 days</button>
+        <button type="button" data-period="all">All time</button>
+        <button id="earnings-refresh-button" type="button">Refresh</button>
+      </div>
+      <p>Trips: <strong id="earnings-trips"></strong></p>
+      <p>Cancellation fees: <strong id="earnings-fees"></strong></p>
+      <p>Fares: <strong id="earnings-gross"></strong></p>
+      <p>Platform fee: <strong id="earnings-platform-fee"></strong></p>
+      <p>Your earnings: <strong id="earnings-driver-earning"></strong></p>
+      <p id="earnings-cash"></p>
+      <p id="earnings-wallet"></p>
+      <p id="earnings-balance"></p>
+      <p class="note">Payouts and cash settlement are not built yet, so this balance only grows.</p>
+      <h3>Latest rides</h3>
+      <ul id="earnings-list" class="plain-list"></ul>
+      <button id="earnings-more-button" type="button" hidden>Show more</button>
     </section>
   </main>
 

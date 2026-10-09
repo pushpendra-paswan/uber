@@ -41,6 +41,7 @@ const RIDE_KINDS = ["pickup", "dropoff"];
 const RIDE_MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
 const RIDE_MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
 const FIT_PADDING = [40, 40];
+const ENTRIES_PAGE = 10; // earning entries shown at first, and added by each "Show more"
 const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
 const session = getSession();
@@ -63,6 +64,10 @@ const state = {
   offerTotal: 0, // whole seconds the offer had when first seen, the maximum of the progress bar
   secondsLeft: 0,
   notice: "", // why an offer went away, cleared by the next action or the next offer
+  earnings: null, // {summary, entries, hasMore} from GET /drivers/me/earnings and /entries; null hides the section
+  earningsPeriod: "today", // "today", "week" or "all", written only by the period buttons' handlers
+  earningsSince: null, // the since (ISO) that the shown earnings were asked for, so "Show more" pages the same window
+  earningsKey: null, // "start" or "ride:<id>": what the earnings were last loaded for; set before the call so a failure is not retried every poll
   socketStatus: "connecting", // "connecting", "open", "reconnecting", "closed", as reported by ws.js
   socketInfo: null, // the info that came with the status
   error: "",
@@ -112,6 +117,7 @@ const rideStatus = document.getElementById("ride-status");
 const rideStatusText = document.getElementById("ride-status-text");
 const rideNote = document.getElementById("ride-note");
 const rideFare = document.getElementById("ride-fare");
+const rideEarning = document.getElementById("ride-earning");
 const ridePickup = document.getElementById("ride-pickup");
 const rideDropoff = document.getElementById("ride-dropoff");
 const arriveButton = document.getElementById("arrive-button");
@@ -121,6 +127,19 @@ const completeButton = document.getElementById("complete-button");
 const cancelButton = document.getElementById("cancel-button");
 const doneButton = document.getElementById("done-button");
 const eventsBody = document.getElementById("events");
+const earningsSection = document.getElementById("earnings-section");
+const periodButtons = document.querySelectorAll("[data-period]");
+const earningsRefreshButton = document.getElementById("earnings-refresh-button");
+const earningsTrips = document.getElementById("earnings-trips");
+const earningsFees = document.getElementById("earnings-fees");
+const earningsGross = document.getElementById("earnings-gross");
+const earningsPlatformFee = document.getElementById("earnings-platform-fee");
+const earningsDriverEarning = document.getElementById("earnings-driver-earning");
+const earningsCash = document.getElementById("earnings-cash");
+const earningsWallet = document.getElementById("earnings-wallet");
+const earningsBalance = document.getElementById("earnings-balance");
+const earningsList = document.getElementById("earnings-list");
+const earningsMoreButton = document.getElementById("earnings-more-button");
 
 async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
@@ -161,6 +180,27 @@ async function getOrNull(path) {
     if (err.status === 404) return null;
     throw err;
   }
+}
+
+// The summary and the latest entries of the selected period. The window comes from the browser's local midnight, so the
+// server needs no timezone. null from the server (no driver profile yet) hides the section.
+async function loadEarnings() {
+  let since = null;
+  if (state.earningsPeriod !== "all") {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    if (state.earningsPeriod === "week") start.setDate(start.getDate() - 6);
+    since = start.toISOString();
+  }
+  const sinceQuery = since === null ? "" : `since=${encodeURIComponent(since)}`;
+  const summary = await getOrNull(`/drivers/me/earnings?${sinceQuery}`);
+  if (summary === null) {
+    state.earnings = null;
+    return;
+  }
+  const entries = await api("GET", `/drivers/me/earnings/entries?limit=${ENTRIES_PAGE}&${sinceQuery}`);
+  state.earningsSince = since;
+  state.earnings = { summary, entries, hasMore: entries.length === ENTRIES_PAGE };
 }
 
 async function refresh() {
@@ -205,6 +245,16 @@ async function refresh() {
       state.offer = null;
     }
     state.loaded = true;
+
+    // Earnings change only when a ride is settled, so they are loaded once at the start and once when a ride finishes,
+    // never on every poll. Last, so a failure here cannot stop the offer and ride checks above.
+    if (state.driver !== null) {
+      const key = state.ride !== null && FINISHED.includes(state.ride.status) ? `ride:${state.ride.id}` : state.earningsKey || "start";
+      if (state.earningsKey !== key) {
+        state.earningsKey = key;
+        await loadEarnings();
+      }
+    }
   } catch (err) {
     state.error = err.message;
   }
@@ -427,6 +477,12 @@ function render() {
     if (showFare) {
       rideFare.textContent = `Trip fare: ${money.format(state.ride.final_fare / 100)} (${(breakdown.distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(breakdown.duration_s / 60))} min). ${paidText}`;
     }
+    // The earning row of this ride, once the earnings list has it (a ride with nothing to pay has none).
+    const earning = state.earnings === null ? undefined : state.earnings.entries.find((entry) => entry.ride_id === state.ride.id);
+    rideEarning.hidden = earning === undefined;
+    if (earning !== undefined) {
+      rideEarning.textContent = `You earn ${money.format(earning.driver_earning / 100)} (${money.format(earning.gross_amount / 100)} fare minus ${money.format(earning.platform_fee / 100)} platform fee).`;
+    }
     ridePickup.textContent = state.ride.pickup_address;
     rideDropoff.textContent = state.ride.dropoff_address;
     arriveButton.hidden = status !== "DRIVER_ASSIGNED";
@@ -445,6 +501,35 @@ function render() {
       return row;
     });
     eventsBody.replaceChildren(...rows);
+  }
+
+  // Only textContent below: addresses are plain text.
+  earningsSection.hidden = !isDriver || state.earnings === null;
+  for (const button of periodButtons) button.setAttribute("aria-pressed", String(button.dataset.period === state.earningsPeriod));
+  if (!earningsSection.hidden) {
+    const { summary, entries, hasMore } = state.earnings;
+    earningsTrips.textContent = summary.trips;
+    earningsFees.textContent = summary.cancellation_fees;
+    earningsGross.textContent = money.format(summary.total.gross / 100);
+    earningsPlatformFee.textContent = money.format(summary.total.platform_fee / 100);
+    earningsDriverEarning.textContent = money.format(summary.total.driver_earning / 100);
+    earningsCash.textContent = `Cash rides (${summary.cash.rides}): you collected ${money.format(summary.cash.gross / 100)} in cash and owe the platform ${money.format(summary.cash.platform_fee / 100)} commission.`;
+    earningsWallet.textContent = `Wallet rides (${summary.wallet.rides}): ${money.format(summary.wallet.driver_earning / 100)} will be paid to you.`;
+    const net = summary.settlement.net;
+    const owed = net > 0 ? `the platform owes you ${money.format(net / 100)}` : net < 0 ? `you owe the platform ${money.format(-net / 100)}` : "nothing owed";
+    earningsBalance.textContent = `Balance with the platform: ${owed}`;
+    earningsList.replaceChildren(
+      ...entries.map((entry) => {
+        const row = document.createElement("li");
+        const what = entry.kind === "trip" ? "Trip" : "Cancellation fee";
+        row.textContent =
+          `${new Date(entry.created_at).toLocaleString()}: ${what}, ${entry.pickup_address} \u2192 ${entry.dropoff_address}. ` +
+          `Fare ${money.format(entry.gross_amount / 100)}, platform fee ${money.format(entry.platform_fee / 100)} (${entry.commission_percent}%), ` +
+          `you earn ${money.format(entry.driver_earning / 100)} (${entry.payment_method}).`;
+        return row;
+      })
+    );
+    earningsMoreButton.hidden = !hasMore;
   }
 
   for (const button of document.querySelectorAll("button")) button.disabled = state.busy;
@@ -544,6 +629,25 @@ doneButton.addEventListener("click", () => {
     state.ride = null;
     state.rideId = null;
     state.events = [];
+  });
+});
+
+// The period and the entries are written only here: render() shows them and never changes them.
+for (const button of periodButtons) {
+  button.addEventListener("click", () => {
+    state.earningsPeriod = button.dataset.period;
+    act(loadEarnings);
+  });
+}
+
+earningsRefreshButton.addEventListener("click", () => act(loadEarnings));
+
+earningsMoreButton.addEventListener("click", () => {
+  act(async () => {
+    const entries = state.earnings.entries;
+    const sinceQuery = state.earningsSince === null ? "" : `&since=${encodeURIComponent(state.earningsSince)}`;
+    const more = await api("GET", `/drivers/me/earnings/entries?limit=${ENTRIES_PAGE}&before_id=${entries[entries.length - 1].id}${sinceQuery}`);
+    state.earnings = { ...state.earnings, entries: [...entries, ...more], hasMore: more.length === ENTRIES_PAGE };
   });
 });
 

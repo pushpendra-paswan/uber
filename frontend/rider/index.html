@@ -206,6 +206,32 @@
         </table>
       </div>
     </section>
+
+    <section id="receipt-section" hidden>
+      <h2>Receipt <span id="receipt-number"></span></h2>
+      <p id="receipt-issued" class="note"></p>
+      <dl>
+        <div>
+          <dt>Pickup</dt>
+          <dd id="receipt-pickup"></dd>
+        </div>
+        <div>
+          <dt>Drop-off</dt>
+          <dd id="receipt-dropoff"></dd>
+        </div>
+        <div>
+          <dt>Driver</dt>
+          <dd id="receipt-driver"></dd>
+        </div>
+        <div id="receipt-trip-row">
+          <dt>Distance and time</dt>
+          <dd id="receipt-trip"></dd>
+        </div>
+      </dl>
+      <ul id="receipt-lines" class="breakdown"></ul>
+      <p id="receipt-payment"></p>
+      <button id="print-receipt-button" type="button">Print receipt</button>
+    </section>
   </main>
 
   <!-- Before the module script, so L is defined when rider.js runs. -->

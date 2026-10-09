@@ -10,7 +10,8 @@ through `docker compose exec db psql`. It never touches Redis, Nominatim, or Ope
 Usage: python simulator/stress.py --scenario drivers --admin-email ... --admin-password ...
 Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulator.py fleet), chaos (M4.3: riders and
 drivers acting at random for a while, then a settle period; looks for any invariant violation and for stuck rides; since
-M5.3 riders pay from a funded wallet or in cash and an admin credits wallets with replayed requests), payments (M5.3: top-up
+M5.3 riders pay from a funded wallet or in cash and an admin credits wallets with replayed requests; since M5.4 it also
+compares the money views of the API with the database, see scenario_chaos), payments (M5.3: top-up
 requests repeated at once, signed webhooks delivered many times at once, bad signatures refused; needs the backend to use the
 local fake Stripe, simulator/fake_stripe.py).
 Stop simulator.py for the drivers, riders and chaos scenarios: its drivers would join the test.
@@ -91,6 +92,11 @@ INVARIANTS = {
     ),
     "wallet_charge_mismatch": ("I17", "rides", None, ("ride_id", "payment_amount", "entry_count", "entry_amount")),
     "topup_credit_mismatch": ("I18", "top-ups", None, ("topup_id", "status", "amount", "entry_count", "entry_amount")),
+    "earning_payment_mismatch": (
+        "I19", "payments", None,
+        ("ride_id", "payment_id", "payment_amount", "earning_id", "gross_amount", "ride_driver_id", "earning_driver_id", "kind", "breakdown_kind"),
+    ),
+    "earning_math_mismatch": ("I20", "earnings", None, ("earning_id", "ride_id", "gross_amount", "commission_percent", "platform_fee", "driver_earning")),
 }
 FUND_TO_PAISE = 500000  # the chaos riders' wallets are filled up to 5,000 rupees
 ADJUST_MAX_PAISE = 1000000  # the most one adjustment may move
@@ -269,7 +275,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I18 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I20 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -282,7 +288,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all eighteen invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all twenty invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -296,7 +302,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I18 ok"
+    return ", ".join(parts) or "I1-I20 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -699,7 +705,7 @@ async def chaos_admin(ctx: dict, rng: random.Random, counters: dict, deadline: f
 
 
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I18 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I20 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -860,11 +866,91 @@ async def scenario_chaos(ctx: dict) -> None:
     )
     ctx["surge"] = [int(value) for value in surge[0].split("|")]
 
+    # Money views (M5.4), read-only SQL. First the earnings of this run, where gross must equal fee plus earning.
+    rows = await sql(
+        ctx,
+        "SELECT count(*), COALESCE(sum(e.gross_amount), 0), COALESCE(sum(e.platform_fee), 0), COALESCE(sum(e.driver_earning), 0) "
+        f"FROM ride_earnings e JOIN rides r ON r.id = e.ride_id WHERE {mine}",
+    )
+    ctx["earning_totals"] = [int(value) for value in rows[0].split("|")]
+
+    # Then the API against the database. Everything is compared with the same grouped SQL, worked out here on its own (not with
+    # the backend's code): the admin revenue, and the earnings of every stress driver, all time. If something differs it is
+    # asked once more after 2 s, in case something else was still settling.
+    fields = ("rides", "gross", "platform_fee", "driver_earning")
+    for attempt in (1, 2):
+        mismatches = []
+        grouped = await sql(
+            ctx,
+            "SELECT e.driver_id, e.kind, p.method, count(*), sum(e.gross_amount), sum(e.platform_fee), sum(e.driver_earning) "
+            "FROM ride_earnings e JOIN payments p ON p.id = e.payment_id GROUP BY 1, 2, 3",
+        )
+        expected = collections.defaultdict(collections.Counter)
+        for row in grouped:
+            driver_id, kind, method, number, gross, fee, earning = row.split("|")
+            for who in (driver_id, "all"):
+                numbers = expected[who]
+                numbers["trips" if kind == "trip" else "cancellation_fees"] += int(number)
+                for bucket in ("total", method):
+                    for field, value in zip(fields, (number, gross, fee, earning)):
+                        numbers[f"{bucket}.{field}"] += int(value)
+
+        views = [("revenue", await api(ctx["api"], "GET", "/admin/revenue", ctx["admin_token"]), "all")]
+        for row in await sql(ctx, f"SELECT d.id, u.email FROM drivers d JOIN users u ON u.id = d.user_id WHERE u.email LIKE '{DRIVER_LIKE}' ORDER BY d.id"):
+            driver_id, email = row.split("|")
+            if email in ctx["tokens"]:
+                views.append((f"driver {driver_id}", await api(ctx["api"], "GET", "/drivers/me/earnings", ctx["tokens"][email]), driver_id))
+        for label, answer, key in views:
+            if answer.status_code != 200:
+                mismatches.append(f"{label}: answered {answer.status_code}")
+                continue
+            got, numbers = answer.json(), expected[key]
+            want = {
+                "trips": numbers["trips"], "cancellation_fees": numbers["cancellation_fees"],
+                "owed_to_driver": numbers["wallet.driver_earning"], "owed_by_driver": numbers["cash.platform_fee"],
+                "net": numbers["wallet.driver_earning"] - numbers["cash.platform_fee"],
+                **{f"{bucket}.{field}": numbers[f"{bucket}.{field}"] for bucket in ("total", "cash", "wallet") for field in fields},
+            }
+            have = {
+                "trips": got["trips"], "cancellation_fees": got["cancellation_fees"], **got["settlement"],
+                **{f"{bucket}.{field}": got[bucket][field] for bucket in ("total", "cash", "wallet") for field in fields},
+            }
+            mismatches += [f"{label} {name}: api {have[name]} != sql {value}" for name, value in want.items() if have[name] != value]
+        ctx["money_checked"] = {"revenue": 1, "drivers": len(views) - 1}
+
+        # Receipts of up to 20 settled rides of this run: the amount, the method, and the number.
+        rides = await sql(
+            ctx,
+            "SELECT r.id, u.email, r.final_fare, r.payment_method FROM rides r JOIN users u ON u.id = r.rider_id "
+            f"WHERE {mine} AND r.status IN ('COMPLETED', 'CANCELLED') AND r.final_fare > 0 "
+            "AND (r.fare_breakdown->>'kind') IN ('trip', 'cancellation') ORDER BY r.id DESC LIMIT 20",
+        )
+        for row in rides:
+            ride_id, email, final_fare, method = row.split("|")
+            answer = await api(ctx["api"], "GET", f"/rides/{ride_id}/receipt", ctx["tokens"][email])
+            if answer.status_code != 200:
+                mismatches.append(f"receipt of ride {ride_id}: answered {answer.status_code}")
+                continue
+            receipt = answer.json()
+            if receipt["payment"]["amount"] != int(final_fare):
+                mismatches.append(f"receipt of ride {ride_id}: amount {receipt['payment']['amount']} != final fare {final_fare}")
+            if receipt["payment"]["method"] != method:
+                mismatches.append(f"receipt of ride {ride_id}: method {receipt['payment']['method']} != ride method {method}")
+            if receipt["receipt_number"] != f"RCPT-{int(ride_id):08d}":
+                mismatches.append(f"receipt of ride {ride_id}: number {receipt['receipt_number']}")
+        ctx["money_checked"]["receipts"] = len(rides)
+        if not mismatches:
+            break
+        if attempt == 1:
+            log.warning("money views: %d mismatches, asking again in 2 s", len(mismatches))
+            await asyncio.sleep(2)
+    ctx["money_view_mismatches"] = mismatches
+
 
 async def scenario_payments(ctx: dict) -> None:
     """Top-ups and webhooks under repetition (M5.3). Each round, for all riders at once: the same top-up request five times
     (one top-up, one Stripe session), then the signed paid event delivered ten times with one event id plus three times with
-    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I18 are checked after each
+    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I20 are checked after each
     round. Needs the backend to talk to simulator/fake_stripe.py: it creates a Checkout Session per rider per round."""
     args = ctx["args"]
     ctx["driver_emails"] = []
@@ -1202,6 +1288,13 @@ async def main() -> int:
                  len(ctx["starting"]) - len(ctx["wallet_mismatches"]), len(ctx["starting"]))
         for mismatch in ctx["wallet_mismatches"]:
             log.error("  WALLET MISMATCH %s", mismatch)
+        earning_rows, earning_gross, earning_fees, earning_driver = ctx["earning_totals"]
+        log.info("  earnings of this run: %d rows, gross %d paise = platform fees %d + driver earnings %d%s", earning_rows, earning_gross,
+                 earning_fees, earning_driver, "" if earning_gross == earning_fees + earning_driver else "  (DOES NOT ADD UP)")
+        log.info("  money views checked against SQL: admin revenue, %d drivers (all time), %d receipts; money_view_mismatch %d (should be 0)",
+                 ctx["money_checked"]["drivers"], ctx["money_checked"]["receipts"], len(ctx["money_view_mismatches"]))
+        for mismatch in ctx["money_view_mismatches"][:5]:
+            log.error("  MONEY VIEW MISMATCH %s", mismatch)
         surged, highest, surge_total = ctx["surge"]
         log.info("  surge: %d rides requested above 1.0x, highest multiplier %d percent, surge part of the completed trips %d paise in all",
                  surged, highest, surge_total)
@@ -1229,6 +1322,10 @@ async def main() -> int:
             problems.append(f"{counters['adjust_replay_mismatch']} adjustment replays with different entry ids")
         if ctx["wallet_mismatches"]:
             problems.append(f"{len(ctx['wallet_mismatches'])} wallets whose final balance does not add up")
+        if ctx["money_view_mismatches"]:
+            problems.append(f"{len(ctx['money_view_mismatches'])} money view mismatches")
+        if earning_gross != earning_fees + earning_driver:
+            problems.append("earning rows whose gross is not fees plus earnings")
         if server_errors and not args.tolerate_5xx:
             problems.append(f"{server_errors} server errors (5xx)")
         if counters["transport_errors"] and not args.tolerate_5xx:

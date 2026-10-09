@@ -224,6 +224,34 @@ class Payment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class RideEarning(Base):
+    __tablename__ = "ride_earnings"
+    __table_args__ = (
+        CheckConstraint("kind IN ('trip', 'cancellation')", name="kind_known"),
+        CheckConstraint("gross_amount > 0", name="gross_positive"),
+        CheckConstraint("commission_percent BETWEEN 0 AND 100", name="commission_percent_range"),
+        CheckConstraint("platform_fee >= 0", name="platform_fee_not_negative"),
+        CheckConstraint("driver_earning >= 0", name="driver_earning_not_negative"),
+        # Conservation: the split never creates or loses a paisa.
+        CheckConstraint("platform_fee + driver_earning = gross_amount", name="split_adds_up"),
+        Index("ix_ride_earnings_driver_id_id", "driver_id", "id"),
+        Index("ix_ride_earnings_created_at", "created_at"),
+    )
+
+    # Written by payments.charge_ride in the same transaction as the payment, and never updated or deleted: the amounts and
+    # the percent are snapshots, so a later change to the pricing rule leaves old rows alone.
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ride_id: Mapped[int] = mapped_column(ForeignKey("rides.id"), unique=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("payments.id"), unique=True)
+    driver_id: Mapped[int] = mapped_column(ForeignKey("drivers.id"))
+    kind: Mapped[str] = mapped_column(String(20))  # "trip" or "cancellation", as in rides.fare_breakdown
+    gross_amount: Mapped[int] = mapped_column(Integer)  # paise, equal to the payment
+    commission_percent: Mapped[int] = mapped_column(Integer)  # the rate at settlement time
+    platform_fee: Mapped[int] = mapped_column(Integer)  # paise
+    driver_earning: Mapped[int] = mapped_column(Integer)  # paise
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Wallet(Base):
     __tablename__ = "wallets"
 
@@ -311,6 +339,7 @@ class Rating(Base):
 
 class PricingRule(Base):
     __tablename__ = "pricing_rules"
+    __table_args__ = (CheckConstraint("commission_percent BETWEEN 0 AND 100", name="commission_percent_range"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_type: Mapped[str] = mapped_column(String(30), unique=True)
@@ -321,4 +350,5 @@ class PricingRule(Base):
     surge_cap: Mapped[float] = mapped_column(Float, default=2.0, server_default="2.0")
     cancellation_fee: Mapped[int] = mapped_column(Integer, server_default="3000")  # paise
     free_cancel_seconds: Mapped[int] = mapped_column(Integer, server_default="120")
+    commission_percent: Mapped[int] = mapped_column(Integer, server_default="20")  # the platform's share of every payment
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

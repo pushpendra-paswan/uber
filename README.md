@@ -393,6 +393,41 @@ stripe listen --forward-to localhost:8000/webhooks/stripe     # prints the signi
 
 Put `STRIPE_SECRET_KEY=sk_test_...` and `STRIPE_WEBHOOK_SECRET=whsec_...` (from `stripe listen`) in `.env` and leave `STRIPE_API_URL` at `https://api.stripe.com`, then recreate the backend. Pay on Stripe's page with the card `4242 4242 4242 4242` (any future expiry and CVC) for a success, or `4000 0000 0000 0002` for a decline (no credit happens). `stripe events resend <event id>` replays an event: the balance must not change. A live key (`sk_live_...`) is refused on purpose.
 
+## Earnings, commission, and receipts (M5.4)
+
+Every payment is split into a **platform commission** and a **driver earning**, stored once, in the same transaction as the payment. Drivers see their earnings, an admin can query the platform's revenue, and a rider gets a receipt for every ride they were charged for. **Nothing is paid out**: these are views of money that has already been settled.
+
+**The split.** `pricing_rules.commission_percent` is an integer percent (0 to 100, default 20). For a payment of `gross` paise:
+
+```
+platform_fee   = (gross * commission_percent + 50) // 100     # half up, integers only
+driver_earning = gross - platform_fee                          # the driver gets the rest
+```
+
+For example a fare of Rs 139.99 (13999 paise) at 20 percent: `(13999 * 20 + 50) // 100 = 2800`, so the platform keeps Rs 28.00 and the driver Rs 111.99 (11199); the two add up to the payment, and a CHECK constraint on `ride_earnings` makes that a fact of the database. Commission applies to the whole payment, surge included, and a cancellation fee is split with the same percent (the driver is paid for the wasted trip). The percent is read inside the settlement transaction and stored on the row, so editing the rule later never changes an old row. It is the rate at settlement time, not at request time. Until the admin dashboard (M6.2) adds an editor, the commission is changed in the table: `UPDATE pricing_rules SET commission_percent = 25 WHERE vehicle_type = 'economy'`.
+
+**Why cash and wallet rides settle in opposite directions.** On a **cash** ride the driver collected the whole fare from the rider, so the driver owes the platform its `platform_fee`. On a **wallet** ride the platform collected the fare from the rider's wallet, so the platform owes the driver its `driver_earning`. The summaries therefore report the two kinds of ride separately and add a `settlement` block: `owed_to_driver` (the driver earnings of wallet rides), `owed_by_driver` (the platform fees of cash rides) and `net = owed_to_driver - owed_by_driver` (positive: the platform owes the driver). It is always derived from the rows; there is no balance table. Because there are no payouts and no way to record a driver paying their commission, **the number only accumulates** for now.
+
+**Endpoints** (amounts are integer paise):
+
+| Endpoint | Who | Answer |
+|---|---|---|
+| `GET /drivers/me/earnings?since=&until=` | driver (404 without a profile; a pending or rejected driver may read their own) | trips and cancellation fees counted, `total`, `cash` and `wallet` buckets (`rides`, `gross`, `platform_fee`, `driver_earning`), and `settlement` |
+| `GET /drivers/me/earnings/entries?since=&until=&limit=&before_id=` | driver | the driver's earning rows, newest first (`limit` 1 to 100, default 20; `before_id` pages): kind, payment method, gross, commission percent, fee, earning, the pickup and drop-off addresses, distance and duration. Nothing about the rider |
+| `GET /admin/revenue?since=&until=` | admin | the same answer over all drivers: `total.platform_fee` is the platform's revenue |
+| `GET /admin/drivers/{driver_id}/earnings?since=&until=` | admin | the same answer as the driver's own (404 for an unknown driver) |
+| `GET /rides/{ride_id}/receipt` | the ride's rider | the receipt (below). 409 `There is no receipt for this ride` unless the ride is COMPLETED or CANCELLED and was charged; another rider's ride is 404 |
+
+**Windows.** `since` is inclusive and `until` is exclusive, both compared with the time the ride was settled. They must be ISO timestamps **with a timezone**: `2026-10-09T00:00:00Z`, or `2026-10-09T05:30:00%2B05:30` (a `+` in a URL must be written `%2B`, or it is read as a space). A time without a timezone is a 422, and so is `until` not after `since`. The server needs no timezone data: the driver page works out "today" from the browser's local midnight. Every summary is ONE grouped query, so the numbers of one answer always agree with each other.
+
+```bash
+curl -s "localhost:8000/admin/revenue?since=2026-10-09T00:00:00Z" -H "Authorization: Bearer $ADMIN_TOKEN"
+curl -s "localhost:8000/drivers/me/earnings/entries?limit=5" -H "Authorization: Bearer $DRIVER_TOKEN"
+curl -s "localhost:8000/rides/<id>/receipt" -H "Authorization: Bearer $RIDER_TOKEN"
+```
+
+**Receipts** are derived from what was stored when the ride was settled (the fare breakdown, the payment, the ledger entry), never recomputed, so a later change to the pricing rule or to surge cannot change one. The number is `RCPT-` plus the ride id padded to 8 digits. A receipt has the issue time, the route, the driver's name and vehicle (plate, model, color; no id, no contact data), the estimate, either the trip lines (distance, time, base, distance and time fares, minimum fare, surge, cap, total) or the cancellation fee with its reason, and the payment (method, amount, status, and the wallet balance after the charge for a wallet ride). It never shows the commission or the driver's earning. Rides settled before surge existed (M5.2) have no surge keys in their breakdown and show a surge of 100 percent. There is no list of receipts yet (M6.3). The rider page shows the receipt of a finished, charged ride with a "Print receipt" button (the print style shows only the receipt); the driver page has an Earnings section with Today, Last 7 days and All time.
+
 ## Concurrency stress test (M4.1, M4.2, M4.3)
 
 `simulator/stress.py` fires many requests at the same instant and then looks in the database for broken invariants. M4.1 used it to reproduce a real bug (the offer flow checked "is this driver free?" and wrote the offer in separate steps, with no lock in between); M4.2 fixed it with row locks in Postgres (the rider's `users` row in `POST /rides`, the driver's `drivers` row in matching and in accept; see `PROJECT_CONTEXT.md`). **Exit code 0 ("no violation observed") is the expected result for every scenario, including `chaos` (M4.3).** An exit code of 1 means a lock is missing or broken.
@@ -429,6 +464,8 @@ export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --
 
 **Money in the chaos run (M5.3).** The setup fills every stress rider's wallet to Rs 5,000 through the admin API (`POST /admin/wallets/{id}/adjust`, key `stress-fund-<rider>-<unix time>-<balance>`) and remembers the starting balances. Each chaos ride is paid from the wallet with 50 percent probability, otherwise in cash (a `402` is counted as `wallet_402`; it should be 0). An extra agent, the admin, credits a random stress rider Rs 10 to Rs 100 every 2 seconds with a fresh key, and 30 percent of the time sends the SAME request twice at once: every successful answer for one key must carry the same entry id (`adjust_replay_mismatch`, any non-zero value is a violation). The summary lists wallet and cash rides with what was charged, the adjustments, and checks `final balance == starting balance + credits - wallet charges` for every stress rider.
 
+**Money views in the chaos run (M5.4).** After the settle period (and before the cleanup) the run prints the earning rows of the run (count, gross, platform fees and driver earnings; gross must equal fees plus earnings) and compares the public money views with the database, using its own grouped SQL: the all-time `GET /admin/revenue` (counts, the three buckets and the settlement), the all-time `GET /drivers/me/earnings` of every stress driver, and up to 20 receipts of the run's settled rides (`payment.amount` equal to `final_fare`, the same payment method, the number `RCPT-` plus the padded id). A difference is asked again once after 2 seconds, in case something was still settling; what remains is `money_view_mismatch` (the first five are printed), and any non-zero value is a violation (exit 1).
+
 **The `payments` scenario (M5.3).** It needs the backend to use the local fake Stripe (see "Payments and wallet"); it creates one Checkout Session per rider per round in whichever Stripe the backend uses, and prints a warning to that effect. No drivers are needed.
 
 ```bash
@@ -436,7 +473,7 @@ export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --
 # or: export STRIPE_WEBHOOK_SECRET=...   two backend processes: --api-url http://127.0.0.1:8000,http://127.0.0.1:8001
 ```
 
-Each round, for all riders at once: (1) the same top-up request five times at once (one top-up row per rider and key, the same id in every answer; a `409` "in progress" is retried once after a second); (2) the signed `checkout.session.completed` event delivered ten times at once with one event id, plus three times with another event id for the same session (every answer 200, exactly one `processed` per top-up and one `ignored` for the first delivery of the other event id, the rest `duplicate`; every top-up SUCCEEDED with exactly one `TOPUP` entry, each balance up by exactly the top-up); (3) three badly signed events (wrong secret, tampered body, a timestamp 10 minutes old): all `400`, and the database does not change; (4) I1 to I18. The summary counts top-ups, webhook answers (`processed`, `duplicate`, `ignored`), and ends with `PAYMENTS CLEAN` or `PAYMENTS FOUND PROBLEMS: ...`. Exit code 2 with `INVARIANTS NOT CHECKED: Stripe is not configured on the backend ...` when the backend has no test key.
+Each round, for all riders at once: (1) the same top-up request five times at once (one top-up row per rider and key, the same id in every answer; a `409` "in progress" is retried once after a second); (2) the signed `checkout.session.completed` event delivered ten times at once with one event id, plus three times with another event id for the same session (every answer 200, exactly one `processed` per top-up and one `ignored` for the first delivery of the other event id, the rest `duplicate`; every top-up SUCCEEDED with exactly one `TOPUP` entry, each balance up by exactly the top-up); (3) three badly signed events (wrong secret, tampered body, a timestamp 10 minutes old): all `400`, and the database does not change; (4) I1 to I20. The summary counts top-ups, webhook answers (`processed`, `duplicate`, `ignored`), and ends with `PAYMENTS CLEAN` or `PAYMENTS FOUND PROBLEMS: ...`. Exit code 2 with `INVARIANTS NOT CHECKED: Stripe is not configured on the backend ...` when the backend has no test key.
 
 Other flags: `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url` (one URL or several separated by commas, see below), `--webhook-secret` (payments scenario), `--label` (free text printed in the summary header, so saved outputs identify themselves), `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
 
@@ -472,8 +509,10 @@ The container has no `pkill`; `docker compose up -d --force-recreate backend` st
 | I16 `ride_payment_mismatch` | a COMPLETED or CANCELLED ride (not legacy) with a fare has exactly one succeeded payment of that amount and method; one without a fare has none; a ride that is not settled has none |
 | I17 `wallet_charge_mismatch` | a wallet payment has exactly one `RIDE_CHARGE` entry of minus its amount on the rider's wallet, and a `RIDE_CHARGE` entry has a wallet payment (never a cash one) |
 | I18 `topup_credit_mismatch` | a SUCCEEDED top-up has exactly one `TOPUP` entry of its amount on its user's wallet; any other top-up has no entry |
+| I19 `earning_payment_mismatch` | every payment has exactly one earning row, and the row agrees with it: the same ride, `gross_amount` equal to the payment amount, the ride's own driver, and the kind of the ride's breakdown |
+| I20 `earning_math_mismatch` | every earning row's `platform_fee + driver_earning = gross_amount`, the fee is `(gross * percent + 50) / 100`, nothing is negative, the gross is positive and the percent is between 0 and 100 |
 
-I4 to I18 cannot be legitimately violated even for an instant (each pair of changes, each status change with its settlement, and each ledger entry with its cause is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
+I4 to I20 cannot be legitimately violated even for an instant (each pair of changes, each status change with its settlement, each ledger entry with its cause, and each payment with its earning row is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
 
 ```bash
 docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql

@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 from fastapi import Header
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, StrictInt, model_validator
 
-from app.models import PaymentMethod, RideStatus, TopupStatus, UserRole, VerificationStatus, WalletEntryKind
+from app.models import PaymentMethod, PaymentStatus, RideStatus, TopupStatus, UserRole, VerificationStatus, WalletEntryKind
 
 # The Idempotency-Key header of a request that must not happen twice: 8 to 64 characters, required.
 IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -287,3 +287,99 @@ class AdjustRequest(BaseModel):
 
     amount: StrictInt  # paise, signed, not 0; the limit is checked by the service
     note: str = Field(min_length=1, max_length=200)
+
+
+class EarningsBucket(BaseModel):
+    rides: int
+    gross: int  # paise
+    platform_fee: int
+    driver_earning: int
+
+
+class EarningsSettlement(BaseModel):
+    owed_to_driver: int  # paise: the platform collected these fares (wallet rides) and owes the driver its part
+    owed_by_driver: int  # the driver collected these fares (cash rides) and owes the platform its fee
+    net: int  # owed_to_driver - owed_by_driver; positive means the platform owes the driver
+
+
+class EarningsSummaryResponse(BaseModel):
+    since: datetime | None  # the window as it was asked for, inclusive
+    until: datetime | None  # exclusive
+    trips: int
+    cancellation_fees: int
+    total: EarningsBucket
+    cash: EarningsBucket
+    wallet: EarningsBucket
+    settlement: EarningsSettlement
+
+
+# What a driver may know about a settled ride: the addresses of their own ride, and nothing about the rider.
+class EarningEntryResponse(BaseModel):
+    id: int
+    ride_id: int
+    kind: Literal["trip", "cancellation"]
+    payment_method: PaymentMethod
+    gross_amount: int
+    commission_percent: int
+    platform_fee: int
+    driver_earning: int
+    pickup_address: str
+    dropoff_address: str
+    distance_m: int | None
+    duration_s: int | None
+    created_at: datetime
+
+
+# What a rider may know about the driver of a paid ride: the name and the vehicle, no id and no contact data.
+class ReceiptVehicle(BaseModel):
+    plate_number: str
+    model: str
+    color: str
+
+
+class ReceiptTrip(BaseModel):
+    distance_m: int
+    duration_s: int
+    distance_source: str  # "tracked" or "estimate"
+    base_fare: int
+    distance_fare: int
+    time_fare: int
+    minimum_fare_applied: bool
+    normal_fare: int
+    surge_percent: int
+    surge_amount: int
+    computed_fare: int
+    capped: bool
+    total: int
+
+
+class ReceiptCancellation(BaseModel):
+    fee: int
+    reason: str
+    cancelled_by: str
+
+
+class ReceiptPayment(BaseModel):
+    method: PaymentMethod
+    amount: int
+    status: PaymentStatus
+    wallet_balance_after: int | None
+
+
+# No otp, no commission, no earning, no driver id. Exactly one of trip and cancellation is set.
+class ReceiptResponse(BaseModel):
+    receipt_number: str
+    issued_at: datetime
+    ride_id: int
+    kind: Literal["trip", "cancellation"]
+    status: RideStatus
+    pickup_address: str
+    dropoff_address: str
+    started_at: datetime | None
+    ended_at: datetime | None
+    driver_name: str
+    vehicle: ReceiptVehicle
+    estimated_fare: int | None
+    trip: ReceiptTrip | None
+    cancellation: ReceiptCancellation | None
+    payment: ReceiptPayment

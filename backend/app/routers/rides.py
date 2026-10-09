@@ -8,6 +8,7 @@ from app.schemas import (
     EstimateRequest,
     EstimateResponse,
     OtpResponse,
+    ReceiptResponse,
     RideCreate,
     RideDriverResponse,
     RideEventResponse,
@@ -15,6 +16,7 @@ from app.schemas import (
     StartTripRequest,
 )
 from app.security import get_current_user, require_role
+from app.services import receipts as receipts_service
 from app.services import rides as rides_service
 
 router = APIRouter(prefix="/rides", tags=["rides"])
@@ -64,6 +66,13 @@ async def get_cancellation_fee(
     ride_id: int, user: User = Depends(require_role("rider")), db: AsyncSession = Depends(get_db)
 ) -> CancellationFeeResponse:
     return await rides_service.get_cancellation_fee(db, user, ride_id)
+
+
+@router.get("/{ride_id}/receipt", response_model=ReceiptResponse)
+async def get_ride_receipt(
+    ride_id: int, user: User = Depends(require_role("rider")), db: AsyncSession = Depends(get_db)
+) -> dict:
+    return await receipts_service.get_receipt(db, user, ride_id)
 
 
 @router.get("/{ride_id}/events", response_model=list[RideEventResponse])

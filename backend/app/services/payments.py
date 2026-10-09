@@ -10,7 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import PaymentMethod, Ride, TopupStatus, User, WalletEntryKind, WalletTopup
+from app.repositories import earnings as earnings_repo
 from app.repositories import payments as payments_repo
+from app.repositories import pricing as pricing_repo
 from app.schemas import TopupCreate
 from app.services import wallet
 
@@ -33,11 +35,23 @@ logger = logging.getLogger("uvicorn.error")
 
 async def charge_ride(db: AsyncSession, ride: Ride) -> None:
     """Charges a ride that was just settled (COMPLETED or CANCELLED). Does not commit: it runs in the settlement's
-    transaction, under the ride lock, so a settled ride always has its payment. A fee of 0 creates nothing.
+    transaction, under the ride lock, so a settled ride always has its payment and its earning row. A fee of 0 creates nothing.
     No try/except: a duplicate (unique violation) would be a bug, and must surface and undo the whole settlement."""
     if not ride.final_fare:
         return
-    await payments_repo.create_payment(db, ride.id, ride.final_fare, ride.payment_method, f"ride:{ride.id}:charge")
+    payment_id = await payments_repo.create_payment(db, ride.id, ride.final_fare, ride.payment_method, f"ride:{ride.id}:charge")
+
+    # The split of the payment between the platform and the driver, at the commission of this moment (a snapshot on the
+    # row). Half up on the platform's part; the driver gets the rest, so rounding never creates or loses a paisa.
+    rule = await pricing_repo.get_rule(db, "economy")
+    if rule is None:
+        raise HTTPException(status_code=503, detail="Pricing is not configured")
+    platform_fee = (ride.final_fare * rule.commission_percent + 50) // 100
+    await earnings_repo.create(
+        db, ride.id, payment_id, ride.driver_id, ride.fare_breakdown["kind"], ride.final_fare, rule.commission_percent,
+        platform_fee, ride.final_fare - platform_fee,
+    )
+
     # Cash is assumed collected by the driver. Only a wallet ride moves money in the ledger.
     if ride.payment_method == PaymentMethod.wallet:
         await wallet.post_entry(db, ride.rider_id, -ride.final_fare, WalletEntryKind.RIDE_CHARGE, ride_id=ride.id)

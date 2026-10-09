@@ -5,11 +5,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Payment, PaymentMethod, PaymentStatus, StripeEvent, TopupStatus, WalletTopup
 
 
-async def create_payment(db: AsyncSession, ride_id: int, amount: int, method: PaymentMethod, key: str) -> Payment:
+async def create_payment(db: AsyncSession, ride_id: int, amount: int, method: PaymentMethod, key: str) -> int:
     payment = Payment(ride_id=ride_id, amount=amount, method=method, status=PaymentStatus.succeeded, idempotency_key=key)
     db.add(payment)
     await db.flush()
-    return payment
+    return payment.id
+
+
+async def get_payment_by_ride(db: AsyncSession, ride_id: int):
+    """The payment of a ride as a row (method, amount, status, created_at), or None when the ride was not charged."""
+    result = await db.execute(
+        select(Payment.method, Payment.amount, Payment.status, Payment.created_at).where(Payment.ride_id == ride_id)
+    )
+    return result.first()
 
 
 async def insert_topup_if_new(db: AsyncSession, user_id: int, key: str, amount: int) -> WalletTopup | None:

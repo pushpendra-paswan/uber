@@ -1,11 +1,13 @@
 from fastapi import APIRouter, Depends, Response
+from pydantic import AwareDatetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Driver, User, VerificationStatus
-from app.schemas import AdjustRequest, DriverResponse, IdempotencyKey, SurgeSnapshotResponse, WalletEntryResponse
+from app.schemas import AdjustRequest, DriverResponse, EarningsSummaryResponse, IdempotencyKey, SurgeSnapshotResponse, WalletEntryResponse
 from app.security import require_role
 from app.services import drivers as drivers_service
+from app.services import earnings as earnings_service
 from app.services import pricing as pricing_service
 from app.services import wallet as wallet_service
 
@@ -30,6 +32,21 @@ async def reject_driver(driver_id: int, db: AsyncSession = Depends(get_db)) -> D
 @router.get("/surge", response_model=SurgeSnapshotResponse)
 async def get_surge(refresh: bool = False, db: AsyncSession = Depends(get_db)) -> dict:
     return await pricing_service.get_surge_zones(db, refresh)
+
+
+# since is inclusive and until is exclusive; both need a timezone (a naive time is a 422).
+@router.get("/revenue", response_model=EarningsSummaryResponse)
+async def get_revenue(
+    since: AwareDatetime | None = None, until: AwareDatetime | None = None, db: AsyncSession = Depends(get_db)
+) -> dict:
+    return await earnings_service.get_revenue(db, since, until)
+
+
+@router.get("/drivers/{driver_id}/earnings", response_model=EarningsSummaryResponse)
+async def get_driver_earnings(
+    driver_id: int, since: AwareDatetime | None = None, until: AwareDatetime | None = None, db: AsyncSession = Depends(get_db)
+) -> dict:
+    return await earnings_service.get_admin_driver_summary(db, driver_id, since, until)
 
 
 @router.post("/wallets/{user_id}/adjust", response_model=WalletEntryResponse, status_code=201)

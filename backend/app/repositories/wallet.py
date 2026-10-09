@@ -46,6 +46,14 @@ async def get_entry_by_key(db: AsyncSession, user_id: int, key: str) -> dict | N
     return dict(row) if row is not None else None
 
 
+async def get_charge_entry(db: AsyncSession, ride_id: int) -> int | None:
+    """The balance_after of the RIDE_CHARGE entry of a ride, or None when the ride was not paid from the wallet."""
+    result = await db.execute(
+        select(WalletEntry.balance_after).where(WalletEntry.ride_id == ride_id, WalletEntry.kind == WalletEntryKind.RIDE_CHARGE)
+    )
+    return result.scalar_one_or_none()
+
+
 async def list_entries(db: AsyncSession, user_id: int, limit: int, before_id: int | None) -> list[dict]:
     query = select(WalletEntry.__table__).where(WalletEntry.user_id == user_id)
     if before_id is not None:

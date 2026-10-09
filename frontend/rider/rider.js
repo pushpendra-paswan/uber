@@ -82,6 +82,8 @@ const state = {
   topupKey: null, // the Idempotency-Key of the top-up being attempted; kept after a failure, so a retry is a replay
   topupAmount: null, // the amount (paise) that key was made for
   topupNotice: "", // "Payment received" and the like
+  receipt: null, // answer of GET /rides/{id}/receipt for a finished ride that was charged
+  receiptKey: null, // the ride id the receipt was asked for; set before the call so a failure is not retried every poll
   paymentMethod: "cash", // written only by the radios' change handler
   error: "",
   busy: false,
@@ -172,6 +174,17 @@ const paymentRadios = document.querySelectorAll('input[name="payment"]');
 const paymentHint = document.getElementById("payment-hint");
 const ridePayment = document.getElementById("ride-payment");
 const farePayment = document.getElementById("fare-payment");
+const receiptSection = document.getElementById("receipt-section");
+const receiptNumber = document.getElementById("receipt-number");
+const receiptIssued = document.getElementById("receipt-issued");
+const receiptPickup = document.getElementById("receipt-pickup");
+const receiptDropoff = document.getElementById("receipt-dropoff");
+const receiptDriver = document.getElementById("receipt-driver");
+const receiptTripRow = document.getElementById("receipt-trip-row");
+const receiptTrip = document.getElementById("receipt-trip");
+const receiptLines = document.getElementById("receipt-lines");
+const receiptPayment = document.getElementById("receipt-payment");
+const printReceiptButton = document.getElementById("print-receipt-button");
 let shownTopups = null; // the JSON of the top-ups in the DOM, so polling does not rebuild their buttons under a click
 
 // "5.2 km, 14 min". Used by the estimate panel and the ride view. Old rides have null values.
@@ -310,6 +323,16 @@ async function refresh() {
     } else {
       state.otp = null;
       state.otpKey = null;
+    }
+
+    // A receipt exists only for a finished ride that was charged (not a free cancellation, not a ride from before the fare
+    // existed). Asked for once, and last, so a failure here cannot stop the checks above.
+    const breakdown = state.ride === null ? null : state.ride.fare_breakdown;
+    const charged =
+      breakdown !== null && breakdown.kind !== "legacy" && ["COMPLETED", "CANCELLED"].includes(state.ride.status) && state.ride.final_fare > 0;
+    if (charged && state.receiptKey !== state.ride.id) {
+      state.receiptKey = state.ride.id;
+      state.receipt = await api("GET", `/rides/${state.ride.id}/receipt`);
     }
   } catch (err) {
     state.error = err.message;
@@ -608,6 +631,48 @@ function render() {
       (state.wallet.available < state.estimate.max_fare ? " Add money or pay with cash." : "");
   }
 
+  // Only textContent below: the receipt holds addresses and a driver's name, which are plain text.
+  receiptSection.hidden = !isRider || state.receipt === null;
+  if (!receiptSection.hidden) {
+    const receipt = state.receipt;
+    receiptNumber.textContent = receipt.receipt_number;
+    receiptIssued.textContent = `Issued ${new Date(receipt.issued_at).toLocaleString()}`;
+    receiptPickup.textContent = receipt.pickup_address;
+    receiptDropoff.textContent = receipt.dropoff_address;
+    receiptDriver.textContent = `${receipt.driver_name}, ${receipt.vehicle.color} ${receipt.vehicle.model}, plate ${receipt.vehicle.plate_number}`;
+    const lines = [];
+    receiptTripRow.hidden = receipt.trip === null;
+    if (receipt.trip !== null) {
+      const trip = receipt.trip;
+      receiptTrip.textContent = `${formatTrip(trip.distance_m, trip.duration_s)}${trip.distance_source === "estimate" ? " (estimated, tracking was not available)" : ""}`;
+      lines.push(
+        `Base fare: ${money.format(trip.base_fare / 100)}`,
+        `Distance: ${money.format(trip.distance_fare / 100)}`,
+        `Time: ${money.format(trip.time_fare / 100)}`
+      );
+      if (trip.minimum_fare_applied) lines.push("Minimum fare applied");
+      if (trip.surge_percent > 100) {
+        lines.push(`High-demand pricing: ${(trip.surge_percent / 100).toFixed(1)}x (+${money.format(trip.surge_amount / 100)})`);
+      }
+      if (trip.capped) lines.push("Capped at 150% of the estimate");
+      lines.push(`Total: ${money.format(trip.total / 100)}`);
+    } else {
+      lines.push(`Cancellation fee ${money.format(receipt.cancellation.fee / 100)}`, CANCEL_REASON_TEXT[receipt.cancellation.reason] || "");
+    }
+    receiptLines.replaceChildren(
+      ...lines.map((text) => {
+        const row = document.createElement("li");
+        row.textContent = text;
+        return row;
+      })
+    );
+    const payment = receipt.payment;
+    receiptPayment.textContent =
+      payment.method === "wallet"
+        ? `Paid from your wallet (balance after: ${money.format(payment.wallet_balance_after / 100)})`
+        : "Paid in cash to the driver";
+  }
+
   if (showRide) {
     rideId.textContent = state.ride.id;
     ridePayment.textContent = `Payment: ${state.ride.payment_method}`;
@@ -743,6 +808,8 @@ logoutButton.addEventListener("click", () => {
   state.driverKey = null;
   state.otp = null;
   state.otpKey = null;
+  state.receipt = null;
+  state.receiptKey = null;
   render(); // removes the driver marker
   clearSession();
   location.reload();
@@ -838,6 +905,9 @@ topupForm.addEventListener("submit", (event) => {
 
 reconnectButton.addEventListener("click", () => act(() => reconnectNow()));
 
+// Not through act(): printing changes no state and calls no API. The print styles show only the receipt.
+printReceiptButton.addEventListener("click", () => window.print());
+
 // The quote and the cancel are one action, so a failed quote shows its error and cancels nothing.
 cancelButton.addEventListener("click", () => {
   act(async () => {
@@ -865,6 +935,8 @@ newRideButton.addEventListener("click", () => {
     state.driverKey = null;
     state.otp = null;
     state.otpKey = null;
+    state.receipt = null;
+    state.receiptKey = null;
     for (const kind of KINDS) inputs[kind].value = "";
     pickRadios.pickup.checked = true;
   });

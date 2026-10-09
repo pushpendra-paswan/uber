@@ -124,3 +124,30 @@ input[type="radio"] {
 .plain-list button {
   margin: 0 0 0 0.5rem;
 }
+
+#receipt-lines {
+  margin: 0 0 0.75rem;
+}
+
+/* Printing shows the receipt and nothing else. The map section is hidden whole, so Leaflet's own styles are not touched. */
+@media print {
+  body {
+    background: #fff;
+  }
+
+  header,
+  #message,
+  #login-section,
+  #wrong-role-section,
+  #wallet-section,
+  #map-section,
+  #request-section,
+  #ride-section,
+  #print-receipt-button {
+    display: none !important;
+  }
+
+  #receipt-section {
+    border: 0;
+  }
+}

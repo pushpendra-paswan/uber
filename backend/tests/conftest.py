@@ -25,7 +25,10 @@ from app import database  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.database import Base, get_db, redis_client  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Driver, PricingRule, Ride, RideEvent, RideStatus, User, UserRole, Vehicle, VerificationStatus  # noqa: E402
+from app.models import (  # noqa: E402
+    Driver, Payment, PaymentMethod, PaymentStatus, PricingRule, Ride, RideEarning, RideEvent, RideStatus, User, UserRole, Vehicle,
+    VerificationStatus,
+)
 from app.repositories import drivers as drivers_repo  # noqa: E402
 from app.repositories import users as users_repo  # noqa: E402
 from app.routers import websocket as websocket_router  # noqa: E402
@@ -69,7 +72,7 @@ async def clean_tables(test_engine):
         await connection.execute(
             PricingRule.__table__.insert().values(
                 vehicle_type="economy", base_fare=5000, per_km=1200, per_min=200, min_fare=8000, surge_cap=2.0,
-                cancellation_fee=3000, free_cancel_seconds=120,
+                cancellation_fee=3000, free_cancel_seconds=120, commission_percent=20,
             )
         )
 
@@ -295,6 +298,64 @@ async def insert_ride(db: AsyncSession):
             db.add(RideEvent(ride_id=ride.id, from_status=RideStatus.REQUESTED, to_status=RideStatus.DRIVER_ASSIGNED))
         await db.commit()
         return ride
+
+    return create
+
+
+@pytest_asyncio.fixture
+async def settled_ride(db: AsyncSession):
+    """Returns a function that inserts a settled ride straight into the database: the ride (COMPLETED for a trip, CANCELLED for a
+    cancellation) with a final fare of `amount` paise, its succeeded payment, and its earning row split at `percent`, all dated
+    `created_at` (the payment and the earning row: the earnings windows use it). `with_earning=False` leaves the earning row out,
+    and `old_breakdown=True` leaves the surge keys out of the breakdown, like a ride settled before M5.2. Returns the ids."""
+
+    async def create(
+        rider: dict, driver: dict, amount: int = 14000, method: str = "cash", kind: str = "trip", percent: int = 20,
+        created_at: datetime | None = None, with_earning: bool = True, old_breakdown: bool = False,
+    ) -> dict:
+        created_at = created_at or datetime.now(timezone.utc)
+        if kind == "trip":
+            breakdown = {
+                "kind": "trip", "distance_m": 5000, "duration_s": 900, "distance_source": "tracked", "fallback_reason": None,
+                "tracked_pings": 40, "jumps_ignored": 0, "base_fare": 5000, "distance_fare": 6000, "time_fare": 3000,
+                "minimum_fare_applied": False, "computed_fare": amount, "normal_fare": amount, "surge_percent": 100,
+                "surge_amount": 0, "fare_cap": 21000, "capped": False,
+            }
+            if old_breakdown:
+                for name in ("normal_fare", "surge_percent", "surge_amount"):
+                    del breakdown[name]
+        else:
+            breakdown = {"kind": "cancellation", "fee": amount, "reason": "late_cancellation", "cancelled_by": "rider"}
+        ride = Ride(
+            rider_id=rider["user"].id, driver_id=driver["driver"].id,
+            status=RideStatus.COMPLETED if kind == "trip" else RideStatus.CANCELLED,
+            pickup_lat=settings.city_center_lat, pickup_lng=settings.city_center_lng, pickup_address="MG Road",
+            dropoff_lat=settings.city_south, dropoff_lng=settings.city_east, dropoff_address="Koramangala",
+            distance_m=5000, duration_s=900, fare_estimate=14000, final_fare=amount,
+            actual_distance_m=5000 if kind == "trip" else None, actual_duration_s=900 if kind == "trip" else None,
+            fare_breakdown=breakdown, payment_method=PaymentMethod(method), created_at=created_at,
+            started_at=created_at if kind == "trip" else None, completed_at=created_at if kind == "trip" else None,
+        )
+        db.add(ride)
+        await db.flush()
+        payment = Payment(
+            ride_id=ride.id, amount=amount, method=PaymentMethod(method), status=PaymentStatus.succeeded,
+            idempotency_key=f"ride:{ride.id}:charge", created_at=created_at,
+        )
+        db.add(payment)
+        await db.flush()
+        earning_id = None
+        if with_earning:
+            platform_fee = (amount * percent + 50) // 100
+            earning = RideEarning(
+                ride_id=ride.id, payment_id=payment.id, driver_id=driver["driver"].id, kind=kind, gross_amount=amount,
+                commission_percent=percent, platform_fee=platform_fee, driver_earning=amount - platform_fee, created_at=created_at,
+            )
+            db.add(earning)
+            await db.flush()
+            earning_id = earning.id
+        await db.commit()
+        return {"ride_id": ride.id, "payment_id": payment.id, "earning_id": earning_id}
 
     return create
 

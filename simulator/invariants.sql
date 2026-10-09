@@ -1,5 +1,5 @@
 -- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1, I12 since M5.2,
--- I13 to I18 since M5.3). Read-only. One SELECT per invariant, one row per offender:
+-- I13 to I18 since M5.3, I19 and I20 since M5.4). Read-only. One SELECT per invariant, one row per offender:
 -- an empty result means the invariant holds. Used by simulator/stress.py, and runnable by hand:
 --   docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
 -- Statuses are stored as the enum names in upper case (VARCHAR, no CHECK constraint).
@@ -202,3 +202,30 @@ GROUP BY t.id
 HAVING (t.status = 'SUCCEEDED' AND (count(e.id) <> 1 OR sum(e.amount) <> t.amount OR bool_or(e.user_id <> t.user_id OR e.kind <> 'TOPUP')))
     OR (t.status <> 'SUCCEEDED' AND count(e.id) > 0)
 ORDER BY t.id;
+
+\echo '== earning_payment_mismatch'
+-- I19: every payment has its earning row (the two are written in one transaction), and the row agrees with its payment and
+-- its ride: same ride, gross_amount equal to the payment amount, the ride's own driver, and the kind of the ride's breakdown.
+SELECT p.ride_id, p.id AS payment_id, p.amount AS payment_amount, e.id AS earning_id, e.gross_amount,
+       r.driver_id AS ride_driver_id, e.driver_id AS earning_driver_id, e.kind, r.fare_breakdown->>'kind' AS breakdown_kind
+FROM payments p
+JOIN rides r ON r.id = p.ride_id
+LEFT JOIN ride_earnings e ON e.payment_id = p.id
+WHERE e.id IS NULL
+   OR e.ride_id <> p.ride_id
+   OR e.gross_amount <> p.amount
+   OR r.driver_id IS NULL
+   OR e.driver_id <> r.driver_id
+   OR e.kind IS DISTINCT FROM (r.fare_breakdown->>'kind')
+ORDER BY p.ride_id;
+
+\echo '== earning_math_mismatch'
+-- I20: the split adds up and follows the rule: fee + earning = gross, the fee is the percent of the gross rounded half up,
+-- nothing is negative, the gross is positive, and the percent is between 0 and 100.
+SELECT id AS earning_id, ride_id, gross_amount, commission_percent, platform_fee, driver_earning
+FROM ride_earnings
+WHERE platform_fee + driver_earning <> gross_amount
+   OR platform_fee <> (gross_amount * commission_percent + 50) / 100
+   OR platform_fee < 0 OR driver_earning < 0 OR gross_amount <= 0
+   OR commission_percent NOT BETWEEN 0 AND 100
+ORDER BY id;
