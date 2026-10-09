@@ -1,5 +1,5 @@
 import { api, clearSession, getSession, saveSession } from "/shared/api.js";
-import { connect, disconnect } from "/shared/ws.js";
+import { connect, disconnect, reconnectNow } from "/shared/ws.js";
 
 const STATUS_TEXT = {
   REQUESTED: "Looking for a driver",
@@ -13,6 +13,13 @@ const STATUS_TEXT = {
 const CANCELLABLE = ["REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED"];
 const FINISHED = ["COMPLETED", "CANCELLED", "NO_DRIVER_FOUND"];
 const TRACKING = ["DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS"]; // the driver's position is shown only in these
+const CLOSE_REPLACED = 4409; // ws.js reports it as "closed": this account has too many tabs
+const MEANWHILE = "Updating every few seconds meanwhile.";
+const TRACKING_TEXT = {
+  connecting: "Live tracking: connecting...",
+  open: "Live tracking: connected",
+  paused: `Live tracking paused: this account is open in too many tabs. ${MEANWHILE}`,
+};
 const POLL_MS = 3000;
 const ANIMATION_MS = 3000; // equal to the drivers' ping interval, so one glide ends as the next update arrives
 const SNAP_DISTANCE_M = 500; // a bigger jump (the driver was moved by hand) is shown at once, not flown over the map
@@ -51,8 +58,8 @@ const state = {
   routeRideId: null, // the ride whose route was asked for; set before the call so a failure is not retried every poll
   routeLine: null, // Leaflet polyline
   drawnPath: null, // the path routeLine shows, so polling neither redraws nor refits it
-  socketStatus: "closed", // "connecting", "open", "closed"
-  socketCode: null, // close code once closed
+  socketStatus: "connecting", // "connecting", "open", "reconnecting", "closed", as reported by ws.js
+  socketInfo: null, // the info that came with the status
   driver: null, // answer of GET /rides/{id}/driver
   driverLocation: null, // {lat, lng, updated_at} of the newest accepted update
   driverKey: null, // "rideId:driverId" the details were asked for; set before the call so a failure is not retried every poll
@@ -94,6 +101,7 @@ const driverName = document.getElementById("driver-name");
 const driverVehicle = document.getElementById("driver-vehicle");
 const driverTracking = document.getElementById("driver-tracking");
 const driverUpdated = document.getElementById("driver-updated");
+const reconnectButton = document.getElementById("reconnect-button");
 const cancelButton = document.getElementById("cancel-button");
 const newRideButton = document.getElementById("new-ride-button");
 const eventsBody = document.getElementById("events");
@@ -118,10 +126,7 @@ async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
   saveSession(data.access_token, data.user);
   state.user = data.user;
-  if (state.user.role === "rider") {
-    state.socketStatus = "connecting";
-    connect(socketHandlers);
-  }
+  if (state.user.role === "rider") connect(socketHandlers);
 }
 
 // Events only say "something changed": the page reacts by asking the REST API, which is the source of truth.
@@ -137,9 +142,20 @@ const socketHandlers = {
       refresh().then(render);
     }
   },
-  onStatus: (status, code) => {
+  onStatus: (status, info) => {
     state.socketStatus = status;
-    state.socketCode = status === "closed" ? code : null;
+    state.socketInfo = info;
+    // Events published while the socket was down are lost, so ask the REST API again.
+    if (status === "open" && info.reconnected) {
+      state.driverKey = null; // the next refresh also fetches the driver details and last location again
+      if (!refreshing && !state.busy) {
+        refreshing = true;
+        refresh().then(() => {
+          refreshing = false;
+          render();
+        });
+      }
+    }
     render();
   },
 };
@@ -213,6 +229,10 @@ async function refresh() {
         state.driverKey = key;
         state.driver = await api("GET", `/rides/${state.ride.id}/driver`);
         if (state.driver.location !== null) applyDriverLocation(state.driver.location);
+      } else if (TRACKING.includes(state.ride.status) && state.driver !== null && state.socketStatus !== "open") {
+        // While the socket is down the marker keeps moving from here, every poll. applyDriverLocation drops stale answers.
+        const details = await api("GET", `/rides/${state.ride.id}/driver`);
+        if (details.location !== null) applyDriverLocation(details.location);
       }
     } else {
       state.driver = null;
@@ -465,11 +485,15 @@ function render() {
       const live = TRACKING.includes(state.ride.status);
       driverTracking.hidden = !live;
       driverUpdated.hidden = !live || state.driverLocation === null;
-      if (state.socketStatus === "connecting") driverTracking.textContent = "Live tracking: connecting...";
-      if (state.socketStatus === "open") driverTracking.textContent = "Live tracking: connected";
-      if (state.socketStatus === "closed") {
-        driverTracking.textContent = `Live tracking: disconnected (code ${state.socketCode}). Reload the page to reconnect.`;
+      const { socketStatus: status, socketInfo: info } = state;
+      if (status === "reconnecting") {
+        driverTracking.textContent = `Live tracking: connection lost. Reconnecting (attempt ${info.attempt}), next try in about ${info.retryInSeconds} s. ${MEANWHILE}`;
+      } else if (status === "closed") {
+        driverTracking.textContent = info.code === CLOSE_REPLACED ? TRACKING_TEXT.paused : `Live tracking stopped (code ${info.code}). ${MEANWHILE}`;
+      } else {
+        driverTracking.textContent = TRACKING_TEXT[status];
       }
+      reconnectButton.hidden = !live || status !== "closed";
       if (state.driverLocation !== null) {
         driverUpdated.textContent = `Last location update: ${new Date(state.driverLocation.updated_at * 1000).toLocaleTimeString()}`;
       }
@@ -558,6 +582,8 @@ requestButton.addEventListener("click", () => {
   });
 });
 
+reconnectButton.addEventListener("click", () => act(() => reconnectNow()));
+
 cancelButton.addEventListener("click", () => {
   if (confirm("Cancel this ride?")) act(() => api("POST", `/rides/${state.ride.id}/cancel`));
 });
@@ -591,9 +617,6 @@ setInterval(async () => {
   render();
 }, POLL_MS);
 
-if (state.user !== null && state.user.role === "rider") {
-  state.socketStatus = "connecting";
-  connect(socketHandlers);
-}
+if (state.user !== null && state.user.role === "rider") connect(socketHandlers);
 render();
 refresh().then(render);

@@ -1,5 +1,5 @@
 import { api, clearSession, getSession, saveSession } from "/shared/api.js";
-import { connect, disconnect } from "/shared/ws.js";
+import { connect, disconnect, reconnectNow } from "/shared/ws.js";
 
 const STATUS_TEXT = {
   REQUESTED: "Waiting for a driver to be assigned",
@@ -20,7 +20,13 @@ const POLL_MS = 3000;
 const COUNTDOWN_MS = 250;
 // Shown when an offer closes without the driver answering it. Accepted and rejected need no message.
 const CLOSED_NOTICE = { expired: "The offer expired.", ride_cancelled: "The rider cancelled the request." };
-const LIVE_TEXT = { connecting: "Live updates: connecting", open: "Live updates: connected" };
+const CLOSE_REPLACED = 4409; // ws.js reports it as "closed": this account has too many tabs
+const STILL_ARRIVE = "New offers still arrive within a few seconds.";
+const LIVE_TEXT = {
+  connecting: "Live updates: connecting...",
+  open: "Live updates: connected",
+  paused: `Live updates paused: this account is open in too many tabs. ${STILL_ARRIVE}`,
+};
 const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 const MAX_ZOOM = 19;
@@ -53,8 +59,8 @@ const state = {
   offerTotal: 0, // whole seconds the offer had when first seen, the maximum of the progress bar
   secondsLeft: 0,
   notice: "", // why an offer went away, cleared by the next action or the next offer
-  socketStatus: "connecting", // "connecting", "open", "closed"
-  socketCode: null, // close code once closed
+  socketStatus: "connecting", // "connecting", "open", "reconnecting", "closed", as reported by ws.js
+  socketInfo: null, // the info that came with the status
   error: "",
   busy: false,
 };
@@ -64,6 +70,7 @@ let countdownTimer = null; // setInterval id while an offer is showing
 const message = document.getElementById("message");
 const noticeText = document.getElementById("notice");
 const liveStatus = document.getElementById("live-status");
+const reconnectButton = document.getElementById("reconnect-button");
 const userBar = document.getElementById("user-bar");
 const userName = document.getElementById("user-name");
 const logoutButton = document.getElementById("logout-button");
@@ -112,10 +119,7 @@ async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
   saveSession(data.access_token, data.user);
   state.user = data.user;
-  if (state.user.role === "driver") {
-    state.socketStatus = "connecting";
-    connect(socketHandlers);
-  }
+  if (state.user.role === "driver") connect(socketHandlers);
 }
 
 // Events only say "something changed": the page reacts by asking the REST API, which is the source of truth.
@@ -130,9 +134,11 @@ const socketHandlers = {
       refresh().then(render);
     }
   },
-  onStatus: (status, code) => {
+  onStatus: (status, info) => {
     state.socketStatus = status;
-    state.socketCode = status === "closed" ? code : null;
+    state.socketInfo = info;
+    // Events published while the socket was down are lost: an offer or ride that arrived meanwhile shows now.
+    if (status === "open" && info.reconnected) refresh().then(render);
     render();
   },
 };
@@ -247,11 +253,15 @@ function render() {
   noticeText.hidden = state.notice === "";
   noticeText.textContent = state.notice;
   liveStatus.hidden = !isDriver;
-  if (state.socketStatus === "closed") {
-    liveStatus.textContent = `Live updates: disconnected (code ${state.socketCode}). Offers still arrive within a few seconds by polling.`;
+  const { socketStatus: status, socketInfo: info } = state;
+  if (status === "reconnecting") {
+    liveStatus.textContent = `Live updates: connection lost, reconnecting (attempt ${info.attempt}). ${STILL_ARRIVE}`;
+  } else if (status === "closed") {
+    liveStatus.textContent = info.code === CLOSE_REPLACED ? LIVE_TEXT.paused : `Live updates stopped (code ${info.code}). ${STILL_ARRIVE}`;
   } else {
-    liveStatus.textContent = LIVE_TEXT[state.socketStatus];
+    liveStatus.textContent = LIVE_TEXT[status];
   }
+  reconnectButton.hidden = !isDriver || status !== "closed";
 
   loginSection.hidden = loggedIn;
   userBar.hidden = !loggedIn;
@@ -468,6 +478,7 @@ offlineButton.addEventListener("click", () => {
   });
 });
 
+reconnectButton.addEventListener("click", () => act(() => reconnectNow()));
 acceptButton.addEventListener("click", () => act(() => api("POST", `/offers/${state.offer.id}/accept`)));
 rejectButton.addEventListener("click", () => act(() => api("POST", `/offers/${state.offer.id}/reject`)));
 

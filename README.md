@@ -121,7 +121,7 @@ While a ride is assigned, arrived, or in progress, the rider page shows a **Your
 4. Open DevTools, Network, WS, click the `/ws` connection, and watch the Messages: a `driver_location` frame arrives about every 3 seconds (`{"type":"driver_location","data":{"ride_id":..,"lat":..,"lng":..,"updated_at":..}}`, the first frame you send is `auth`).
 5. Without the simulator: log in as an approved driver on `/driver/`, click the map, press **Go online**, then request a ride near that point as a rider. The marker sits still and "Last location update" moves forward every 3 seconds. Clicking far away on the driver map makes the rider's marker jump there (moves over 500 m are not animated).
 
-The marker lags the real position by up to about 3 seconds on purpose (it glides between updates). If the socket closes (for example the backend restarts), the page says "Live tracking: disconnected" and you must reload the page; reconnecting by itself comes in M3.4. Check the details endpoint by hand with `curl localhost:8000/rides/<ride_id>/driver -H "Authorization: Bearer $RIDER"`.
+The marker lags the real position by up to about 3 seconds on purpose (it glides between updates). If the socket closes (for example the backend restarts), the page reconnects by itself and the marker keeps moving through polling meanwhile (see "Reconnect and outages" below). Check the details endpoint by hand with `curl localhost:8000/rides/<ride_id>/driver -H "Authorization: Bearer $RIDER"`.
 
 ### Go online as a driver
 
@@ -190,6 +190,35 @@ The backend accepts WebSocket connections at `ws://localhost:8000/ws` and pushes
 | 4409 | Replaced by a newer connection (a user keeps at most 5 sockets; the oldest is closed) |
 
 Frames larger than 64 KB are rejected by the server (`--ws-max-size 65536`, close code 1009). Events are lost if the user is not connected at that moment; the REST API stays the source of truth.
+
+### Reconnect and outages (M3.4)
+
+`frontend/shared/ws.js` owns the connection. Pages pass `onEvent` and `onStatus` to `connect()` and never create a `WebSocket`. What it does when the connection ends:
+
+| Situation | Action |
+|---|---|
+| Close code 4401 (unauthorized) | Clear the session and reload the page, like a REST 401. No retry |
+| Close code 4409 (replaced by a newer connection) | Stop, status `closed`. No automatic retry (tabs would kick each other forever). Resumes when the page becomes visible again, the browser goes online, or you press **Reconnect** |
+| Close code 4400 (bad message) | Stop, status `closed`. Only **Reconnect** resumes (this means a bug) |
+| Any other code, a connection that fails to open, or a dead connection found by the watchdog | Retry with backoff |
+
+- **Backoff:** before the n-th retry the wait is `cap / 2` plus a random part up to `cap / 2`, with `cap = min(30 s, 1 s * 2^n)`: 0.5 to 1 s, 1 to 2, 2 to 4, 4 to 8, 8 to 16, then 15 to 30 s. It starts over only after a connection stayed logged in for 10 seconds, so a server that accepts and drops you keeps being backed off from.
+- **Dead connections:** after login the client sends `ping` every 20 seconds and expects any frame back within 8 seconds, so a frozen server or a lost network is noticed within 28 seconds at worst. A socket that does not open or does not answer `auth` within 10 seconds is abandoned too. The old socket is dropped at once, without waiting for the browser's close event (a half-dead connection can take minutes to report one).
+- **Waking up:** when a tab becomes visible or the browser goes online, a waiting retry happens immediately, and an open socket is pinged to check it.
+- **After a reconnect** the pages re-fetch their state over REST, because events published while the socket was down are lost. The rider page also polls the driver's location every 3 seconds while the socket is not open, so the marker keeps moving (without the smooth glide).
+- The status line shows the state ("Live tracking: connection lost. Reconnecting (attempt 3), next try in about 4 s. ...") and a **Reconnect** button appears after 4409 or 4400.
+
+Try the outage cases with a rider tab that has an active ride (start the simulator with `--drivers 20 --speed-kmh 30`):
+
+```bash
+docker compose restart backend      # status goes to Reconnecting, then back to connected within seconds
+docker compose pause backend        # frozen server: the dead connection is noticed within 28 s; then
+docker compose unpause backend      # it reconnects
+docker compose stop backend         # long outage: the retry delays grow to 15 to 30 s
+docker compose start backend        # it reconnects within one retry period
+```
+
+Six tabs of one login: the first shows "paused: this account is open in too many tabs" with a **Reconnect** button (its marker still moves every 3 seconds through polling). Close another tab and press **Reconnect**, and it shows "connected" again. Stopping only Redis (`docker compose stop redis`) does not disconnect anyone: the sockets stay open, but no events are delivered until Redis is back.
 
 Try it with redis-cli and the browser console (log in on /rider/ first):
 
