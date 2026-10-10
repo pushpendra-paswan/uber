@@ -4,11 +4,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models import Driver, User, VerificationStatus
-from app.schemas import AdjustRequest, DriverResponse, EarningsSummaryResponse, IdempotencyKey, SurgeSnapshotResponse, WalletEntryResponse
+from app.schemas import AdjustRequest, AdminRatingResponse, DriverResponse, EarningsSummaryResponse, IdempotencyKey, SurgeSnapshotResponse, WalletEntryResponse
 from app.security import require_role
 from app.services import drivers as drivers_service
 from app.services import earnings as earnings_service
 from app.services import pricing as pricing_service
+from app.services import ratings as ratings_service
 from app.services import wallet as wallet_service
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_role("admin"))])
@@ -58,3 +59,12 @@ async def adjust_wallet(
     if not created:
         response.status_code = 200
     return entry
+
+
+# The only way to read a rating together with its comment: individual ratings are never shown to the person who was rated.
+@router.get("/ratings", response_model=list[AdminRatingResponse])
+async def list_ratings(
+    user_id: int | None = None, max_score: int | None = None, limit: int = ratings_service.ADMIN_LIST_DEFAULT_LIMIT,
+    before_id: int | None = None, db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    return await ratings_service.list_for_admin(db, user_id, max_score, limit, before_id)

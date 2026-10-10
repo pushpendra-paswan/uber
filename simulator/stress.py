@@ -11,9 +11,11 @@ Usage: python simulator/stress.py --scenario drivers --admin-email ... --admin-p
 Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulator.py fleet), chaos (M4.3: riders and
 drivers acting at random for a while, then a settle period; looks for any invariant violation and for stuck rides; since
 M5.3 riders pay from a funded wallet or in cash and an admin credits wallets with replayed requests; since M5.4 it also
-compares the money views of the API with the database, see scenario_chaos), payments (M5.3: top-up
+compares the money views of the API with the database, see scenario_chaos; since M6.1 riders and drivers also rate each
+other, some of them twice at once, and the rating views are compared with the database), payments (M5.3: top-up
 requests repeated at once, signed webhooks delivered many times at once, bad signatures refused; needs the backend to use the
-local fake Stripe, simulator/fake_stripe.py).
+local fake Stripe, simulator/fake_stripe.py), ratings (M6.1: one stress driver completes a ride for each rider, then everyone
+rates everyone at once, three copies of every request, all landing on the driver's one summary row).
 Stop simulator.py for the drivers, riders and chaos scenarios: its drivers would join the test.
 Exit codes: 0 no violation (expected for every scenario), 1 a violation, a stuck ride, or a 5xx, 2 the check could not run.
 --api-url takes several comma-separated URLs (two backend processes): requests are spread over them round-robin.
@@ -97,7 +99,12 @@ INVARIANTS = {
         ("ride_id", "payment_id", "payment_amount", "earning_id", "gross_amount", "ride_driver_id", "earning_driver_id", "kind", "breakdown_kind"),
     ),
     "earning_math_mismatch": ("I20", "earnings", None, ("earning_id", "ride_id", "gross_amount", "commission_percent", "platform_fee", "driver_earning")),
+    "rating_summary_mismatch": ("I21", "users", None, ("user_id", "summary_count", "summary_total", "ratings_count", "ratings_sum")),
+    "rating_participants_mismatch": (
+        "I22", "ratings", None, ("rating_id", "ride_id", "ride_status", "from_user_id", "to_user_id", "rider_id", "driver_user_id")
+    ),
 }
+RATING_BURST_COPIES = 3  # ratings scenario: every rating request is sent this many times at once
 FUND_TO_PAISE = 500000  # the chaos riders' wallets are filled up to 5,000 rupees
 ADJUST_MAX_PAISE = 1000000  # the most one adjustment may move
 WEBHOOK_COPIES = 10  # payments scenario: one event delivered this many times at once
@@ -270,12 +277,12 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
     latency = f" (median {statistics.median(times):.0f} ms, max {max(times):.0f} ms)" if times else ""
     counts_text = ", ".join(f"{label} x{count}" for label, count in sorted(counts.items())) or "nothing sent"
     mode = "one by one" if ctx["args"].sequential else "together"
-    return {"results": results, "summary": f"{len(requests)} requests {mode} in {seconds * 1000:.0f} ms{latency}: {counts_text}"}
+    return {"results": results, "seconds": seconds, "summary": f"{len(requests)} requests {mode} in {seconds * 1000:.0f} ms{latency}: {counts_text}"}
 
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I20 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I22 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -288,7 +295,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all twenty invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all twenty-two invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -302,7 +309,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I20 ok"
+    return ", ".join(parts) or "I1-I22 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -529,7 +536,9 @@ async def scenario_fleet(ctx: dict) -> None:
 
 async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict, deadline: float) -> None:
     """One rider until the deadline: requests a ride (sometimes the same request twice at once), cancels a quarter of
-    them after a few seconds, follows the rest to the end (cancelling after 90 s), pauses, and requests again."""
+    them after a few seconds, follows the rest to the end (cancelling after 90 s), pauses, and requests again. A completed ride
+    is rated (60 percent, after 0 to 5 s, 10 percent of those sent twice at once); a cancelled or driverless one is sometimes
+    rated too (5 percent), which must be refused."""
     client, token, urls = ctx["api"], ctx["tokens"][email], ctx["args"].api_urls
     ride_id = cancel_at = None
     cancelled = False
@@ -585,6 +594,27 @@ async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict,
                 if active.status_code == 404:
                     final = await api(client, "GET", rng.choice(urls) + f"/rides/{ride_id}", token)
                     counters[f"ride_{final.json().get('status')}"] += final.status_code == 200
+                    if final.status_code == 200 and final.json()["status"] == "COMPLETED" and rng.random() < 0.60:
+                        await asyncio.sleep(rng.uniform(0, 5))
+                        body = {"score": rng.randint(1, 5)}
+                        if rng.random() < 0.50:
+                            body["comment"] = f"Stress rating {rng.randrange(10**6)}"
+                        twice = rng.random() < 0.10
+                        answers = await asyncio.gather(
+                            *[api(client, "POST", rng.choice(urls) + f"/rides/{ride_id}/rating", token, body) for _ in range(2 if twice else 1)]
+                        )
+                        counters["ratings_by_rider"] += sum(1 for answer in answers if answer.status_code == 201)
+                        counters["rating_409"] += sum(1 for answer in answers if answer.status_code == 409)
+                        if twice:
+                            counters["rating_dup_pairs"] += 1
+                            # Exactly one winner, unless a server error muddied the pair (a restart): that is counted as a 5xx.
+                            counters["rating_dup_error"] += (
+                                all(answer.status_code < 500 for answer in answers) and sorted(answer.status_code for answer in answers) != [201, 409]
+                            )
+                    elif final.status_code == 200 and final.json()["status"] != "COMPLETED" and rng.random() < 0.05:
+                        answer = await api(client, "POST", rng.choice(urls) + f"/rides/{ride_id}/rating", token, {"score": rng.randint(1, 5)})
+                        counters["rating_notcompleted_tried"] += 1
+                        counters["rating_notcompleted_409"] += answer.status_code == 409
                     ride_id = None
                     await asyncio.sleep(rng.uniform(0, 3))
         except httpx.HTTPError:
@@ -595,7 +625,8 @@ async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict,
 async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Random, counters: dict, deadline: float) -> None:
     """One driver until the deadline, a tick every second: pings its location every 3 s, takes the next step of its ride
     after a short pause (sometimes cancelling instead), and answers an offer at random: accept 50, reject 15, ignore 15,
-    go offline for 2 to 5 s 10, accept twice at the same moment 10 (percent)."""
+    go offline for 2 to 5 s 10, accept twice at the same moment 10 (percent). After it completes a trip it rates the rider
+    (60 percent, after 0 to 5 s, 10 percent of those sent twice at once)."""
     client, token, urls, otp = ctx["api"], ctx["tokens"][email], ctx["args"].api_urls, ctx["args"].otp
     here = {"lat": location[0], "lng": location[1]}
     online, offline_until, last_ping = True, 0.0, time.monotonic()
@@ -632,7 +663,24 @@ async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Rando
                     elif ride["status"] == "DRIVER_ARRIVED":
                         await api(client, "POST", step + "/start", token, {"otp": otp})
                     elif ride["status"] == "IN_PROGRESS":
-                        counters["trips_completed"] += (await api(client, "POST", step + "/complete", token)).status_code == 200
+                        completed = (await api(client, "POST", step + "/complete", token)).status_code == 200
+                        counters["trips_completed"] += completed
+                        if completed and rng.random() < 0.60:
+                            await asyncio.sleep(rng.uniform(0, 5))
+                            body = {"score": rng.randint(1, 5)}
+                            if rng.random() < 0.50:
+                                body["comment"] = f"Stress rating {rng.randrange(10**6)}"
+                            twice = rng.random() < 0.10
+                            answers = await asyncio.gather(
+                                *[api(client, "POST", rng.choice(urls) + f"/rides/{ride['id']}/rating", token, body) for _ in range(2 if twice else 1)]
+                            )
+                            counters["ratings_by_driver"] += sum(1 for answer in answers if answer.status_code == 201)
+                            counters["rating_409"] += sum(1 for answer in answers if answer.status_code == 409)
+                            if twice:
+                                counters["rating_dup_pairs"] += 1
+                                counters["rating_dup_error"] += (
+                                    all(answer.status_code < 500 for answer in answers) and sorted(answer.status_code for answer in answers) != [201, 409]
+                                )
                 continue
 
             plan = None
@@ -705,7 +753,7 @@ async def chaos_admin(ctx: dict, rng: random.Random, counters: dict, deadline: f
 
 
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I20 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I22 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -946,11 +994,69 @@ async def scenario_chaos(ctx: dict) -> None:
             await asyncio.sleep(2)
     ctx["money_view_mismatches"] = mismatches
 
+    # Rating views (M6.1), the API against read-only SQL worked out here on its own: "GET /ratings/me" of every stress rider and
+    # driver (the real count and average, the average as integer hundredths rounded half up), and "GET /rides/{id}/driver" of up
+    # to 20 rides of a stress driver (the count, and the average only from 3 ratings). Asked once more after 2 s on a difference.
+    for attempt in (1, 2):
+        mismatches = []
+        expected = {}
+        rows = await sql(
+            ctx,
+            "SELECT u.email, count(g.id), COALESCE(sum(g.score), 0) FROM users u LEFT JOIN ratings g ON g.to_user_id = u.id "
+            f"WHERE u.email LIKE '{RIDER_LIKE}' OR u.email LIKE '{DRIVER_LIKE}' GROUP BY u.id",
+        )
+        for row in rows:
+            email, number, total = row.split("|")
+            number, total = int(number), int(total)
+            expected[email] = (number, None if number == 0 else (total * 100 + number // 2) // number)
+        for email, (number, hundredths) in expected.items():
+            if email not in ctx["tokens"]:
+                continue
+            answer = await api(ctx["api"], "GET", "/ratings/me", ctx["tokens"][email])
+            if answer.status_code != 200:
+                mismatches.append(f"/ratings/me of {email}: answered {answer.status_code}")
+                continue
+            got = answer.json()
+            shown = None if got["average"] is None else round(got["average"] * 100)
+            if (got["count"], shown) != (number, hundredths):
+                mismatches.append(f"/ratings/me of {email}: api count {got['count']} average {got['average']} != sql count {number} hundredths {hundredths}")
+        rides = await sql(
+            ctx,
+            "SELECT r.id, ru.email, du.email FROM rides r JOIN users ru ON ru.id = r.rider_id JOIN drivers d ON d.id = r.driver_id "
+            f"JOIN users du ON du.id = d.user_id WHERE {mine} AND du.email LIKE '{DRIVER_LIKE}' ORDER BY r.id DESC LIMIT 20",
+        )
+        for row in rides:
+            ride_id, rider_email, driver_email = row.split("|")
+            answer = await api(ctx["api"], "GET", f"/rides/{ride_id}/driver", ctx["tokens"][rider_email])
+            if answer.status_code != 200:
+                mismatches.append(f"driver details of ride {ride_id}: answered {answer.status_code}")
+                continue
+            number, hundredths = expected[driver_email]
+            got = answer.json()["rating"]
+            shown = None if got["average"] is None else round(got["average"] * 100)
+            if (got["count"], shown) != (number, hundredths if number >= 3 else None):
+                mismatches.append(f"driver details of ride {ride_id}: api {got} != sql count {number} hundredths {hundredths} (average shown from 3)")
+        ctx["rating_checked"] = {"users": sum(1 for email in expected if email in ctx["tokens"]), "rides": len(rides)}
+        if not mismatches:
+            break
+        if attempt == 1:
+            log.warning("rating views: %d mismatches, asking again in 2 s", len(mismatches))
+            await asyncio.sleep(2)
+    ctx["rating_view_mismatches"] = mismatches
+
+    # The ratings of this run, read-only: by score and by direction.
+    rows = await sql(
+        ctx,
+        "SELECT g.score, (g.from_user_id = r.rider_id), count(*) FROM ratings g JOIN rides r ON r.id = g.ride_id "
+        f"WHERE {mine} GROUP BY 1, 2 ORDER BY 1, 2",
+    )
+    ctx["rating_stats"] = [(int(row.split("|")[0]), row.split("|")[1] == "t", int(row.split("|")[2])) for row in rows]
+
 
 async def scenario_payments(ctx: dict) -> None:
     """Top-ups and webhooks under repetition (M5.3). Each round, for all riders at once: the same top-up request five times
     (one top-up, one Stripe session), then the signed paid event delivered ten times with one event id plus three times with
-    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I20 are checked after each
+    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I22 are checked after each
     round. Needs the backend to talk to simulator/fake_stripe.py: it creates a Checkout Session per rider per round."""
     args = ctx["args"]
     ctx["driver_emails"] = []
@@ -1069,9 +1175,119 @@ async def scenario_payments(ctx: dict) -> None:
                  {label[8:]: count for label, count in sorted(counters.items()) if label.startswith("webhook_") and label != "webhook_deliveries"}, invariants)
 
 
+async def scenario_ratings(ctx: dict) -> None:
+    """One stress driver completes a ride for every rider, one at a time. Then, in ONE burst, every rider rates the driver and
+    the driver rates every rider, each request sent RATING_BURST_COPIES times at once: exactly one 201 and the rest 409 for
+    every rater, and the summary rows (the driver's takes all the riders' ratings, so it is the hot row) must equal the scores
+    of the winning requests. I1 to I22 are checked after each round."""
+    args = ctx["args"]
+    client, urls = ctx["api"], args.api_urls
+    ctx["driver_emails"] = [DRIVER_EMAIL.format(n=1)]
+    driver_email = ctx["driver_emails"][0]
+    rider_emails = [RIDER_EMAIL.format(n=n) for n in range(1, args.riders + 1)]
+    started = time.monotonic()
+    await asyncio.gather(setup_accounts(ctx, "driver", 1), *[setup_accounts(ctx, "rider", n) for n in range(1, args.riders + 1)])
+    log.info("setup of 1 driver and %d riders took %.1f s", args.riders, time.monotonic() - started)
+    driver_token = ctx["tokens"][driver_email]
+    user_ids = [ctx["user_ids"][driver_email]] + [ctx["user_ids"][email] for email in rider_emails]
+
+    # What the summaries held before this run (earlier runs rated the same accounts): the checks compare the change.
+    async def read_summaries() -> dict:
+        rows = await sql(ctx, f"SELECT user_id, rating_count, rating_total FROM rating_summaries WHERE user_id IN ({', '.join(str(i) for i in user_ids)})")
+        found = {int(row.split("|")[0]): (int(row.split("|")[1]), int(row.split("|")[2])) for row in rows}
+        return {user_id: found.get(user_id, (0, 0)) for user_id in user_ids}
+
+    before = await read_summaries()
+    expected = dict(before)
+    stats = ctx["ratings"] = {"created": 0, "duplicates": 0, "raters": 0, "bursts": [], "setup_failures": 0, "problems": [], "rides": 0}
+    location = await snap(ctx, 0, 300, on_road=False)
+
+    for round_number in range(1, args.rounds + 1):
+        await cleanup(ctx)
+        seen = {}
+        ctx["rounds"].append(seen)
+        online = await api(client, "POST", urls[0] + "/drivers/me/online", driver_token, {"lat": location[0], "lng": location[1]})
+        if online.status_code != 200:
+            raise RuntimeError(f"the stress driver could not go online: {online.status_code} {online.text}")
+
+        # One ride at a time, through the API only. A ride that does not complete is a setup failure of that rider.
+        completed = []  # (rider email, ride id)
+        for n, email in enumerate(rider_emails, 1):
+            ride_id = None
+            try:
+                ping = await api(client, "POST", urls[0] + "/drivers/me/location", driver_token, {"lat": location[0], "lng": location[1]})
+                if ping.status_code == 409:  # the presence key is gone: come back
+                    await api(client, "POST", urls[0] + "/drivers/me/online", driver_token, {"lat": location[0], "lng": location[1]})
+                pickup = await snap(ctx, 0, args.spread_m)
+                dropoff = await snap(ctx, DROPOFF_MIN_M, DROPOFF_MAX_M)
+                body = {
+                    "pickup_lat": pickup[0], "pickup_lng": pickup[1], "pickup_address": f"Stress pickup {n}",
+                    "dropoff_lat": dropoff[0], "dropoff_lng": dropoff[1], "dropoff_address": f"Stress drop-off {n}", "payment_method": "cash",
+                }
+                created = await api(client, "POST", urls[0] + "/rides", ctx["tokens"][email], body)
+                if created.status_code != 201 or created.json()["status"] != "REQUESTED":
+                    raise RuntimeError(f"the ride was not offered to the driver ({created.status_code} {created.text[:120]})")
+                ride_id = created.json()["id"]
+                offer = await api(client, "GET", urls[0] + "/drivers/me/offer", driver_token)
+                if offer.status_code != 200:
+                    raise RuntimeError(f"the driver has no offer ({offer.status_code})")
+                steps = [
+                    (f"/offers/{offer.json()['id']}/accept", None), (f"/rides/{ride_id}/arrive", None),
+                    (f"/rides/{ride_id}/start", {"otp": args.otp}), (f"/rides/{ride_id}/complete", None),
+                ]
+                for path, step_body in steps:
+                    answer = await api(client, "POST", urls[0] + path, driver_token, step_body)
+                    if answer.status_code != 200:
+                        raise RuntimeError(f"{path} answered {answer.status_code} {answer.text[:120]}")
+                completed.append((email, ride_id))
+            except (RuntimeError, httpx.HTTPError) as error:
+                stats["setup_failures"] += 1
+                log.warning("round %d: rider %03d is skipped, its ride did not complete: %s", round_number, n, error)
+                if ride_id is not None:  # free the driver for the next rider
+                    await api(client, "POST", urls[0] + f"/rides/{ride_id}/cancel", ctx["tokens"][email])
+                    await api(client, "POST", urls[0] + f"/rides/{ride_id}/complete", driver_token)
+        if len(completed) < 2:
+            raise RuntimeError(f"only {len(completed)} riders completed a ride in round {round_number}: the burst would prove nothing")
+        stats["rides"] += len(completed)
+
+        # The burst: every rider rates the driver, the driver rates every rider, each request sent several times at once.
+        requests, raters = [], []  # raters: (what, score, user id of the one rated)
+        for email, ride_id in completed:
+            score = ctx["rng"].randint(1, 5)
+            body = {"score": score, "comment": f"Stress rating {ctx['rng'].randrange(10**6)}"}
+            requests.extend([(ctx["tokens"][email], "POST", f"/rides/{ride_id}/rating", body)] * RATING_BURST_COPIES)
+            raters.append((f"rider {email}", score, ctx["user_ids"][driver_email]))
+            score = ctx["rng"].randint(1, 5)
+            requests.extend([(driver_token, "POST", f"/rides/{ride_id}/rating", {"score": score})] * RATING_BURST_COPIES)
+            raters.append((f"driver on ride {ride_id}", score, ctx["user_ids"][email]))
+        fired = await burst(ctx, requests)
+        times = [result["ms"] for result in fired["results"] if result["ms"] is not None]
+        stats["bursts"].append((fired["seconds"], statistics.median(times) if times else 0, len(requests)))
+        stats["raters"] += len(raters)
+        for index, (who, score, rated) in enumerate(raters):
+            codes = sorted(result["status"] for result in fired["results"][index * RATING_BURST_COPIES : (index + 1) * RATING_BURST_COPIES])
+            if codes != [201] + [409] * (RATING_BURST_COPIES - 1):
+                stats["problems"].append(f"round {round_number}: {who} got answers {codes}, expected one 201 and the rest 409")
+            if 201 in codes:
+                stats["created"] += 1
+                stats["duplicates"] += codes.count(409)
+                count, total = expected[rated]
+                expected[rated] = (count + 1, total + score)
+
+        invariants = await check_invariants(ctx, seen)
+        actual = await read_summaries()
+        for user_id in user_ids:
+            if actual[user_id] != expected[user_id]:
+                stats["problems"].append(f"round {round_number}: summary of user {user_id} is {actual[user_id]}, the winning requests add up to {expected[user_id]}")
+        log.info("ratings round %d/%d: %d of %d riders completed a ride; %s; the driver's summary is now %s (it was %s before the run); %s",
+                 round_number, args.rounds, len(completed), args.riders, fired["summary"], actual[user_ids[0]], before[user_ids[0]], invariants)
+        if not (round_number == args.rounds and args.keep_last_round):
+            await cleanup(ctx)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Concurrency stress test: fires simultaneous requests and checks database invariants")
-    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos", "payments"], default="drivers")
+    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos", "payments", "ratings"], default="drivers")
     parser.add_argument("--admin-email", default=os.environ.get("SIM_ADMIN_EMAIL"), help="or env SIM_ADMIN_EMAIL")
     parser.add_argument("--admin-password", default=os.environ.get("SIM_ADMIN_PASSWORD"), help="or env SIM_ADMIN_PASSWORD")
     parser.add_argument("--webhook-secret", default=os.environ.get("STRIPE_WEBHOOK_SECRET"), help="payments scenario: the backend's webhook secret, or env STRIPE_WEBHOOK_SECRET")
@@ -1120,7 +1336,7 @@ async def main() -> int:
     if not 2 <= args.riders <= 100:
         parser.error("--riders must be between 2 and 100")
     if args.drivers is None:
-        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10, "payments": 0}[args.scenario]
+        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10, "payments": 0, "ratings": 1}[args.scenario]
     if not 10 <= args.chaos_seconds <= 600:
         parser.error("--chaos-seconds must be between 10 and 600")
     if not 30 <= args.settle_seconds <= 300:
@@ -1195,7 +1411,7 @@ async def main() -> int:
 
                 scenario = {
                     "drivers": scenario_drivers, "riders": scenario_riders, "fleet": scenario_fleet, "chaos": scenario_chaos,
-                    "payments": scenario_payments,
+                    "payments": scenario_payments, "ratings": scenario_ratings,
                 }[args.scenario]
                 task = asyncio.create_task(scenario(ctx))
                 try:
@@ -1300,6 +1516,24 @@ async def main() -> int:
                  surged, highest, surge_total)
         if not surged:
             log.warning("  no ride had surge in this run: it proves nothing about the surge path")
+        by_score = collections.Counter()
+        directions = {True: [0, 0], False: [0, 0]}  # by the rider (True) or by the driver: [ratings, sum of the scores]
+        for score, by_rider, number in ctx["rating_stats"]:
+            by_score[score] += number
+            directions[by_rider][0] += number
+            directions[by_rider][1] += score * number
+        log.info("  ratings: %d created (%d by riders, %d by drivers), %d answered 409; by score %s", counters["ratings_by_rider"] + counters["ratings_by_driver"],
+                 counters["ratings_by_rider"], counters["ratings_by_driver"], counters["rating_409"], dict(sorted(by_score.items())))
+        log.info("  ratings in the database from this run: rider to driver %d (average %s), driver to rider %d (average %s)",
+                 directions[True][0], f"{directions[True][1] / directions[True][0]:.2f}" if directions[True][0] else "-",
+                 directions[False][0], f"{directions[False][1] / directions[False][0]:.2f}" if directions[False][0] else "-")
+        log.info("  rating duplicates: %d pairs sent at once, %d without exactly one winner (rating_dup_error, should be 0); "
+                 "%d attempts on rides that did not complete, %d answered 409", counters["rating_dup_pairs"], counters["rating_dup_error"],
+                 counters["rating_notcompleted_tried"], counters["rating_notcompleted_409"])
+        log.info("  rating views checked against SQL: %d users (/ratings/me), %d driver details; rating_view_mismatch %d (should be 0)",
+                 ctx["rating_checked"]["users"], ctx["rating_checked"]["rides"], len(ctx["rating_view_mismatches"]))
+        for mismatch in ctx["rating_view_mismatches"][:5]:
+            log.error("  RATING VIEW MISMATCH %s", mismatch)
         log.info("  final offers by status: %s", dict(sorted(ctx["chaos"]["offer"].items())))
         log.info("  5xx answers: %d, connection errors: %d%s", server_errors, counters["transport_errors"],
                  " (tolerated)" if args.tolerate_5xx else "")
@@ -1312,7 +1546,9 @@ async def main() -> int:
         for what, label in (("wallet_rides_requested", "wallet ride request"), ("adjust_replays_sent", "adjustment sent twice at once"),
                             ("duplicate_requests", "duplicate ride request"), ("rider_cancels_ok", "rider cancel"), ("driver_cancels", "driver cancel"),
                             ("trips_completed", "completed trip"), ("offline_events", "driver going offline"), ("double_accepts", "double accept"),
-                            ("rejects", "reject"), ("ignores", "ignored offer")):
+                            ("rejects", "reject"), ("ignores", "ignored offer"), ("ratings_by_rider", "rating by a rider"),
+                            ("ratings_by_driver", "rating by a driver"), ("rating_dup_pairs", "rating sent twice at once"),
+                            ("rating_notcompleted_tried", "rating attempt on a ride that did not complete")):
             if not counters[what]:
                 log.warning("  no %s happened in this run: it proves nothing about that case", label)
         problems = [f"{code} in {len(ctx['rounds'][0][name])} offenders" for name, (code, *_rest) in INVARIANTS.items() if ctx["rounds"][0].get(name)]
@@ -1324,6 +1560,12 @@ async def main() -> int:
             problems.append(f"{len(ctx['wallet_mismatches'])} wallets whose final balance does not add up")
         if ctx["money_view_mismatches"]:
             problems.append(f"{len(ctx['money_view_mismatches'])} money view mismatches")
+        if ctx["rating_view_mismatches"]:
+            problems.append(f"{len(ctx['rating_view_mismatches'])} rating view mismatches")
+        if counters["rating_dup_error"]:
+            problems.append(f"{counters['rating_dup_error']} duplicate rating pairs without exactly one 201")
+        if counters["rating_notcompleted_tried"] != counters["rating_notcompleted_409"] and not args.tolerate_5xx:
+            problems.append("a rating of a ride that did not complete was not refused with 409")
         if earning_gross != earning_fees + earning_driver:
             problems.append("earning rows whose gross is not fees plus earnings")
         if server_errors and not args.tolerate_5xx:
@@ -1337,6 +1579,25 @@ async def main() -> int:
             log.info("CHAOS FOUND PROBLEMS: %s", ", ".join(problems))
             return 1
         log.info("CHAOS CLEAN")
+        return 0
+
+    if args.scenario == "ratings" and not failure:
+        stats = ctx["ratings"]
+        log.info("  rides completed by the one driver: %d (%d setup failures, those riders were skipped)", stats["rides"], stats["setup_failures"])
+        log.info("  ratings created: %d of %d raters (%d copies of every request); duplicate answers (409): %d, exactly %d per rater expected",
+                 stats["created"], stats["raters"], RATING_BURST_COPIES, stats["duplicates"], RATING_BURST_COPIES - 1)
+        for number, (seconds, median_ms, sent) in enumerate(stats["bursts"], 1):
+            log.info("  burst %d: %d requests in %.0f ms, median latency %.0f ms (the hottest row is the driver's summary: every rider's rating lands on it)",
+                     number, sent, seconds * 1000, median_ms)
+        for problem in stats["problems"][:20]:
+            log.error("  RATING PROBLEM %s", problem)
+        if ctx["checks"] == 0:
+            log.error("INVARIANTS NOT CHECKED: no snapshot was taken")
+            return 2
+        if violated or stats["problems"]:
+            log.info("RATINGS FOUND PROBLEMS: %s", ", ".join(violated + [f"{len(stats['problems'])} rating problems"] * bool(stats["problems"])))
+            return 1
+        log.info("RATINGS CLEAN")
         return 0
 
     if args.scenario == "payments" and not failure:

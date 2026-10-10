@@ -44,6 +44,11 @@ const FIT_PADDING = [40, 40];
 const ENTRIES_PAGE = 10; // earning entries shown at first, and added by each "Show more"
 const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
+// "★★★★☆". Built as text, never as markup.
+function stars(score) {
+  return "★".repeat(score) + "☆".repeat(5 - score);
+}
+
 const session = getSession();
 const state = {
   user: session ? session.user : null,
@@ -68,6 +73,9 @@ const state = {
   earningsPeriod: "today", // "today", "week" or "all", written only by the period buttons' handlers
   earningsSince: null, // the since (ISO) that the shown earnings were asked for, so "Show more" pages the same window
   earningsKey: null, // "start" or "ride:<id>": what the earnings were last loaded for; set before the call so a failure is not retried every poll
+  myRating: null, // answer of GET /ratings/me: {count, average}
+  ratingStatus: null, // answer of GET /rides/{id}/rating for a COMPLETED ride
+  ratingKey: null, // the finished ride's id ("none" while there is none) the ratings were loaded for; set before the calls so a failure is not retried every poll
   socketStatus: "connecting", // "connecting", "open", "reconnecting", "closed", as reported by ws.js
   socketInfo: null, // the info that came with the status
   error: "",
@@ -91,6 +99,15 @@ const wrongRoleText = document.getElementById("wrong-role-text");
 const driverIdSection = document.getElementById("driver-id-section");
 const driverId = document.getElementById("driver-id");
 const verificationText = document.getElementById("verification-text");
+const myRating = document.getElementById("my-rating");
+const ratingSection = document.getElementById("rating-section");
+const ratingForm = document.getElementById("rating-form");
+const ratingComment = document.getElementById("rating-comment");
+const ratingExpires = document.getElementById("rating-expires");
+const ratingMine = document.getElementById("rating-mine");
+const ratingMineText = document.getElementById("rating-mine-text");
+const ratingMineComment = document.getElementById("rating-mine-comment");
+const ratingClosed = document.getElementById("rating-closed");
 const profileSection = document.getElementById("profile-section");
 const profileForm = document.getElementById("profile-form");
 const vehicleSection = document.getElementById("vehicle-section");
@@ -203,6 +220,15 @@ async function loadEarnings() {
   state.earnings = { summary, entries, hasMore: entries.length === ENTRIES_PAGE };
 }
 
+// Your own rating, and the rating status of a COMPLETED ride. Not called on every poll: refresh() calls it when the page
+// loads and once per finished ride, and the submit handler calls it again after a rating.
+async function loadRatings() {
+  const finished = state.ride !== null && FINISHED.includes(state.ride.status) ? state.ride : null;
+  state.ratingKey = finished === null ? "none" : finished.id;
+  state.myRating = await api("GET", "/ratings/me");
+  state.ratingStatus = finished !== null && finished.status === "COMPLETED" ? await api("GET", `/rides/${finished.id}/rating`) : null;
+}
+
 async function refresh() {
   if (!state.user || state.user.role !== "driver") return;
   try {
@@ -254,6 +280,8 @@ async function refresh() {
         state.earningsKey = key;
         await loadEarnings();
       }
+      const ratingsFor = state.ride !== null && FINISHED.includes(state.ride.status) ? state.ride.id : "none";
+      if (state.ratingKey !== ratingsFor) await loadRatings();
     }
   } catch (err) {
     state.error = err.message;
@@ -333,6 +361,12 @@ function render() {
   driverId.textContent = hasProfile ? state.driver.id : "";
   verificationText.hidden = !hasVehicle;
   if (hasVehicle) verificationText.textContent = VERIFICATION_TEXT[state.driver.verification_status];
+  myRating.hidden = !hasProfile || state.myRating === null;
+  if (!myRating.hidden) {
+    // A driver never sees a rider's rating, only their own. Plain text only.
+    const { average, count } = state.myRating;
+    myRating.textContent = average === null ? "Your rating: no ratings yet" : `Your rating: ★ ${average.toFixed(1)} (${count} ${count === 1 ? "rating" : "ratings"})`;
+  }
 
   profileSection.hidden = !isDriver || !state.loaded || hasProfile;
   vehicleSection.hidden = !hasProfile || hasVehicle;
@@ -491,6 +525,21 @@ function render() {
     cancelButton.hidden = status !== "DRIVER_ASSIGNED" && status !== "DRIVER_ARRIVED";
     doneButton.hidden = !FINISHED.includes(status);
 
+    // Only textContent: the comment is plain text. The form's inputs are never written here, only shown or hidden.
+    const rating = state.ratingKey === state.ride.id ? state.ratingStatus : null;
+    ratingSection.hidden = rating === null;
+    if (rating !== null) {
+      ratingForm.hidden = !rating.can_rate;
+      ratingExpires.textContent = rating.expires_at === null ? "" : `You can rate until ${new Date(rating.expires_at).toLocaleString()}`;
+      ratingMine.hidden = rating.mine === null;
+      ratingClosed.hidden = rating.reason !== "window_closed";
+      if (rating.mine !== null) {
+        ratingMineText.textContent = `You rated this trip ${stars(rating.mine.score)} (${rating.mine.score} of 5)`;
+        ratingMineComment.hidden = rating.mine.comment === null;
+        ratingMineComment.textContent = rating.mine.comment === null ? "" : rating.mine.comment;
+      }
+    }
+
     const rows = state.events.map((event) => {
       const row = document.createElement("tr");
       for (const text of [event.from_status || "-", event.to_status, new Date(event.created_at).toLocaleString()]) {
@@ -560,6 +609,9 @@ registerForm.addEventListener("submit", (event) => {
 });
 
 logoutButton.addEventListener("click", () => {
+  state.myRating = null;
+  state.ratingStatus = null;
+  state.ratingKey = null;
   disconnect();
   clearInterval(countdownTimer);
   clearSession();
@@ -615,6 +667,32 @@ startForm.addEventListener("submit", (event) => {
   });
 });
 
+// The stars and the comment are written only here: cleared after a rating is accepted, kept after an error.
+// With no star chosen nothing is sent.
+ratingForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const chosen = ratingForm.querySelector('input[name="score"]:checked');
+  if (chosen === null) {
+    state.error = "Choose a star rating first";
+    render();
+    return;
+  }
+  const body = { score: Number(chosen.value) };
+  const comment = ratingComment.value.trim();
+  if (comment !== "") body.comment = comment;
+  act(async () => {
+    try {
+      await api("POST", `/rides/${state.ride.id}/rating`, body);
+    } catch (err) {
+      // For example "already rated" (a second tab, a double click): show the message and what is true now.
+      if (err.status === 409) await loadRatings();
+      throw err;
+    }
+    ratingForm.reset();
+    await loadRatings();
+  });
+});
+
 completeButton.addEventListener("click", () => act(() => api("POST", `/rides/${state.ride.id}/complete`)));
 
 cancelButton.addEventListener("click", () => {
@@ -625,10 +703,13 @@ cancelButton.addEventListener("click", () => {
 
 doneButton.addEventListener("click", () => {
   codeInput.value = "";
+  ratingForm.reset();
   act(async () => {
     state.ride = null;
     state.rideId = null;
     state.events = [];
+    state.ratingStatus = null;
+    state.ratingKey = null; // the next refresh loads your rating again
   });
 });
 

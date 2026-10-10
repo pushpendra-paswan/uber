@@ -11,12 +11,14 @@ from app.models import ACTIVE_RIDE_STATUSES, OfferStatus, Ride, RideEvent, RideS
 from app.repositories import drivers as drivers_repo
 from app.repositories import events
 from app.repositories import offers as offers_repo
+from app.repositories import ratings as ratings_repo
 from app.repositories import rides as rides_repo
 from app.repositories import users as users_repo
 from app.repositories import wallet as wallet_repo
-from app.schemas import CancellationFeeResponse, DriverLocation, EstimateRequest, OtpResponse, RideCreate, RideDriverResponse, VehicleResponse
+from app.schemas import CancellationFeeResponse, DriverLocation, EstimateRequest, OtpResponse, RatingPublic, RideCreate, RideDriverResponse, VehicleResponse
 from app.services import matching, payments, pricing, routing
 from app.utils.geo import is_inside_bounds
+from app.utils.ratings import PUBLIC_MIN_RATINGS, average
 
 MIN_TRIP_DISTANCE_M = 200
 
@@ -171,11 +173,14 @@ async def get_ride_driver(db: AsyncSession, user: User, ride_id: int) -> RideDri
     driver = await drivers_repo.get_by_id(db, ride.driver_id)
     # A finished ride never shows where the driver is now, even if the driver is online for another ride.
     presence = await drivers_repo.get_presence(driver.id) if ride.status in ACTIVE_RIDE_STATUSES else None
+    count, total = await ratings_repo.get_summary(db, driver.user_id)
+    driver_average = average(count, total)
     return RideDriverResponse(
         driver_id=driver.id,
         name=driver.user.name,
         vehicle=VehicleResponse.model_validate(driver.vehicle) if driver.vehicle is not None else None,
         location=DriverLocation(**presence) if presence is not None else None,
+        rating=RatingPublic(count=count, average=driver_average if count >= PUBLIC_MIN_RATINGS else None),
     )
 
 

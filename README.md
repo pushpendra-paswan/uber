@@ -428,6 +428,37 @@ curl -s "localhost:8000/rides/<id>/receipt" -H "Authorization: Bearer $RIDER_TOK
 
 **Receipts** are derived from what was stored when the ride was settled (the fare breakdown, the payment, the ledger entry), never recomputed, so a later change to the pricing rule or to surge cannot change one. The number is `RCPT-` plus the ride id padded to 8 digits. A receipt has the issue time, the route, the driver's name and vehicle (plate, model, color; no id, no contact data), the estimate, either the trip lines (distance, time, base, distance and time fares, minimum fare, surge, cap, total) or the cancellation fee with its reason, and the payment (method, amount, status, and the wallet balance after the charge for a wallet ride). It never shows the commission or the driver's earning. Rides settled before surge existed (M5.2) have no surge keys in their breakdown and show a surge of 100 percent. There is no list of receipts yet (M6.3). The rider page shows the receipt of a finished, charged ride with a "Print receipt" button (the print style shows only the receipt); the driver page has an Earnings section with Today, Last 7 days and All time.
 
+## Ratings (M6.1)
+
+After a **completed** trip the rider can rate the driver and the driver can rate the rider, once each, from 1 to 5 stars with an optional comment. Each person's running average is kept in the same transaction as the rating.
+
+**Rules.**
+
+- Only the two people of a COMPLETED ride, each rating the other one. Cancelled rides (even with a fee), rides with no driver found and active rides answer `409 You can only rate completed trips`; a ride you are not part of is a `404`; an admin cannot rate (`403`).
+- **Once, and final.** A second attempt, even with another score, is `409 You have already rated this trip`. There is no editing and no deleting.
+- **Seven days.** You can rate until `completed_at` plus 7 days (`RATING_WINDOW_DAYS` in `services/ratings.py`); after that `409 The rating period for this trip has ended`.
+- The score must be a whole number from 1 to 5 (`"5"`, `4.5` and `true` are a `422`). The comment is optional, stripped, at most 300 characters; an empty one is stored as nothing.
+
+**The average.** The database keeps `rating_count` and `rating_total` per rated user (`rating_summaries`), changed by one atomic upsert in the rating's own transaction. The average is worked out in integer hundredths, rounded half up: `(total * 100 + count // 2) // count`, then divided by 100. For example 8 ratings totalling 37 give 4.63 (Python's `round()` would give 4.62), and the scores 5, 4, 4 give `1300 / 3 -> (1300 + 1) // 3 = 433`, so 4.33.
+
+**Who sees what.** Your own count and average (`GET /ratings/me`) are always the real values. Another person's average, as a rider sees it on the driver details, is shown only from **3 ratings** (the count is always shown): one or two ratings are too easy to trace to a person. **Individual ratings are never shown to the person who was rated**, so nobody can answer a low score with revenge; a rater sees only their own rating. Comments are private to their author and to admins.
+
+| Endpoint | Who | Answer |
+|---|---|---|
+| `POST /rides/{id}/rating` `{"score": 4, "comment": "..."}` | the ride's rider or driver | `201` with `id`, `ride_id`, `score`, `comment`, `created_at` |
+| `GET /rides/{id}/rating` | the ride's rider or driver | `can_rate`, `reason` (`not_completed`, `already_rated`, `window_closed` or null), `expires_at`, and `mine` (your own rating or null) |
+| `GET /ratings/me` | rider, driver | `count` and `average` (null with no ratings) |
+| `GET /rides/{id}/driver` | as before | gains `rating: {count, average}`, the average hidden below 3 ratings |
+| `GET /admin/ratings?user_id=&max_score=&limit=&before_id=` | admin | ratings about `user_id`, newest first, with comments and both user ids (`limit` 1 to 100, default 20) |
+
+```bash
+curl -s -X POST localhost:8000/rides/<id>/rating -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"score": 5, "comment": "Smooth ride"}'
+curl -s localhost:8000/ratings/me -H "Authorization: Bearer $TOKEN"
+curl -s "localhost:8000/admin/ratings?user_id=7&max_score=2" -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+**The pages.** The rider and driver pages show "Your rating" (loaded when the page loads, once when a ride finishes, and after you rate; never on every 3-second poll) and, for a COMPLETED ride, a "Rate your driver" / "Rate the rider" form with five stars and a comment box. The rider sees the driver's rating in "Your driver" ("New driver" until there are 3 ratings). Comments are always shown as plain text. Ratings can only be given from that finished-ride view or the API until the history page (M6.3).
+
 ## Concurrency stress test (M4.1, M4.2, M4.3)
 
 `simulator/stress.py` fires many requests at the same instant and then looks in the database for broken invariants. M4.1 used it to reproduce a real bug (the offer flow checked "is this driver free?" and wrote the offer in separate steps, with no lock in between); M4.2 fixed it with row locks in Postgres (the rider's `users` row in `POST /rides`, the driver's `drivers` row in matching and in accept; see `PROJECT_CONTEXT.md`). **Exit code 0 ("no violation observed") is the expected result for every scenario, including `chaos` (M4.3).** An exit code of 1 means a lock is missing or broken.
@@ -466,6 +497,15 @@ export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --
 
 **Money views in the chaos run (M5.4).** After the settle period (and before the cleanup) the run prints the earning rows of the run (count, gross, platform fees and driver earnings; gross must equal fees plus earnings) and compares the public money views with the database, using its own grouped SQL: the all-time `GET /admin/revenue` (counts, the three buckets and the settlement), the all-time `GET /drivers/me/earnings` of every stress driver, and up to 20 receipts of the run's settled rides (`payment.amount` equal to `final_fare`, the same payment method, the number `RCPT-` plus the padded id). A difference is asked again once after 2 seconds, in case something was still settling; what remains is `money_view_mismatch` (the first five are printed), and any non-zero value is a violation (exit 1).
 
+**Ratings in the chaos run (M6.1).** After a rider sees its ride COMPLETED, with 60 percent probability it rates the driver after a random 0 to 5 s pause (score 1 to 5, a comment half of the time), and 10 percent of those send the same rating twice at once; with 5 percent probability it tries to rate a ride it saw CANCELLED or NO_DRIVER_FOUND instead (must be a `409`). A driver agent does the same after it completes a ride, rating the rider. A pair sent at once must give exactly one `201` and one `409` (`rating_dup_error` counts the pairs that did not, any non-zero value is a violation). After the settle period the run compares the views with its own SQL: `GET /ratings/me` of every stress rider and driver (the real count and the average in integer hundredths, half up) and `GET /rides/{id}/driver` of up to 20 rides of a stress driver (`rating.count` equal to SQL, `rating.average` null below 3 ratings and equal to SQL from 3). A difference is asked again once after 2 seconds; what remains is `rating_view_mismatch` (the first five are printed), and any non-zero value is a violation (exit 1). The summary also prints the ratings of the run by score and by direction (rider to driver, driver to rider) with the average of each.
+
+**The `ratings` scenario (M6.1).** One stress driver (`stress-driver-01`) completes a ride for each rider, one at a time and only through the API (request, offer, accept, arrive, start with the code, complete). Then ONE burst: every completed rider rates the driver and the driver rates every rider, each request sent 3 times at once (`--api-url` values are used round-robin). Per rater exactly one `201` and two `409`. After the burst the summary rows must equal what was there before the run plus the scores of the winning requests: the driver's row takes every rider's rating, so it is the hottest row, and the summary reports the burst duration and the median latency. A rider whose ride does not complete is skipped and reported; fewer than 2 completed riders is exit code 2. I1 to I22 are checked after every round.
+
+```bash
+.venv-sim/bin/python simulator/stress.py --scenario ratings --riders 20 --rounds 5     # RATINGS CLEAN
+.venv-sim/bin/python simulator/stress.py --scenario ratings --riders 60 --rounds 3 --api-url http://127.0.0.1:8000,http://127.0.0.1:8001
+```
+
 **The `payments` scenario (M5.3).** It needs the backend to use the local fake Stripe (see "Payments and wallet"); it creates one Checkout Session per rider per round in whichever Stripe the backend uses, and prints a warning to that effect. No drivers are needed.
 
 ```bash
@@ -473,7 +513,7 @@ export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --
 # or: export STRIPE_WEBHOOK_SECRET=...   two backend processes: --api-url http://127.0.0.1:8000,http://127.0.0.1:8001
 ```
 
-Each round, for all riders at once: (1) the same top-up request five times at once (one top-up row per rider and key, the same id in every answer; a `409` "in progress" is retried once after a second); (2) the signed `checkout.session.completed` event delivered ten times at once with one event id, plus three times with another event id for the same session (every answer 200, exactly one `processed` per top-up and one `ignored` for the first delivery of the other event id, the rest `duplicate`; every top-up SUCCEEDED with exactly one `TOPUP` entry, each balance up by exactly the top-up); (3) three badly signed events (wrong secret, tampered body, a timestamp 10 minutes old): all `400`, and the database does not change; (4) I1 to I20. The summary counts top-ups, webhook answers (`processed`, `duplicate`, `ignored`), and ends with `PAYMENTS CLEAN` or `PAYMENTS FOUND PROBLEMS: ...`. Exit code 2 with `INVARIANTS NOT CHECKED: Stripe is not configured on the backend ...` when the backend has no test key.
+Each round, for all riders at once: (1) the same top-up request five times at once (one top-up row per rider and key, the same id in every answer; a `409` "in progress" is retried once after a second); (2) the signed `checkout.session.completed` event delivered ten times at once with one event id, plus three times with another event id for the same session (every answer 200, exactly one `processed` per top-up and one `ignored` for the first delivery of the other event id, the rest `duplicate`; every top-up SUCCEEDED with exactly one `TOPUP` entry, each balance up by exactly the top-up); (3) three badly signed events (wrong secret, tampered body, a timestamp 10 minutes old): all `400`, and the database does not change; (4) I1 to I22. The summary counts top-ups, webhook answers (`processed`, `duplicate`, `ignored`), and ends with `PAYMENTS CLEAN` or `PAYMENTS FOUND PROBLEMS: ...`. Exit code 2 with `INVARIANTS NOT CHECKED: Stripe is not configured on the backend ...` when the backend has no test key.
 
 Other flags: `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url` (one URL or several separated by commas, see below), `--webhook-secret` (payments scenario), `--label` (free text printed in the summary header, so saved outputs identify themselves), `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
 
@@ -511,8 +551,10 @@ The container has no `pkill`; `docker compose up -d --force-recreate backend` st
 | I18 `topup_credit_mismatch` | a SUCCEEDED top-up has exactly one `TOPUP` entry of its amount on its user's wallet; any other top-up has no entry |
 | I19 `earning_payment_mismatch` | every payment has exactly one earning row, and the row agrees with it: the same ride, `gross_amount` equal to the payment amount, the ride's own driver, and the kind of the ride's breakdown |
 | I20 `earning_math_mismatch` | every earning row's `platform_fee + driver_earning = gross_amount`, the fee is `(gross * percent + 50) / 100`, nothing is negative, the gross is positive and the percent is between 0 and 100 |
+| I21 `rating_summary_mismatch` | every user's `rating_summaries` row equals the count and the sum of the ratings made about them (a missing row counts as 0) |
+| I22 `rating_participants_mismatch` | every rating is on a COMPLETED ride and goes between its rider and its driver's USER id, in either direction; nobody rates themselves |
 
-I4 to I20 cannot be legitimately violated even for an instant (each pair of changes, each status change with its settlement, each ledger entry with its cause, and each payment with its earning row is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
+I4 to I22 cannot be legitimately violated even for an instant (each pair of changes, each status change with its settlement, each ledger entry with its cause, each payment with its earning row, and each rating with its summary change is one transaction), so any sighting at any snapshot counts. Since M4.3 the database also refuses the bad states of I1 to I3 itself (partial unique indexes `uq_ride_offers_one_pending_per_driver`, `uq_rides_one_active_per_driver`, `uq_rides_one_active_per_rider`); the locks stay, because they avoid wasted work.
 
 ```bash
 docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql

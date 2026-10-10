@@ -49,6 +49,16 @@ const TOPUP_MIN_RUPEES = 100;
 const TOPUP_MAX_RUPEES = 10000;
 const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
+// "★★★★☆". Built as text, never as markup.
+function stars(score) {
+  return "★".repeat(score) + "☆".repeat(5 - score);
+}
+
+// "★ 4.7 (31 ratings)". The average is null when there are none (or, for someone else, too few to show).
+function formatRating(rating) {
+  return `★ ${rating.average.toFixed(1)} (${rating.count} ${rating.count === 1 ? "rating" : "ratings"})`;
+}
+
 const session = getSession();
 const state = {
   user: session ? session.user : null,
@@ -84,6 +94,9 @@ const state = {
   topupNotice: "", // "Payment received" and the like
   receipt: null, // answer of GET /rides/{id}/receipt for a finished ride that was charged
   receiptKey: null, // the ride id the receipt was asked for; set before the call so a failure is not retried every poll
+  myRating: null, // answer of GET /ratings/me: {count, average}
+  ratingStatus: null, // answer of GET /rides/{id}/rating for a COMPLETED ride
+  ratingKey: null, // the finished ride's id ("none" while there is none) the ratings were loaded for; set before the calls so a failure is not retried every poll
   paymentMethod: "cash", // written only by the radios' change handler
   error: "",
   busy: false,
@@ -124,6 +137,7 @@ const rideDriver = document.getElementById("ride-driver");
 const driverSection = document.getElementById("driver-section");
 const driverName = document.getElementById("driver-name");
 const driverVehicle = document.getElementById("driver-vehicle");
+const driverRating = document.getElementById("driver-rating");
 const driverTracking = document.getElementById("driver-tracking");
 const driverUpdated = document.getElementById("driver-updated");
 const reconnectButton = document.getElementById("reconnect-button");
@@ -185,12 +199,30 @@ const receiptTrip = document.getElementById("receipt-trip");
 const receiptLines = document.getElementById("receipt-lines");
 const receiptPayment = document.getElementById("receipt-payment");
 const printReceiptButton = document.getElementById("print-receipt-button");
+const myRating = document.getElementById("my-rating");
+const ratingSection = document.getElementById("rating-section");
+const ratingForm = document.getElementById("rating-form");
+const ratingComment = document.getElementById("rating-comment");
+const ratingExpires = document.getElementById("rating-expires");
+const ratingMine = document.getElementById("rating-mine");
+const ratingMineText = document.getElementById("rating-mine-text");
+const ratingMineComment = document.getElementById("rating-mine-comment");
+const ratingClosed = document.getElementById("rating-closed");
 let shownTopups = null; // the JSON of the top-ups in the DOM, so polling does not rebuild their buttons under a click
 
 // "5.2 km, 14 min". Used by the estimate panel and the ride view. Old rides have null values.
 function formatTrip(distanceM, durationS) {
   if (distanceM === null || durationS === null) return "-";
   return `${(distanceM / 1000).toFixed(1)} km, ${Math.max(1, Math.round(durationS / 60))} min`;
+}
+
+// Your own rating, and the rating status of a COMPLETED ride. Not called on every poll: refresh() calls it when the page
+// loads and once per finished ride, and the submit handler calls it again after a rating.
+async function loadRatings() {
+  const finished = state.ride !== null && FINISHED.includes(state.ride.status) ? state.ride : null;
+  state.ratingKey = finished === null ? "none" : finished.id;
+  state.myRating = await api("GET", "/ratings/me");
+  state.ratingStatus = finished !== null && finished.status === "COMPLETED" ? await api("GET", `/rides/${finished.id}/rating`) : null;
 }
 
 async function login(email, password) {
@@ -334,6 +366,10 @@ async function refresh() {
       state.receiptKey = state.ride.id;
       state.receipt = await api("GET", `/rides/${state.ride.id}/receipt`);
     }
+
+    // Last, like the receipt: a failure here cannot stop the checks above.
+    const ratingsFor = state.ride !== null && FINISHED.includes(state.ride.status) ? state.ride.id : "none";
+    if (state.ratingKey !== ratingsFor) await loadRatings();
   } catch (err) {
     state.error = err.message;
   }
@@ -580,6 +616,9 @@ function render() {
     }
   }
 
+  myRating.hidden = !isRider || state.myRating === null;
+  if (!myRating.hidden) myRating.textContent = state.myRating.average === null ? "Your rating: no ratings yet" : `Your rating: ${formatRating(state.myRating)}`;
+
   // Only textContent below: names, notes and addresses are plain text. No input is touched here.
   walletSection.hidden = !isRider || state.wallet === null;
   if (!walletSection.hidden) {
@@ -743,6 +782,7 @@ function render() {
     if (state.driver !== null) {
       const vehicle = state.driver.vehicle;
       driverName.textContent = state.driver.name;
+      driverRating.textContent = state.driver.rating.average === null ? "New driver" : `Rating: ${formatRating(state.driver.rating)}`;
       driverVehicle.textContent = vehicle === null ? "-" : `${vehicle.color} ${vehicle.model}, plate ${vehicle.plate_number}`;
       const live = TRACKING.includes(state.ride.status);
       driverTracking.hidden = !live;
@@ -762,6 +802,21 @@ function render() {
     }
     cancelButton.hidden = !CANCELLABLE.includes(state.ride.status);
     newRideButton.hidden = !FINISHED.includes(state.ride.status);
+
+    // Only textContent: the comment is plain text. The form's inputs are never written here, only shown or hidden.
+    const rating = state.ratingKey === state.ride.id ? state.ratingStatus : null;
+    ratingSection.hidden = rating === null;
+    if (rating !== null) {
+      ratingForm.hidden = !rating.can_rate;
+      ratingExpires.textContent = rating.expires_at === null ? "" : `You can rate until ${new Date(rating.expires_at).toLocaleString()}`;
+      ratingMine.hidden = rating.mine === null;
+      ratingClosed.hidden = rating.reason !== "window_closed";
+      if (rating.mine !== null) {
+        ratingMineText.textContent = `You rated this trip ${stars(rating.mine.score)} (${rating.mine.score} of 5)`;
+        ratingMineComment.hidden = rating.mine.comment === null;
+        ratingMineComment.textContent = rating.mine.comment === null ? "" : rating.mine.comment;
+      }
+    }
 
     const rows = state.events.map((event) => {
       const row = document.createElement("tr");
@@ -810,6 +865,9 @@ logoutButton.addEventListener("click", () => {
   state.otpKey = null;
   state.receipt = null;
   state.receiptKey = null;
+  state.myRating = null;
+  state.ratingStatus = null;
+  state.ratingKey = null;
   render(); // removes the driver marker
   clearSession();
   location.reload();
@@ -905,6 +963,32 @@ topupForm.addEventListener("submit", (event) => {
 
 reconnectButton.addEventListener("click", () => act(() => reconnectNow()));
 
+// The stars and the comment are written only here: cleared after a rating is accepted, kept after an error.
+// With no star chosen nothing is sent.
+ratingForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const chosen = ratingForm.querySelector('input[name="score"]:checked');
+  if (chosen === null) {
+    state.error = "Choose a star rating first";
+    render();
+    return;
+  }
+  const body = { score: Number(chosen.value) };
+  const comment = ratingComment.value.trim();
+  if (comment !== "") body.comment = comment;
+  act(async () => {
+    try {
+      await api("POST", `/rides/${state.ride.id}/rating`, body);
+    } catch (err) {
+      // For example "already rated" (a second tab, a double click): show the message and what is true now.
+      if (err.status === 409) await loadRatings();
+      throw err;
+    }
+    ratingForm.reset();
+    await loadRatings();
+  });
+});
+
 // Not through act(): printing changes no state and calls no API. The print styles show only the receipt.
 printReceiptButton.addEventListener("click", () => window.print());
 
@@ -937,6 +1021,9 @@ newRideButton.addEventListener("click", () => {
     state.otpKey = null;
     state.receipt = null;
     state.receiptKey = null;
+    state.ratingStatus = null;
+    state.ratingKey = null; // the next refresh loads your rating again
+    ratingForm.reset();
     for (const kind of KINDS) inputs[kind].value = "";
     pickRadios.pickup.checked = true;
   });

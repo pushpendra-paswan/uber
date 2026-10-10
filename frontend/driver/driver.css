@@ -77,3 +77,31 @@ dd {
   border-bottom: 1px solid #d0d4d9;
   overflow-wrap: anywhere;
 }
+
+textarea {
+  width: 100%;
+  padding: 0.5rem;
+  font: inherit;
+  border: 1px solid #aab0b8;
+  border-radius: 0.25rem;
+  resize: vertical;
+}
+
+fieldset {
+  margin: 0.75rem 0 0;
+  padding: 0.25rem 0.75rem 0.75rem;
+  border: 1px solid #d0d4d9;
+  border-radius: 0.25rem;
+}
+
+input[type="radio"] {
+  width: auto;
+}
+
+.radio {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-items: center;
+  margin-right: 1rem;
+  font-weight: normal;
+}

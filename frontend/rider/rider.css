@@ -71,6 +71,15 @@ input[type="radio"] {
   font-weight: normal;
 }
 
+textarea {
+  width: 100%;
+  padding: 0.5rem;
+  font: inherit;
+  border: 1px solid #aab0b8;
+  border-radius: 0.25rem;
+  resize: vertical;
+}
+
 #request-button {
   margin-top: 1rem;
 }
@@ -139,6 +148,7 @@ input[type="radio"] {
   #message,
   #login-section,
   #wrong-role-section,
+  #my-rating,
   #wallet-section,
   #map-section,
   #request-section,

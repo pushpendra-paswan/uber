@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import Header
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, StrictInt, field_validator, model_validator
 
 from app.models import PaymentMethod, PaymentStatus, RideStatus, TopupStatus, UserRole, VerificationStatus, WalletEntryKind
 
@@ -94,6 +94,12 @@ class DriverLocation(BaseModel):
     updated_at: int  # epoch seconds of the last update
 
 
+# What other people see of someone's ratings: how many, and the average only once there are enough to hide each person.
+class RatingPublic(BaseModel):
+    count: int
+    average: float | None
+
+
 # What a rider (or the assigned driver, or an admin) may know about the driver of a ride:
 # no email, phone, license number, or verification status.
 class RideDriverResponse(BaseModel):
@@ -101,6 +107,7 @@ class RideDriverResponse(BaseModel):
     name: str
     vehicle: VehicleResponse | None
     location: DriverLocation | None
+    rating: RatingPublic
 
 
 class EstimateRequest(BaseModel):
@@ -383,3 +390,48 @@ class ReceiptResponse(BaseModel):
     trip: ReceiptTrip | None
     cancellation: ReceiptCancellation | None
     payment: ReceiptPayment
+
+
+class RatingCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    score: StrictInt = Field(ge=1, le=5)  # strict: "5", 4.5 and true are refused
+    comment: str | None = Field(default=None, max_length=300)
+
+    @field_validator("comment")
+    @classmethod
+    def empty_comment_is_none(cls, comment: str | None) -> str | None:
+        return comment or None
+
+
+# What the rater may know about their own rating: no user ids.
+class RatingResponse(BaseModel):
+    id: int
+    ride_id: int
+    score: int
+    comment: str | None
+    created_at: datetime
+
+
+class RatingStatusResponse(BaseModel):
+    can_rate: bool
+    reason: Literal["not_completed", "already_rated", "window_closed"] | None
+    expires_at: datetime | None  # the end of the rating window, for a COMPLETED ride
+    mine: RatingResponse | None  # the caller's own rating; the other person's is never read
+
+
+# Your own ratings: the real average, even when there are only one or two.
+class RatingSummaryResponse(BaseModel):
+    count: int
+    average: float | None
+
+
+# The only place a score is shown together with its comment and both people, for admins.
+class AdminRatingResponse(BaseModel):
+    id: int
+    ride_id: int
+    from_user_id: int
+    to_user_id: int
+    score: int
+    comment: str | None
+    created_at: datetime

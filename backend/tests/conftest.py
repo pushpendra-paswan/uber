@@ -303,6 +303,27 @@ async def insert_ride(db: AsyncSession):
 
 
 @pytest_asyncio.fixture
+async def completed_ride(db: AsyncSession):
+    """Returns a function that inserts a COMPLETED ride straight into the database for a rider and a driver, completed at
+    `completed_at` (now by default). A rider and a driver can rate each other on it; there is no payment. Returns the ride."""
+
+    async def create(rider: dict, driver: dict, completed_at: datetime | None = None) -> Ride:
+        completed_at = completed_at or datetime.now(timezone.utc)
+        ride = Ride(
+            rider_id=rider["user"].id, driver_id=driver["driver"].id, status=RideStatus.COMPLETED,
+            pickup_lat=settings.city_center_lat, pickup_lng=settings.city_center_lng, pickup_address="MG Road",
+            dropoff_lat=settings.city_south, dropoff_lng=settings.city_east, dropoff_address="Koramangala",
+            distance_m=5000, duration_s=900, fare_estimate=14000, started_at=completed_at - timedelta(minutes=15),
+            completed_at=completed_at,
+        )
+        db.add(ride)
+        await db.commit()
+        return ride
+
+    return create
+
+
+@pytest_asyncio.fixture
 async def settled_ride(db: AsyncSession):
     """Returns a function that inserts a settled ride straight into the database: the ride (COMPLETED for a trip, CANCELLED for a
     cancellation) with a final fare of `amount` paise, its succeeded payment, and its earning row split at `percent`, all dated

@@ -1,5 +1,5 @@
 -- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1, I12 since M5.2,
--- I13 to I18 since M5.3, I19 and I20 since M5.4). Read-only. One SELECT per invariant, one row per offender:
+-- I13 to I18 since M5.3, I19 and I20 since M5.4, I21 and I22 since M6.1). Read-only. One SELECT per invariant, one row per offender:
 -- an empty result means the invariant holds. Used by simulator/stress.py, and runnable by hand:
 --   docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
 -- Statuses are stored as the enum names in upper case (VARCHAR, no CHECK constraint).
@@ -229,3 +229,25 @@ WHERE platform_fee + driver_earning <> gross_amount
    OR platform_fee < 0 OR driver_earning < 0 OR gross_amount <= 0
    OR commission_percent NOT BETWEEN 0 AND 100
 ORDER BY id;
+
+\echo '== rating_summary_mismatch'
+-- I21: every user's rating_summaries row equals the count and the sum of the ratings made about them (a missing row counts
+-- as 0). The summary changes in the same transaction as the rating, so this cannot be violated even for an instant.
+SELECT COALESCE(s.user_id, r.to_user_id) AS user_id, COALESCE(s.rating_count, 0) AS summary_count,
+       COALESCE(s.rating_total, 0) AS summary_total, COALESCE(r.n, 0) AS ratings_count, COALESCE(r.total, 0) AS ratings_sum
+FROM rating_summaries s
+FULL JOIN (SELECT to_user_id, count(*) AS n, sum(score) AS total FROM ratings GROUP BY to_user_id) r ON r.to_user_id = s.user_id
+WHERE COALESCE(s.rating_count, 0) <> COALESCE(r.n, 0) OR COALESCE(s.rating_total, 0) <> COALESCE(r.total, 0)
+ORDER BY 1;
+
+\echo '== rating_participants_mismatch'
+-- I22: a rating is about a COMPLETED ride and goes between its two people, in either direction: the rider rates the driver's
+-- USER id, the driver's user rates the rider. Nobody rates themselves. (IS NOT TRUE also catches a ride with no driver.)
+SELECT g.id AS rating_id, g.ride_id, r.status AS ride_status, g.from_user_id, g.to_user_id, r.rider_id, d.user_id AS driver_user_id
+FROM ratings g
+JOIN rides r ON r.id = g.ride_id
+LEFT JOIN drivers d ON d.id = r.driver_id
+WHERE r.status <> 'COMPLETED'
+   OR g.from_user_id = g.to_user_id
+   OR ((g.from_user_id = r.rider_id AND g.to_user_id = d.user_id) OR (g.from_user_id = d.user_id AND g.to_user_id = r.rider_id)) IS NOT TRUE
+ORDER BY g.id;

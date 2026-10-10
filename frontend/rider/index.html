@@ -19,6 +19,7 @@
     </header>
 
     <p id="message" class="message" role="alert" hidden></p>
+    <p id="my-rating" class="note" hidden></p>
 
     <section id="login-section" hidden>
       <h2>Log in</h2>
@@ -188,9 +189,33 @@
         <h3>Your driver</h3>
         <p><strong id="driver-name"></strong></p>
         <p id="driver-vehicle"></p>
+        <p id="driver-rating"></p>
         <p id="driver-tracking" class="note" hidden></p>
         <p id="driver-updated" class="note" hidden></p>
         <button id="reconnect-button" type="button" hidden>Reconnect</button>
+      </div>
+
+      <div id="rating-section" hidden>
+        <h3>Rate your driver</h3>
+        <form id="rating-form" hidden>
+          <fieldset>
+            <legend>Stars</legend>
+            <label class="radio"><input type="radio" name="score" value="1" autocomplete="off"> 1 star</label>
+            <label class="radio"><input type="radio" name="score" value="2" autocomplete="off"> 2 stars</label>
+            <label class="radio"><input type="radio" name="score" value="3" autocomplete="off"> 3 stars</label>
+            <label class="radio"><input type="radio" name="score" value="4" autocomplete="off"> 4 stars</label>
+            <label class="radio"><input type="radio" name="score" value="5" autocomplete="off"> 5 stars</label>
+          </fieldset>
+          <label for="rating-comment">Comment (optional, only our team can read it)</label>
+          <textarea id="rating-comment" name="comment" rows="3" maxlength="300" autocomplete="off"></textarea>
+          <button type="submit">Submit rating</button>
+          <p id="rating-expires" class="note"></p>
+        </form>
+        <div id="rating-mine" hidden>
+          <p id="rating-mine-text"></p>
+          <p id="rating-mine-comment" class="note" hidden></p>
+        </div>
+        <p id="rating-closed" hidden>The rating period for this trip has ended.</p>
       </div>
 
       <button id="cancel-button" type="button" hidden>Cancel ride</button>

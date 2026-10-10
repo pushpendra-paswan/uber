@@ -326,6 +326,10 @@ class Rating(Base):
     __table_args__ = (
         CheckConstraint("score >= 1 AND score <= 5", name="score_range"),
         UniqueConstraint("ride_id", "from_user_id", name="uq_ratings_ride_id_from_user_id"),
+        CheckConstraint("from_user_id <> to_user_id", name="no_self_rating"),
+        CheckConstraint("comment IS NULL OR char_length(comment) <= 300", name="comment_length"),
+        # The admin list: one person's ratings, newest first.
+        Index("ix_ratings_to_user_id_id", "to_user_id", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -333,8 +337,24 @@ class Rating(Base):
     from_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     to_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     score: Mapped[int] = mapped_column(Integer)
-    comment: Mapped[str | None] = mapped_column(String(500))
+    comment: Mapped[str | None] = mapped_column(String(500))  # the check constraint keeps it to 300; private to the author and admins
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RatingSummary(Base):
+    __tablename__ = "rating_summaries"
+    __table_args__ = (
+        CheckConstraint("rating_count >= 0", name="count_not_negative"),
+        # Every score is 1 to 5.
+        CheckConstraint("rating_total BETWEEN rating_count AND rating_count * 5", name="total_within_range"),
+    )
+
+    # One row per rated user, changed only by repositories/ratings.add_to_summary (one atomic upsert in the rating's own
+    # transaction). The average is derived: see utils/ratings.average.
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    rating_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    rating_total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class PricingRule(Base):

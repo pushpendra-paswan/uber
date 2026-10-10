@@ -221,7 +221,7 @@ async def test_the_details_hold_only_name_vehicle_and_location(client, db, assig
     response = await get_driver_details(client, assigned["ride_id"], assigned["rider"]["headers"])
 
     body = response.json()
-    assert set(body) == {"driver_id", "name", "vehicle", "location"}
+    assert set(body) == {"driver_id", "name", "vehicle", "location", "rating"}
     assert body["driver_id"] == driver["driver"].id
     assert body["name"] == "Test driver"
     assert set(body["vehicle"]) == {"id", "plate_number", "model", "color", "vehicle_type"}

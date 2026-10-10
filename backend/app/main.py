@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine, redis_client
-from app.routers import admin, auth, drivers, offers, payments, places, rides, websocket
+from app.routers import admin, auth, drivers, offers, payments, places, ratings, rides, websocket
 from app.services import offers as offers_service
 from app.services.payments import TEST_KEY_PREFIXES
 
@@ -78,6 +78,7 @@ app.include_router(rides.router)
 app.include_router(offers.router)
 app.include_router(payments.router)
 app.include_router(places.router)
+app.include_router(ratings.router)
 app.include_router(websocket.router)
 
 # Mounted last so it does not shadow the API routes above.
