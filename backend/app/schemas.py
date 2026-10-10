@@ -2,9 +2,23 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import Header
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, StrictInt, field_validator, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, StrictInt, field_validator, model_validator
 
-from app.models import PaymentMethod, PaymentStatus, RideStatus, TopupStatus, UserRole, VerificationStatus, WalletEntryKind
+from app.models import OfferStatus, PaymentMethod, PaymentStatus, RideStatus, TopupStatus, UserRole, VerificationStatus, WalletEntryKind
+
+# The editable pricing values and their allowed range (money in paise). The one source of the bounds: the Field constraints of
+# PricingRulePatch use it, and GET /admin/pricing-rules returns it so the page never hard-codes a range. Only the safety floors
+# and the surge_cap range are also database checks, so the upper bounds can be raised without a migration.
+RULE_LIMITS = {
+    "base_fare": {"min": 0, "max": 100000},
+    "per_km": {"min": 0, "max": 50000},
+    "per_min": {"min": 0, "max": 20000},
+    "min_fare": {"min": 100, "max": 500000},
+    "cancellation_fee": {"min": 0, "max": 100000},
+    "free_cancel_seconds": {"min": 0, "max": 3600},
+    "commission_percent": {"min": 0, "max": 100},
+    "surge_cap": {"min": 1.0, "max": 2.0},
+}
 
 # The Idempotency-Key header of a request that must not happen twice: 8 to 64 characters, required.
 IdempotencyKey = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")]
@@ -435,3 +449,314 @@ class AdminRatingResponse(BaseModel):
     score: int
     comment: str | None
     created_at: datetime
+
+
+# ---- Admin dashboard (M6.2). None of these has an otp field, and none has a password hash. ----
+
+DriverState = Literal["offline", "free", "offered", "on_ride"]
+
+
+# Every value is optional except the version. A value that is present must be valid, so an explicit null is a 422 (the default
+# None is never validated). Money is a strict integer in paise: strings, floats and booleans are refused.
+class PricingRulePatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: StrictInt  # the version the admin saw; a stale one is a 409
+    base_fare: StrictInt = Field(default=None, ge=RULE_LIMITS["base_fare"]["min"], le=RULE_LIMITS["base_fare"]["max"])
+    per_km: StrictInt = Field(default=None, ge=RULE_LIMITS["per_km"]["min"], le=RULE_LIMITS["per_km"]["max"])
+    per_min: StrictInt = Field(default=None, ge=RULE_LIMITS["per_min"]["min"], le=RULE_LIMITS["per_min"]["max"])
+    min_fare: StrictInt = Field(default=None, ge=RULE_LIMITS["min_fare"]["min"], le=RULE_LIMITS["min_fare"]["max"])
+    cancellation_fee: StrictInt = Field(
+        default=None, ge=RULE_LIMITS["cancellation_fee"]["min"], le=RULE_LIMITS["cancellation_fee"]["max"]
+    )
+    free_cancel_seconds: StrictInt = Field(
+        default=None, ge=RULE_LIMITS["free_cancel_seconds"]["min"], le=RULE_LIMITS["free_cancel_seconds"]["max"]
+    )
+    commission_percent: StrictInt = Field(
+        default=None, ge=RULE_LIMITS["commission_percent"]["min"], le=RULE_LIMITS["commission_percent"]["max"]
+    )
+    # An int or a float, never a string or a boolean (strict), with at most two decimals.
+    surge_cap: float = Field(default=None, strict=True, ge=RULE_LIMITS["surge_cap"]["min"], le=RULE_LIMITS["surge_cap"]["max"])
+
+    @field_validator("surge_cap")
+    @classmethod
+    def at_most_two_decimals(cls, surge_cap: float) -> float:
+        if abs(round(surge_cap * 100) / 100 - surge_cap) > 1e-9:
+            raise ValueError("surge_cap can have at most two decimals")
+        return surge_cap
+
+    @model_validator(mode="after")
+    def has_a_change(self) -> "PricingRulePatch":
+        if not self.model_fields_set - {"version"}:
+            raise ValueError("Send at least one value to change")
+        return self
+
+
+class PricingRuleResponse(BaseModel):
+    id: int
+    vehicle_type: str
+    base_fare: int
+    per_km: int
+    per_min: int
+    min_fare: int
+    cancellation_fee: int
+    free_cancel_seconds: int
+    commission_percent: int
+    surge_cap: float
+    version: int
+    updated_at: datetime
+    updated_by: int | None
+    updated_by_name: str | None
+
+
+class PricingRulesResponse(BaseModel):
+    rules: list[PricingRuleResponse]
+    active_rides: int  # rides in REQUESTED, DRIVER_ASSIGNED, DRIVER_ARRIVED or IN_PROGRESS right now
+    limits: dict[str, dict[str, int | float]]
+
+
+class PricingRuleChangeItem(BaseModel):
+    field: str
+    old: int | float
+    new: int | float
+
+
+class PricingRuleUpdateResponse(BaseModel):
+    rule: PricingRuleResponse
+    active_rides: int
+    changes: list[PricingRuleChangeItem]  # empty when nothing differed: then nothing was written
+
+
+class PricingRuleChangeResponse(BaseModel):
+    id: int
+    actor_name: str
+    version_before: int
+    version_after: int
+    changes: list[PricingRuleChangeItem]
+    created_at: datetime
+
+
+class LiveDriver(BaseModel):
+    id: int
+    name: str
+    plate_number: str | None
+    lat: float
+    lng: float
+    state: DriverState
+    active_ride_id: int | None
+
+
+class LiveRide(BaseModel):
+    id: int
+    status: RideStatus
+    pickup_lat: float
+    pickup_lng: float
+    pickup_address: str
+    dropoff_lat: float
+    dropoff_lng: float
+    dropoff_address: str
+    driver_id: int | None
+    rider_id: int
+    rider_name: str
+    created_at: datetime
+    fare_estimate: int | None
+
+
+class LiveDriverCounts(BaseModel):
+    online: int
+    free: int
+    offered: int
+    on_ride: int
+
+
+class LiveCounts(BaseModel):
+    drivers: LiveDriverCounts
+    rides: dict[str, int]
+
+
+class LiveResponse(BaseModel):
+    generated_at: int  # epoch seconds
+    drivers: list[LiveDriver]
+    rides: list[LiveRide]
+    drivers_total: int  # exact, even when the list is cut
+    rides_total: int
+    truncated: bool  # true when either list was cut at its cap
+    counts: LiveCounts
+
+
+# Everything in DriverResponse plus what the admin needs to find and judge a driver. rating_average is the REAL average,
+# even with one rating (an admin is not a rider).
+class AdminDriverResponse(DriverResponse):
+    user_id: int
+    online: bool
+    state: DriverState
+    active_ride_id: int | None
+    rating_count: int
+    rating_average: float | None
+    completed_trips: int
+
+
+class AdminRideRow(BaseModel):
+    id: int
+    created_at: datetime
+    status: RideStatus
+    rider_id: int
+    driver_id: int | None
+    pickup_address: str
+    dropoff_address: str
+    fare_estimate: int | None
+    final_fare: int | None
+    surge_percent: int
+    payment_method: PaymentMethod
+
+
+class AdminRideRider(BaseModel):
+    id: int
+    name: str
+    email: str
+
+
+class AdminRideDriver(BaseModel):
+    id: int
+    user_id: int
+    name: str
+    email: str
+    plate_number: str | None
+    model: str | None
+    color: str | None
+
+
+class AdminRideEvent(BaseModel):
+    id: int
+    from_status: RideStatus | None
+    to_status: RideStatus
+    actor_user_id: int | None
+    actor: Literal["system", "rider", "driver", "other"]
+    created_at: datetime
+
+
+class AdminRideOffer(BaseModel):
+    id: int
+    driver_id: int
+    status: OfferStatus
+    pickup_distance_m: int
+    created_at: datetime
+    expires_at: datetime
+    responded_at: datetime | None
+
+
+class AdminRidePayment(BaseModel):
+    id: int
+    amount: int
+    method: PaymentMethod
+    status: PaymentStatus
+    created_at: datetime
+
+
+class AdminRideEarning(BaseModel):
+    id: int
+    kind: str
+    gross_amount: int
+    commission_percent: int
+    platform_fee: int
+    driver_earning: int
+    created_at: datetime
+
+
+class AdminRideRating(BaseModel):
+    id: int
+    from_user_id: int
+    to_user_id: int
+    from_role: Literal["rider", "driver"]
+    score: int
+    comment: str | None
+    created_at: datetime
+
+
+class AdminRideDetail(AdminRideRow):
+    pickup_lat: float
+    pickup_lng: float
+    dropoff_lat: float
+    dropoff_lng: float
+    distance_m: int | None
+    duration_s: int | None
+    actual_distance_m: int | None
+    actual_duration_s: int | None
+    fare_breakdown: dict | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    rider: AdminRideRider
+    driver: AdminRideDriver | None
+    events: list[AdminRideEvent]
+    offers: list[AdminRideOffer]
+    payment: AdminRidePayment | None
+    earning: AdminRideEarning | None
+    ratings: list[AdminRideRating]
+
+
+class StatsRides(BaseModel):
+    requested: int
+    completed: int
+    cancelled: int
+    no_driver_found: int
+    active: int
+    completion_rate: float | None  # percent, one decimal, of the finished rides (completed + cancelled + no_driver_found)
+    cancellation_rate: float | None
+    no_driver_rate: float | None
+
+
+class StatsTrips(BaseModel):
+    avg_fare: int | None  # paise
+    avg_distance_m: int | None
+    avg_duration_s: int | None
+    assigned_rides: int
+    mean_time_to_assign_s: float | None
+    median_time_to_assign_s: float | None
+
+
+class StatsOffers(BaseModel):
+    pending: int
+    accepted: int
+    rejected: int
+    expired: int
+    cancelled: int
+    acceptance_rate: float | None  # percent: accepted / (accepted + rejected + expired)
+
+
+class StatsSurge(BaseModel):
+    rides_surged: int
+    max_surge_percent: int
+
+
+class StatsUsers(BaseModel):
+    new_riders: int
+    new_drivers: int
+
+
+class StatsNow(BaseModel):
+    online_drivers: int | None  # null when Redis is down
+    active_rides: dict[str, int]
+    pending_offers: int
+
+
+class StatsBucket(BaseModel):
+    start: int  # epoch seconds
+    rides: int
+    completed: int
+    gross: int
+    platform_fee: int
+
+
+class StatsResponse(BaseModel):
+    since: AwareDatetime
+    until: AwareDatetime
+    bucket: Literal["hour", "day"]
+    utc_offset_minutes: int
+    rides: StatsRides
+    trips: StatsTrips
+    offers: StatsOffers
+    surge: StatsSurge
+    money: EarningsSummaryResponse
+    users: StatsUsers
+    now: StatsNow
+    series: list[StatsBucket]

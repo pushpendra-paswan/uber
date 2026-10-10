@@ -223,7 +223,7 @@ async def test_supply_counts_only_available_drivers_in_the_zone(
     assert (await snapshot())[ZONE]["supply"] == 3
 
 
-@pytest.mark.parametrize("cap, quoted", [(1.5, 150), (1.0, 100), (2.0, 200), (0.5, 100)])
+@pytest.mark.parametrize("cap, quoted", [(1.5, 150), (1.0, 100), (2.0, 200)])
 async def test_the_cap_comes_from_the_pricing_rule_and_the_snapshot_stays_uncapped(
     client, db, rider, snapshot, add_demand, add_supply, cap, quoted
 ):
@@ -329,9 +329,14 @@ async def test_the_minimum_fare_is_multiplied_too(db):
 
 
 @pytest.mark.parametrize("normal, surge, fare", [(1, 150, 2), (3, 110, 3), (1, 149, 1), (5, 110, 6)])
-async def test_surge_rounds_half_up(db, normal, surge, fare):
-    db.add(PricingRule(vehicle_type="test", base_fare=normal, per_km=0, per_min=0, min_fare=0))
-    await db.commit()
+async def test_surge_rounds_half_up(db, monkeypatch, normal, surge, fare):
+    # An in-memory rule: the database refuses a minimum fare below 100 paise (M6.2), and this test needs a minimum of 0.
+    rule = PricingRule(vehicle_type="test", base_fare=normal, per_km=0, per_min=0, min_fare=0)
+
+    async def get_rule(db, vehicle_type):
+        return rule
+
+    monkeypatch.setattr(pricing_repo, "get_rule", get_rule)
 
     result = await pricing.calculate_fare(db, 1000, 60, surge, vehicle_type="test")
 

@@ -1,5 +1,5 @@
 -- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1, I12 since M5.2,
--- I13 to I18 since M5.3, I19 and I20 since M5.4, I21 and I22 since M6.1). Read-only. One SELECT per invariant, one row per offender:
+-- I13 to I18 since M5.3, I19 and I20 since M5.4, I21 and I22 since M6.1, I23 since M6.2). Read-only. One SELECT per invariant, one row per offender:
 -- an empty result means the invariant holds. Used by simulator/stress.py, and runnable by hand:
 --   docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
 -- Statuses are stored as the enum names in upper case (VARCHAR, no CHECK constraint).
@@ -251,3 +251,14 @@ WHERE r.status <> 'COMPLETED'
    OR g.from_user_id = g.to_user_id
    OR ((g.from_user_id = r.rider_id AND g.to_user_id = d.user_id) OR (g.from_user_id = d.user_id AND g.to_user_id = r.rider_id)) IS NOT TRUE
 ORDER BY g.id;
+
+\echo '== pricing_rule_audit_mismatch'
+-- I23: every pricing rule's version is 1 plus the number of audit rows written for it, and when it has any, its newest audit row
+-- ends at that version. The rule update and its audit row are ONE transaction, so this cannot be violated even for an instant.
+-- (A direct SQL edit of a rule does not change the version, so it cannot trigger this.)
+SELECT r.id AS rule_id, r.version, count(c.id) AS changes, max(c.version_after) AS last_version_after
+FROM pricing_rules r
+LEFT JOIN pricing_rule_changes c ON c.rule_id = r.id
+GROUP BY r.id, r.version
+HAVING r.version <> 1 + count(c.id) OR (count(c.id) > 0 AND max(c.version_after) <> r.version)
+ORDER BY r.id;

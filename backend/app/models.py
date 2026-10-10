@@ -193,6 +193,8 @@ class RideOffer(Base):
         Index("uq_ride_offers_one_pending_per_driver", "driver_id", unique=True, postgresql_where=text("status = 'PENDING'")),
         # The sweeper's query: PENDING offers, oldest deadline first.
         Index("ix_ride_offers_status_expires_at", "status", "expires_at"),
+        # The admin stats windows: offers created in a period.
+        Index("ix_ride_offers_created_at", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -359,7 +361,18 @@ class RatingSummary(Base):
 
 class PricingRule(Base):
     __tablename__ = "pricing_rules"
-    __table_args__ = (CheckConstraint("commission_percent BETWEEN 0 AND 100", name="commission_percent_range"),)
+    __table_args__ = (
+        CheckConstraint("commission_percent BETWEEN 0 AND 100", name="commission_percent_range"),
+        # Safety floors and the cap range only. The upper bounds of the other values are API-level (RULE_LIMITS in schemas.py),
+        # so they can be raised later without a migration. 100 paise keeps every trip chargeable; 2.0 matches rides.surge_percent.
+        CheckConstraint("base_fare >= 0", name="base_fare_nonneg"),
+        CheckConstraint("per_km >= 0", name="per_km_nonneg"),
+        CheckConstraint("per_min >= 0", name="per_min_nonneg"),
+        CheckConstraint("cancellation_fee >= 0", name="cancellation_fee_nonneg"),
+        CheckConstraint("free_cancel_seconds >= 0", name="free_cancel_seconds_nonneg"),
+        CheckConstraint("min_fare >= 100", name="min_fare_floor"),
+        CheckConstraint("surge_cap BETWEEN 1.0 AND 2.0", name="surge_cap_range"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_type: Mapped[str] = mapped_column(String(30), unique=True)
@@ -371,4 +384,26 @@ class PricingRule(Base):
     cancellation_fee: Mapped[int] = mapped_column(Integer, server_default="3000")  # paise
     free_cancel_seconds: Mapped[int] = mapped_column(Integer, server_default="120")
     commission_percent: Mapped[int] = mapped_column(Integer, server_default="20")  # the platform's share of every payment
+    # Optimistic version: an edit carries the version the admin saw, and every applied edit adds 1 (see PricingRuleChange).
+    version: Mapped[int] = mapped_column(Integer, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PricingRuleChange(Base):
+    __tablename__ = "pricing_rule_changes"
+    __table_args__ = (
+        UniqueConstraint("rule_id", "version_after", name="uq_pricing_rule_changes_rule_id_version_after"),
+        CheckConstraint("version_after = version_before + 1", name="version_step"),
+        Index("ix_pricing_rule_changes_rule_id_id", "rule_id", "id"),
+    )
+
+    # Append-only audit trail, inserted by the same transaction that changes the rule and never updated or deleted.
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("pricing_rules.id"))
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    version_before: Mapped[int] = mapped_column(Integer)
+    version_after: Mapped[int] = mapped_column(Integer)
+    changes: Mapped[list] = mapped_column(JSONB)  # [{"field": ..., "old": ..., "new": ...}]
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

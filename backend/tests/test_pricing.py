@@ -4,6 +4,7 @@ from sqlalchemy import delete, select
 
 from app.config import settings
 from app.models import PricingRule, Ride, RideStatus
+from app.repositories import pricing as pricing_repo
 from app.services import routing
 from app.services.pricing import calculate_fare
 from app.services.rides import MIN_TRIP_DISTANCE_M
@@ -51,9 +52,14 @@ async def test_fare_formula_with_the_seed_rule(db, distance_m, duration_s, dista
         (0, 89, 0, 1),
     ],
 )
-async def test_fare_rounds_half_up(db, distance_m, duration_s, distance_fare, time_fare):
-    db.add(PricingRule(vehicle_type="test", base_fare=0, per_km=1, per_min=1, min_fare=0))
-    await db.commit()
+async def test_fare_rounds_half_up(db, monkeypatch, distance_m, duration_s, distance_fare, time_fare):
+    # An in-memory rule: the database refuses a minimum fare below 100 paise (M6.2), and this test needs a minimum of 0.
+    rule = PricingRule(vehicle_type="test", base_fare=0, per_km=1, per_min=1, min_fare=0)
+
+    async def get_rule(db, vehicle_type):
+        return rule
+
+    monkeypatch.setattr(pricing_repo, "get_rule", get_rule)
 
     result = await calculate_fare(db, distance_m, duration_s, vehicle_type="test")
 

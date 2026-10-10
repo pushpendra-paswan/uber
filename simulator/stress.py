@@ -12,7 +12,9 @@ Scenarios: drivers (I1 and I2), riders (I3), fleet (against the running simulato
 drivers acting at random for a while, then a settle period; looks for any invariant violation and for stuck rides; since
 M5.3 riders pay from a funded wallet or in cash and an admin credits wallets with replayed requests; since M5.4 it also
 compares the money views of the API with the database, see scenario_chaos; since M6.1 riders and drivers also rate each
-other, some of them twice at once, and the rating views are compared with the database), payments (M5.3: top-up
+other, some of them twice at once, and the rating views are compared with the database; since M6.2 the admin edits the pricing
+rule every ~10 s (30 percent of the time the same edit twice at once), reads the admin views for structure, and after the settle
+period the admin stats, rides and drivers lists and ride details are compared with the database), payments (M5.3: top-up
 requests repeated at once, signed webhooks delivered many times at once, bad signatures refused; needs the backend to use the
 local fake Stripe, simulator/fake_stripe.py), ratings (M6.1: one stress driver completes a ride for each rider, then everyone
 rates everyone at once, three copies of every request, all landing on the driver's one summary row).
@@ -103,6 +105,16 @@ INVARIANTS = {
     "rating_participants_mismatch": (
         "I22", "ratings", None, ("rating_id", "ride_id", "ride_status", "from_user_id", "to_user_id", "rider_id", "driver_user_id")
     ),
+    "pricing_rule_audit_mismatch": ("I23", "rules", None, ("rule_id", "version", "changes", "last_version_after")),
+}
+PRICING_EDIT_INTERVAL_S = 10  # chaos: the admin edits the pricing rule about this often
+PRICING_FIELDS = (
+    "base_fare", "per_km", "per_min", "min_fare", "cancellation_fee", "free_cancel_seconds", "commission_percent", "surge_cap"
+)
+# What the chaos admin may set (all inside the bounds of the API): field -> allowed values.
+PRICING_CHOICES = {
+    "per_km": range(800, 1601), "per_min": range(100, 301), "commission_percent": range(15, 26),
+    "cancellation_fee": range(2000, 4001), "surge_cap": [step / 20 for step in range(30, 41)],  # 1.5 to 2.0 in steps of 0.05
 }
 RATING_BURST_COPIES = 3  # ratings scenario: every rating request is sent this many times at once
 FUND_TO_PAISE = 500000  # the chaos riders' wallets are filled up to 5,000 rupees
@@ -282,7 +294,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I22 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I23 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -295,7 +307,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all twenty-two invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all twenty-three invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -309,7 +321,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I22 ok"
+    return ", ".join(parts) or "I1-I23 ok"
 
 
 async def cleanup(ctx: dict) -> None:
@@ -727,9 +739,17 @@ async def chaos_driver(ctx: dict, email: str, location: tuple, rng: random.Rando
 async def chaos_admin(ctx: dict, rng: random.Random, counters: dict, deadline: float) -> None:
     """The admin until the deadline, a tick every 2 s: credits a random stress rider 10 to 100 rupees with a fresh
     Idempotency-Key, and 30 percent of the time sends the SAME request twice at once. Every successful answer for one key must
-    carry the same entry id (adjust_replay_mismatch counts the keys where they did not)."""
+    carry the same entry id (adjust_replay_mismatch counts the keys where they did not).
+
+    Since M6.2 each tick also reads /admin/live, /admin/rides and /admin/drivers and checks their STRUCTURE only (these reads are
+    not atomic snapshots; admin_view_mismatch counts what is wrong), and about every PRICING_EDIT_INTERVAL_S seconds it changes one
+    field of the pricing rule with the version it just read. 30 percent of the edits are sent twice at once: exactly one 200 and
+    one 409 must come back (pricing_dup_error otherwise). Only this task writes the rule, so a single edit answering 409 is
+    unexpected (pricing_409_unexpected)."""
     client, urls = ctx["api"], ctx["args"].api_urls
     user_ids = [ctx["user_ids"][RIDER_EMAIL.format(n=n)] for n in range(1, ctx["args"].riders + 1)]
+    south, west, north, east = ctx["bounds"]
+    next_edit = time.monotonic() + PRICING_EDIT_INTERVAL_S
     while time.monotonic() < deadline:
         await asyncio.sleep(2)
         user_id = rng.choice(user_ids)
@@ -751,9 +771,78 @@ async def chaos_admin(ctx: dict, rng: random.Random, counters: dict, deadline: f
             if len({answer.json()["id"] for answer in answers if answer.status_code in (200, 201)}) > 1:
                 counters["adjust_replay_mismatch"] += 1
 
+        try:
+            for path in ("/admin/live", "/admin/rides?limit=25", "/admin/drivers?limit=50"):
+                started = time.monotonic()
+                answer = await api(client, "GET", rng.choice(urls) + path, ctx["admin_token"])
+                counters["admin_reads"] += 1
+                if path == "/admin/live":
+                    counters["admin_live_max_ms"] = max(counters["admin_live_max_ms"], int((time.monotonic() - started) * 1000))
+                if answer.status_code >= 500:
+                    continue  # already counted as a 5xx
+                found = []
+                if answer.status_code != 200:
+                    found.append(f"{path} answered {answer.status_code}")
+                elif '"otp"' in answer.text:
+                    found.append(f"{path} contains the word otp")
+                elif path == "/admin/live":
+                    data = answer.json()
+                    driver_ids, ride_ids = [row["id"] for row in data["drivers"]], [row["id"] for row in data["rides"]]
+                    if len(set(driver_ids)) != len(driver_ids) or len(set(ride_ids)) != len(ride_ids):
+                        found.append("/admin/live has a duplicate id")
+                    if any(row["state"] not in ("free", "offered", "on_ride") for row in data["drivers"]):
+                        found.append("/admin/live has a driver with an unknown state")
+                    if any(row["status"] not in ("REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS") for row in data["rides"]):
+                        found.append("/admin/live has a ride that is not active")
+                    if any(not (south <= row["lat"] <= north and west <= row["lng"] <= east) for row in data["drivers"]) or any(
+                        not (south <= row["pickup_lat"] <= north and west <= row["pickup_lng"] <= east) for row in data["rides"]
+                    ):
+                        found.append("/admin/live has a position outside the city")
+                    if not data["truncated"] and data["counts"]["drivers"]["online"] != len(data["drivers"]):
+                        found.append("/admin/live counts.drivers.online differs from the drivers returned")
+                elif path.startswith("/admin/rides"):
+                    ride_ids = [row["id"] for row in answer.json()]
+                    if any(newer <= older for newer, older in zip(ride_ids, ride_ids[1:])):
+                        found.append("/admin/rides is not strictly newest first")
+                else:
+                    driver_ids = [row["id"] for row in answer.json()]
+                    if any(smaller >= larger for smaller, larger in zip(driver_ids, driver_ids[1:])):
+                        found.append("/admin/drivers is not strictly ascending")
+                counters["admin_view_mismatch"] += len(found)
+                ctx["admin_view_details"].extend(found[: max(0, 5 - len(ctx["admin_view_details"]))])
+
+            if time.monotonic() >= next_edit:
+                next_edit += PRICING_EDIT_INTERVAL_S
+                answer = await api(client, "GET", urls[0] + "/admin/pricing-rules", ctx["admin_token"])
+                if answer.status_code != 200:
+                    continue
+                rule = answer.json()["rules"][0]
+                field = rng.choice(list(PRICING_CHOICES))
+                value = rng.choice([choice for choice in PRICING_CHOICES[field] if choice != rule[field]])  # a real change
+                twice = rng.random() < 0.30
+                answers = await asyncio.gather(
+                    *[api(client, "PATCH", rng.choice(urls) + "/admin/pricing-rules/economy", ctx["admin_token"], {"version": rule["version"], field: value})
+                      for _ in range(2 if twice else 1)]
+                )
+                codes = sorted(answer.status_code for answer in answers)
+                if twice:
+                    counters["pricing_dups_sent"] += 1
+                    if codes == [200, 409]:
+                        counters["pricing_dups_ok"] += 1
+                    elif max(codes) < 500:  # a 5xx is counted on its own
+                        counters["pricing_dup_error"] += 1
+                        log.error("pricing: the same edit sent twice answered %s, expected [200, 409]", codes)
+                else:
+                    counters["pricing_409_unexpected"] += codes == [409]
+                    counters["pricing_edit_error"] += codes[0] not in (200, 409) and codes[0] < 500
+                counters["pricing_edits"] += codes.count(200)
+                counters["pricing_409"] += codes.count(409)
+        except httpx.HTTPError:
+            counters["transport_errors"] += 1
+
 
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I22 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I23 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -796,7 +885,16 @@ async def scenario_chaos(ctx: dict) -> None:
             balance += step
         ctx["starting"][ctx["user_ids"][email]] = (await api(ctx["api"], "GET", "/wallet", ctx["tokens"][email])).json()["balance"]
 
+    # The pricing rule as it is now (restored at the end of the run), so the admin's edits leave nothing behind.
+    answer = await api(ctx["api"], "GET", "/admin/pricing-rules", ctx["admin_token"])
+    if answer.status_code != 200:
+        raise RuntimeError(f"reading the pricing rule answered {answer.status_code} {answer.text}")
+    rule = answer.json()["rules"][0]
+    ctx["pricing_original"] = {name: rule[name] for name in PRICING_FIELDS}
+    ctx["pricing_version_start"] = rule["version"]
+
     since = (await sql(ctx, "SELECT now()"))[0]
+    since_iso = (await sql(ctx, "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"))[0]
     mine = f"r.created_at >= '{since}' AND r.rider_id IN (SELECT id FROM users WHERE email LIKE '{RIDER_LIKE}')"
     counters = ctx["counters"]
     seed = args.seed if args.seed is not None else random.randrange(1_000_000)
@@ -841,6 +939,18 @@ async def scenario_chaos(ctx: dict) -> None:
     finally:
         for agent in agents:
             agent.cancel()  # only does something when the run is interrupted
+        # Put the pricing rule back with ONE PATCH using the version as it is now, whatever happened to the run.
+        try:
+            now_rule = (await api(ctx["api"], "GET", "/admin/pricing-rules", ctx["admin_token"])).json()["rules"][0]
+            restored = await api(
+                ctx["api"], "PATCH", "/admin/pricing-rules/economy", ctx["admin_token"], {"version": now_rule["version"], **ctx["pricing_original"]}
+            )
+            rule_after = restored.json()["rule"] if restored.status_code == 200 else {}
+            ctx["pricing_restore"] = (
+                restored.status_code, rule_after.get("version"), all(rule_after.get(name) == value for name, value in ctx["pricing_original"].items())
+            )
+        except (httpx.HTTPError, KeyError, ValueError) as error:
+            ctx["pricing_restore"] = (None, repr(error), False)
     for agent in agents:
         if agent.exception() is not None:
             raise RuntimeError(f"a chaos agent crashed: {agent.exception()!r}")
@@ -1052,11 +1162,121 @@ async def scenario_chaos(ctx: dict) -> None:
     )
     ctx["rating_stats"] = [(int(row.split("|")[0]), row.split("|")[1] == "t", int(row.split("|")[2])) for row in rows]
 
+    # Admin views (M6.2), the API against read-only SQL worked out here on its own, for the window from the start of the run to
+    # now (day buckets, offset 0). If something differs it is asked once more after 2 s, in case something was still settling.
+    # (a) /admin/stats: ride counts, money, series sums and offers. (b) /admin/rides walked page by page. (c) /admin/drivers?q=<email>
+    # for every stress driver. (d) /admin/rides/{id} for up to 10 completed rides.
+    for attempt in (1, 2):
+        mismatches = []
+        until_iso = (await sql(ctx, "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"))[0]
+        window = f"created_at >= '{since_iso}' AND created_at < '{until_iso}'"
+
+        answer = await ctx["api"].get(
+            "/admin/stats", params={"since": since_iso, "until": until_iso, "bucket": "day", "utc_offset_minutes": 0},
+            headers={"Authorization": f"Bearer {ctx['admin_token']}"},
+        )
+        status_counts[answer.status_code] += 1
+        if answer.status_code != 200:
+            mismatches.append(f"/admin/stats answered {answer.status_code} {answer.text[:200]}")
+        else:
+            got = answer.json()
+            by_status = {row.split("|")[0]: int(row.split("|")[1]) for row in await sql(ctx, f"SELECT status, count(*) FROM rides WHERE {window} GROUP BY status")}
+            wanted = {
+                "requested": sum(by_status.values()), "completed": by_status.get("COMPLETED", 0), "cancelled": by_status.get("CANCELLED", 0),
+                "no_driver_found": by_status.get("NO_DRIVER_FOUND", 0),
+                "active": sum(by_status.get(status, 0) for status in ("REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS")),
+            }
+            mismatches += [f"stats rides.{name}: api {got['rides'][name]} != sql {value}" for name, value in wanted.items() if got["rides"][name] != value]
+            money = [int(value) for value in (await sql(
+                ctx, "SELECT count(*), COALESCE(sum(gross_amount), 0), COALESCE(sum(platform_fee), 0), COALESCE(sum(driver_earning), 0) "
+                     f"FROM ride_earnings WHERE {window}"))[0].split("|")]
+            total = got["money"]["total"]
+            have = [total["rides"], total["gross"], total["platform_fee"], total["driver_earning"]]
+            mismatches += [f"stats money.total.{name}: api {a} != sql {b}" for name, a, b in zip(("rides", "gross", "platform_fee", "driver_earning"), have, money) if a != b]
+            series = got["series"]
+            for name, value in (("rides", wanted["requested"]), ("completed", wanted["completed"]), ("gross", money[1]), ("platform_fee", money[2])):
+                if sum(entry[name] for entry in series) != value:
+                    mismatches.append(f"stats series sum of {name}: api {sum(entry[name] for entry in series)} != sql {value}")
+            offers = {row.split("|")[0]: int(row.split("|")[1]) for row in await sql(ctx, f"SELECT status, count(*) FROM ride_offers WHERE {window} GROUP BY status")}
+            mismatches += [
+                f"stats offers.{name}: api {got['offers'][name]} != sql {offers.get(name.upper(), 0)}"
+                for name in ("pending", "accepted", "rejected", "expired", "cancelled") if got["offers"][name] != offers.get(name.upper(), 0)
+            ]
+
+        sql_ids = [int(row) for row in await sql(ctx, f"SELECT id FROM rides WHERE {window} ORDER BY id DESC")]
+        walked, before_id = [], None
+        for _ in range(len(sql_ids) // 25 + 3):
+            params = {"since": since_iso, "until": until_iso, "limit": 25, **({"before_id": before_id} if before_id else {})}
+            answer = await ctx["api"].get("/admin/rides", params=params, headers={"Authorization": f"Bearer {ctx['admin_token']}"})
+            status_counts[answer.status_code] += 1
+            if answer.status_code != 200:
+                mismatches.append(f"/admin/rides page answered {answer.status_code}")
+                break
+            page = [row["id"] for row in answer.json()]
+            if not page:
+                break
+            walked += page
+            before_id = page[-1]
+        else:
+            mismatches.append("/admin/rides did not reach the end of the list")
+        if walked != sql_ids:
+            mismatches.append(f"/admin/rides walked {len(walked)} ids != sql {len(sql_ids)} ids (first difference at index "
+                              f"{next((i for i, (a, b) in enumerate(zip(walked, sql_ids)) if a != b), min(len(walked), len(sql_ids)))})")
+
+        rows = await sql(
+            ctx,
+            "SELECT u.email, (SELECT count(*) FROM rides r WHERE r.driver_id = d.id AND r.status = 'COMPLETED'), "
+            "(SELECT count(*) FROM ratings g WHERE g.to_user_id = u.id), COALESCE((SELECT sum(g.score) FROM ratings g WHERE g.to_user_id = u.id), 0) "
+            f"FROM drivers d JOIN users u ON u.id = d.user_id WHERE u.email LIKE '{DRIVER_LIKE}' ORDER BY d.id",
+        )
+        for row in rows:
+            email, trips, number, total = row.split("|")
+            trips, number, total = int(trips), int(number), int(total)
+            answer = await ctx["api"].get("/admin/drivers", params={"q": email}, headers={"Authorization": f"Bearer {ctx['admin_token']}"})
+            status_counts[answer.status_code] += 1
+            found = [entry for entry in answer.json() if entry["user"]["email"] == email] if answer.status_code == 200 else []
+            if len(found) != 1:
+                mismatches.append(f"/admin/drivers?q={email} answered {answer.status_code} with {len(found)} matching drivers")
+                continue
+            want_average = None if number == 0 else (total * 100 + number // 2) // number / 100
+            if (found[0]["completed_trips"], found[0]["rating_count"], found[0]["rating_average"]) != (trips, number, want_average):
+                mismatches.append(f"driver {email}: api trips/count/average {found[0]['completed_trips']}/{found[0]['rating_count']}/{found[0]['rating_average']}"
+                                  f" != sql {trips}/{number}/{want_average}")
+
+        for row in await sql(ctx, f"SELECT r.id, r.final_fare FROM rides r WHERE {mine} AND r.status = 'COMPLETED' AND r.final_fare > 0 ORDER BY r.id DESC LIMIT 10"):
+            ride_id, final_fare = row.split("|")
+            answer = await ctx["api"].get(f"/admin/rides/{ride_id}", headers={"Authorization": f"Bearer {ctx['admin_token']}"})
+            status_counts[answer.status_code] += 1
+            if answer.status_code != 200:
+                mismatches.append(f"/admin/rides/{ride_id} answered {answer.status_code}")
+                continue
+            detail = answer.json()
+            if '"otp"' in answer.text:
+                mismatches.append(f"/admin/rides/{ride_id} contains the word otp")
+            if detail["payment"] is None or detail["payment"]["amount"] != int(final_fare):
+                mismatches.append(f"ride {ride_id}: payment {detail['payment']} != final fare {final_fare}")
+            elif detail["earning"] is None or detail["earning"]["gross_amount"] != detail["payment"]["amount"]:
+                mismatches.append(f"ride {ride_id}: earning {detail['earning']} does not match the payment")
+            events = [tuple(line.split("|")) for line in await sql(
+                ctx, f"SELECT COALESCE(from_status, ''), to_status, COALESCE(actor_user_id::text, '') FROM ride_events WHERE ride_id = {int(ride_id)} ORDER BY id")]
+            shown = [(e["from_status"] or "", e["to_status"], "" if e["actor_user_id"] is None else str(e["actor_user_id"])) for e in detail["events"]]
+            if shown != events:
+                mismatches.append(f"ride {ride_id}: events {shown} != sql {events}")
+        ctx["admin_checked"] = {"stats": 1, "rides_walked": len(sql_ids), "drivers": len(rows), "details": min(10, len(sql_ids))}
+        if not mismatches:
+            break
+        if attempt == 1:
+            log.warning("admin views: %d mismatches, asking again in 2 s", len(mismatches))
+            await asyncio.sleep(2)
+    ctx["admin_view_final"] = mismatches
+    counters["admin_view_mismatch"] += len(mismatches)
+    ctx["admin_view_details"].extend(mismatches[: max(0, 5 - len(ctx["admin_view_details"]))])
+
 
 async def scenario_payments(ctx: dict) -> None:
     """Top-ups and webhooks under repetition (M5.3). Each round, for all riders at once: the same top-up request five times
     (one top-up, one Stripe session), then the signed paid event delivered ten times with one event id plus three times with
-    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I22 are checked after each
+    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I23 are checked after each
     round. Needs the backend to talk to simulator/fake_stripe.py: it creates a Checkout Session per rider per round."""
     args = ctx["args"]
     ctx["driver_emails"] = []
@@ -1179,7 +1399,7 @@ async def scenario_ratings(ctx: dict) -> None:
     """One stress driver completes a ride for every rider, one at a time. Then, in ONE burst, every rider rates the driver and
     the driver rates every rider, each request sent RATING_BURST_COPIES times at once: exactly one 201 and the rest 409 for
     every rater, and the summary rows (the driver's takes all the riders' ratings, so it is the hot row) must equal the scores
-    of the winning requests. I1 to I22 are checked after each round."""
+    of the winning requests. I1 to I23 are checked after each round."""
     args = ctx["args"]
     client, urls = ctx["api"], args.api_urls
     ctx["driver_emails"] = [DRIVER_EMAIL.format(n=1)]
@@ -1370,6 +1590,7 @@ async def main() -> int:
         "driver_emails": [], "rounds": [], "checks": 0, "latencies": {}, "per_rider": {}, "fleet": {"rides": 0, "no_driver": 0},
         "finished": False, "unsettled": False, "offers": {"got": 0, "expected": 0, "lost_rounds": 0},
         "counters": collections.Counter(), "payment_problems": [], "stuck": {}, "chaos": {"ride": {}, "offer": {}}, "left_active": 0,
+        "admin_view_details": [], "pricing_original": None, "pricing_restore": None,
     }
     failure = None
     interrupted = False
@@ -1534,6 +1755,19 @@ async def main() -> int:
                  ctx["rating_checked"]["users"], ctx["rating_checked"]["rides"], len(ctx["rating_view_mismatches"]))
         for mismatch in ctx["rating_view_mismatches"][:5]:
             log.error("  RATING VIEW MISMATCH %s", mismatch)
+        checked = ctx["admin_checked"]
+        log.info("  admin views: %d reads (the longest /admin/live answer took %d ms); checked against SQL: /admin/stats, %d rides walked page by page, "
+                 "%d drivers by email, %d ride details; admin_view_mismatch %d (should be 0)", counters["admin_reads"], counters["admin_live_max_ms"],
+                 checked["rides_walked"], checked["drivers"], checked["details"], counters["admin_view_mismatch"])
+        for detail in ctx["admin_view_details"][:5]:
+            log.error("  ADMIN VIEW MISMATCH %s", detail)
+        restore_status, restore_version, restore_equal = ctx["pricing_restore"]
+        log.info("  pricing edits: %d made (rule version %s at the start), %d edits sent twice at once (%d answered exactly 200 and 409, "
+                 "pricing_dup_error %d), %d answers were 409, %d single edits answered 409 (should be 0), %d other errors (should be 0)",
+                 counters["pricing_edits"], ctx["pricing_version_start"], counters["pricing_dups_sent"], counters["pricing_dups_ok"],
+                 counters["pricing_dup_error"], counters["pricing_409"], counters["pricing_409_unexpected"], counters["pricing_edit_error"])
+        log.info("  pricing rule restored with one PATCH: status %s, final version %s, original values back: %s",
+                 restore_status, restore_version, restore_equal)
         log.info("  final offers by status: %s", dict(sorted(ctx["chaos"]["offer"].items())))
         log.info("  5xx answers: %d, connection errors: %d%s", server_errors, counters["transport_errors"],
                  " (tolerated)" if args.tolerate_5xx else "")
@@ -1548,7 +1782,9 @@ async def main() -> int:
                             ("trips_completed", "completed trip"), ("offline_events", "driver going offline"), ("double_accepts", "double accept"),
                             ("rejects", "reject"), ("ignores", "ignored offer"), ("ratings_by_rider", "rating by a rider"),
                             ("ratings_by_driver", "rating by a driver"), ("rating_dup_pairs", "rating sent twice at once"),
-                            ("rating_notcompleted_tried", "rating attempt on a ride that did not complete")):
+                            ("rating_notcompleted_tried", "rating attempt on a ride that did not complete"),
+                            ("pricing_edits", "pricing edit"), ("pricing_dups_sent", "pricing edit sent twice at once"),
+                            ("admin_reads", "admin view read")):
             if not counters[what]:
                 log.warning("  no %s happened in this run: it proves nothing about that case", label)
         problems = [f"{code} in {len(ctx['rounds'][0][name])} offenders" for name, (code, *_rest) in INVARIANTS.items() if ctx["rounds"][0].get(name)]
@@ -1564,6 +1800,14 @@ async def main() -> int:
             problems.append(f"{len(ctx['rating_view_mismatches'])} rating view mismatches")
         if counters["rating_dup_error"]:
             problems.append(f"{counters['rating_dup_error']} duplicate rating pairs without exactly one 201")
+        if counters["admin_view_mismatch"]:
+            problems.append(f"{counters['admin_view_mismatch']} admin view mismatches")
+        if counters["pricing_dup_error"]:
+            problems.append(f"{counters['pricing_dup_error']} pricing edits sent twice that did not answer exactly 200 and 409")
+        if counters["pricing_409_unexpected"] or counters["pricing_edit_error"]:
+            problems.append(f"{counters['pricing_409_unexpected']} single pricing edits answered 409 and {counters['pricing_edit_error']} failed otherwise")
+        if not restore_equal:
+            problems.append("the pricing rule was not restored to its original values")
         if counters["rating_notcompleted_tried"] != counters["rating_notcompleted_409"] and not args.tolerate_5xx:
             problems.append("a rating of a ride that did not complete was not refused with 409")
         if earning_gross != earning_fees + earning_driver:

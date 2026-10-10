@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Admin</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
   <link rel="stylesheet" href="/shared/base.css">
   <link rel="stylesheet" href="admin.css">
 </head>
@@ -34,37 +35,257 @@
       <p id="wrong-role-text"></p>
     </section>
 
+    <nav id="nav" hidden>
+      <button type="button" data-tab="overview">Overview</button>
+      <button type="button" data-tab="live">Live map</button>
+      <button type="button" data-tab="drivers">Drivers</button>
+      <button type="button" data-tab="rides">Rides</button>
+      <button type="button" data-tab="pricing">Pricing</button>
+    </nav>
+
+    <!-- Overview -->
+    <section id="overview-section" hidden>
+      <h2>Overview</h2>
+      <div class="button-row" id="period-buttons">
+        <button type="button" data-period="today">Today (hourly)</button>
+        <button type="button" data-period="week">Last 7 days</button>
+        <button type="button" data-period="month">Last 30 days</button>
+      </div>
+      <p id="period-text" class="note"></p>
+      <p id="stats-empty" class="note" hidden>Loading...</p>
+
+      <h3>Rides requested in this period</h3>
+      <dl id="cards-rides" class="cards"></dl>
+      <p class="note">Ride numbers count rides requested in this period. Money counts payments settled in this period, so the two can differ.</p>
+
+      <h3>Money settled in this period</h3>
+      <dl id="cards-money" class="cards"></dl>
+      <p id="settlement-line"></p>
+
+      <h3>Right now</h3>
+      <dl id="cards-now" class="cards"></dl>
+
+      <figure>
+        <figcaption id="chart-rides-caption"></figcaption>
+        <svg id="chart-rides" class="chart"></svg>
+      </figure>
+      <figure>
+        <figcaption id="chart-money-caption"></figcaption>
+        <svg id="chart-money" class="chart"></svg>
+      </figure>
+    </section>
+
+    <!-- Live map -->
+    <section id="live-section" hidden>
+      <h2>Live map</h2>
+      <p id="live-counts"></p>
+      <p id="live-warning" class="message" hidden></p>
+      <p id="live-time" class="note"></p>
+      <div class="button-row">
+        <label class="inline"><input id="toggle-drivers" type="checkbox" checked> Drivers</label>
+        <label class="inline"><input id="toggle-rides" type="checkbox" checked> Active rides</label>
+        <button id="fit-button" type="button">Fit map</button>
+      </div>
+      <div class="live-layout">
+        <div id="map"></div>
+        <aside id="live-panel" aria-live="polite"></aside>
+      </div>
+      <p class="note">Drivers (filled dots): green = free, amber = deciding on an offer, blue = on a ride. Rides (pickup point, thick ring): orange = looking for a driver, purple = driver assigned or arrived, red = trip in progress. Click a dot to see its details.</p>
+
+      <h3>Surge zones</h3>
+      <p id="surge-note" class="note"></p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr><th>Zone</th><th>Demand</th><th>Supply</th><th>Pressure</th><th>Multiplier</th></tr>
+          </thead>
+          <tbody id="surge-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Drivers -->
     <section id="drivers-section" hidden>
       <h2>Drivers</h2>
-      <label for="status-filter">Status</label>
-      <select id="status-filter">
-        <option value="">All</option>
-        <option value="pending">Pending</option>
-        <option value="approved">Approved</option>
-        <option value="rejected">Rejected</option>
-      </select>
-      <button id="refresh-button" type="button">Refresh</button>
+      <form id="driver-search-form" class="filter-row">
+        <div>
+          <label for="driver-status">Status</label>
+          <select id="driver-status">
+            <option value="">All</option>
+            <option value="pending">Pending</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+          </select>
+        </div>
+        <div>
+          <label for="driver-search">Search name, email, license, plate or id</label>
+          <input id="driver-search" type="search" maxlength="100" autocomplete="off">
+        </div>
+        <button type="submit">Search</button>
+      </form>
 
       <p id="no-drivers" hidden>No drivers found.</p>
       <div class="table-scroll">
         <table>
           <thead>
             <tr>
-              <th>Driver id</th>
-              <th>Name</th>
-              <th>Email</th>
-              <th>License</th>
-              <th>Plate</th>
-              <th>Status</th>
-              <th>Actions</th>
+              <th>Id</th><th>Name</th><th>Email</th><th>License</th><th>Plate</th><th>Status</th>
+              <th>Online</th><th>Rating</th><th>Trips</th><th>Actions</th>
             </tr>
           </thead>
-          <tbody id="drivers"></tbody>
+          <tbody id="drivers-body"></tbody>
         </table>
       </div>
+      <p><button id="drivers-more" type="button">Load more</button> <span id="drivers-more-note" class="note"></span></p>
+
+      <div id="driver-detail" hidden>
+        <h3>Driver details</h3>
+        <button id="driver-detail-close" type="button">Close</button>
+        <p id="driver-detail-loading">Loading...</p>
+        <p id="driver-detail-missing" hidden>Driver not found.</p>
+        <div id="driver-detail-body">
+          <dl id="driver-detail-fields" class="fields"></dl>
+          <h4>Earnings, all time</h4>
+          <dl id="driver-detail-earnings" class="fields"></dl>
+          <h4>Last 5 rides</h4>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Ride</th><th>Created</th><th>Status</th><th>Final fare</th><th></th></tr></thead>
+              <tbody id="driver-detail-rides"></tbody>
+            </table>
+          </div>
+          <h4>Last 5 ratings received</h4>
+          <ul id="driver-detail-ratings"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Rides -->
+    <section id="rides-section" hidden>
+      <h2>Rides</h2>
+      <form id="ride-search-form" class="filter-row">
+        <div>
+          <label for="ride-status">Status</label>
+          <select id="ride-status">
+            <option value="">All</option>
+            <option value="REQUESTED">Looking for a driver</option>
+            <option value="DRIVER_ASSIGNED">Driver assigned</option>
+            <option value="DRIVER_ARRIVED">Driver arrived</option>
+            <option value="IN_PROGRESS">Trip in progress</option>
+            <option value="COMPLETED">Completed</option>
+            <option value="CANCELLED">Cancelled</option>
+            <option value="NO_DRIVER_FOUND">No driver found</option>
+          </select>
+        </div>
+        <div>
+          <label for="ride-rider">Rider id</label>
+          <input id="ride-rider" type="text" inputmode="numeric" autocomplete="off">
+        </div>
+        <div>
+          <label for="ride-driver">Driver id</label>
+          <input id="ride-driver" type="text" inputmode="numeric" autocomplete="off">
+        </div>
+        <div>
+          <label for="ride-period">Period</label>
+          <select id="ride-period">
+            <option value="all">All time</option>
+            <option value="today">Today</option>
+            <option value="week">Last 7 days</option>
+          </select>
+        </div>
+        <button type="submit">Search</button>
+        <button id="rides-refresh" type="button">Refresh</button>
+      </form>
+
+      <p id="no-rides" hidden>No rides found.</p>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Id</th><th>Created</th><th>Status</th><th>Rider</th><th>Driver</th><th>Trip</th>
+              <th>Estimate</th><th>Final fare</th><th>Surge</th><th>Payment</th>
+            </tr>
+          </thead>
+          <tbody id="rides-body"></tbody>
+        </table>
+      </div>
+      <p><button id="rides-more" type="button">Load more</button></p>
+
+      <div id="ride-detail" hidden>
+        <h3>Ride details</h3>
+        <button id="ride-detail-close" type="button">Close</button>
+        <p id="ride-detail-loading">Loading...</p>
+        <p id="ride-detail-missing" hidden>Ride not found.</p>
+        <div id="ride-detail-body">
+          <dl id="ride-detail-fields" class="fields"></dl>
+          <h4>Timeline</h4>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Time</th><th>Change</th><th>By</th></tr></thead>
+              <tbody id="ride-detail-events"></tbody>
+            </table>
+          </div>
+          <h4>Offers</h4>
+          <p id="ride-detail-no-offers" hidden>No offers were made.</p>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Driver</th><th>Status</th><th>Distance to pickup</th><th>Created</th><th>Expires</th><th>Answered</th></tr></thead>
+              <tbody id="ride-detail-offers"></tbody>
+            </table>
+          </div>
+          <h4>Payment and earning</h4>
+          <dl id="ride-detail-money" class="fields"></dl>
+          <h4>Ratings</h4>
+          <ul id="ride-detail-ratings"></ul>
+          <h4>Fare breakdown</h4>
+          <dl id="ride-detail-breakdown" class="fields"></dl>
+        </div>
+      </div>
+    </section>
+
+    <!-- Pricing -->
+    <section id="pricing-section" hidden>
+      <h2>Pricing</h2>
+      <p id="pricing-active"></p>
+      <form id="pricing-form">
+        <label for="pricing-base_fare">Base fare (rupees)</label>
+        <input id="pricing-base_fare" type="text" inputmode="decimal" autocomplete="off">
+        <span class="note" id="range-base_fare"></span>
+        <label for="pricing-per_km">Per kilometre (rupees)</label>
+        <input id="pricing-per_km" type="text" inputmode="decimal" autocomplete="off">
+        <span class="note" id="range-per_km"></span>
+        <label for="pricing-per_min">Per minute (rupees)</label>
+        <input id="pricing-per_min" type="text" inputmode="decimal" autocomplete="off">
+        <span class="note" id="range-per_min"></span>
+        <label for="pricing-min_fare">Minimum fare (rupees)</label>
+        <input id="pricing-min_fare" type="text" inputmode="decimal" autocomplete="off">
+        <span class="note" id="range-min_fare"></span>
+        <label for="pricing-cancellation_fee">Cancellation fee (rupees)</label>
+        <input id="pricing-cancellation_fee" type="text" inputmode="decimal" autocomplete="off">
+        <span class="note" id="range-cancellation_fee"></span>
+        <label for="pricing-free_cancel_seconds">Free cancellation window (seconds)</label>
+        <input id="pricing-free_cancel_seconds" type="text" inputmode="numeric" autocomplete="off">
+        <span class="note" id="range-free_cancel_seconds"></span>
+        <label for="pricing-commission_percent">Commission (percent of every payment)</label>
+        <input id="pricing-commission_percent" type="text" inputmode="numeric" autocomplete="off">
+        <span class="note" id="range-commission_percent"></span>
+        <label for="pricing-surge_cap">Surge cap (× the normal fare)</label>
+        <input id="pricing-surge_cap" type="text" inputmode="decimal" autocomplete="off">
+        <span class="note" id="range-surge_cap"></span>
+        <button type="submit">Save</button>
+        <button id="pricing-reload" type="button" hidden>Reload values</button>
+      </form>
+      <p id="pricing-saved" role="status"></p>
+      <p class="note" id="pricing-effects">Applies to new estimates immediately. A ride already requested or in progress is settled at completion with the new base fare, per-kilometre rate, per-minute rate and minimum fare, but never above 150% of its own estimate. The surge cap applies immediately to new quotes (a ride keeps the multiplier it was quoted). The commission applies to settlements after the change; earlier settlements keep the percent they had. The cancellation fee and the free window apply to the next cancellation.</p>
+
+      <h3>Last changes</h3>
+      <p id="no-history" class="note" hidden>No changes have been made yet.</p>
+      <ul id="pricing-history"></ul>
     </section>
   </main>
 
+  <!-- Before the module script, so L is defined when admin.js runs. -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script type="module" src="admin.js"></script>
 </body>
 </html>

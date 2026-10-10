@@ -597,7 +597,7 @@ async def test_a_receipt_does_not_change_when_the_rule_or_surge_changes_later(cl
     assert (await complete(client, wallet_trip)).status_code == 200
     before = await get_receipt(client, wallet_trip["rider"], wallet_trip["id"])
 
-    await set_rule(db, base_fare=9999, per_km=1, per_min=1, min_fare=1, cancellation_fee=777, commission_percent=55, surge_cap=1.0)
+    await set_rule(db, base_fare=9999, per_km=1, per_min=1, min_fare=100, cancellation_fee=777, commission_percent=55, surge_cap=1.0)
     await pricing_repo.save_snapshot({"computed_at": 1, "zones": {"x": {"demand": 9, "supply": 0, "pressure_percent": 900, "surge_percent": 200}}}, 60)
 
     after = await get_receipt(client, wallet_trip["rider"], wallet_trip["id"])
