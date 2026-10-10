@@ -179,8 +179,7 @@ async def test_no_lock_is_left_behind(client, db, make_user, online_at, test_eng
         raise RuntimeError("boom")
 
     monkeypatch.setattr(offers_repo, "create", broken)
-    with pytest.raises(RuntimeError):
-        await post_ride(client, rider_1)
+    assert (await post_ride(client, rider_1)).status_code == 500
     monkeypatch.setattr(offers_repo, "create", real_create)
     await assert_no_lock_left(test_engine, driver_ids, user_ids)
 

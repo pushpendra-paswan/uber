@@ -399,8 +399,7 @@ async def test_a_request_that_fails_halfway_leaves_no_lock_behind(client, db, te
 
     with monkeypatch.context() as patch:
         patch.setattr(saved_places_repo, "insert", broken_insert)
-        with pytest.raises(RuntimeError):
-            await create(client, rider, "Home")
+        assert (await create(client, rider, "Home")).status_code == 500
 
     await assert_user_row_is_free(test_engine, rider["user"].id)
     assert await rows_of(db) == []

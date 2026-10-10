@@ -1,0 +1,13 @@
+# Scrapes the backend every 5 seconds. The token file is written by the container's start command in docker-compose.yml
+# from the METRICS_TOKEN environment variable, so the token is not in this file.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: backend
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/metrics_token
+    static_configs:
+      - targets: ["backend:8000"]

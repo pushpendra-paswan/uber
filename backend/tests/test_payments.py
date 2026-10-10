@@ -434,8 +434,7 @@ async def test_a_failure_while_charging_undoes_the_whole_settlement(client, db, 
         raise RuntimeError("the ledger is broken")
 
     monkeypatch.setattr(wallet_service, "post_entry", broken)
-    with pytest.raises(RuntimeError):
-        await complete(client, trip)
+    assert (await complete(client, trip)).status_code == 500
     stored = (await db.execute(select(Ride.status, Ride.final_fare, Ride.fare_breakdown).where(Ride.id == trip["id"]))).one()
     assert (stored.status, stored.final_fare, stored.fare_breakdown) == (RideStatus.IN_PROGRESS, None, None)
     assert await payments_of(db, trip["id"]) == []
@@ -457,8 +456,7 @@ async def test_a_failure_while_charging_a_cancellation_fee_undoes_the_cancel(cli
         raise RuntimeError("the ledger is broken")
 
     monkeypatch.setattr(wallet_service, "post_entry", broken)
-    with pytest.raises(RuntimeError):
-        await client.post(f"/rides/{trip['id']}/cancel", headers=trip["rider"]["headers"])
+    assert (await client.post(f"/rides/{trip['id']}/cancel", headers=trip["rider"]["headers"])).status_code == 500
     stored = (await db.execute(select(Ride.status, Ride.final_fare).where(Ride.id == trip["id"]))).one()
     assert (stored.status, stored.final_fare) == (RideStatus.DRIVER_ASSIGNED, None)
     assert await payments_of(db, trip["id"]) == []
@@ -888,8 +886,7 @@ async def test_a_failure_in_the_middle_leaves_nothing_behind_and_the_retry_credi
         raise RuntimeError("the ledger is broken")
 
     monkeypatch.setattr(wallet_service, "post_entry", broken)
-    with pytest.raises(RuntimeError):
-        await post_webhook(client, body)
+    assert (await post_webhook(client, body)).status_code == 500
     assert await count(db, StripeEvent) == 0  # the event id was rolled back with everything else
     assert (await topup_state(db, topup_id)).status == TopupStatus.PENDING and await count(db, WalletEntry) == 0
 

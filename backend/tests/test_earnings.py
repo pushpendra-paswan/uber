@@ -171,8 +171,7 @@ async def test_a_failing_earning_or_ledger_write_undoes_the_whole_completion(cli
         raise RuntimeError("broken on purpose")
 
     monkeypatch.setattr(module, name, broken)
-    with pytest.raises(RuntimeError):
-        await complete(client, wallet_trip)
+    assert (await complete(client, wallet_trip)).status_code == 500
 
     stored = (await db.execute(select(Ride.status, Ride.final_fare, Ride.fare_breakdown).where(Ride.id == wallet_trip["id"]))).one()
     assert (stored.status, stored.final_fare, stored.fare_breakdown) == (RideStatus.IN_PROGRESS, None, None)
@@ -195,8 +194,7 @@ async def test_a_failing_earning_write_undoes_a_cancellation_too(client, db, mon
         raise RuntimeError("broken on purpose")
 
     monkeypatch.setattr(earnings_repo, "create", broken)
-    with pytest.raises(RuntimeError):
-        await cancel(client, wallet_trip)
+    assert (await cancel(client, wallet_trip)).status_code == 500
     stored = (await db.execute(select(Ride.status, Ride.final_fare).where(Ride.id == wallet_trip["id"]))).one()
     assert (stored.status, stored.final_fare) == (RideStatus.DRIVER_ASSIGNED, None)
     assert await payments_of(db, wallet_trip["id"]) == [] and await count(db, RideEarning) == 0

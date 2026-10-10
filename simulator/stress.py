@@ -37,6 +37,7 @@ import math
 import os
 import pathlib
 import random
+import re
 import signal
 import statistics
 import sys
@@ -636,6 +637,7 @@ async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict,
                     counters["duplicate_requests"] += 1
                     counters["duplicates_refused"] += sum(1 for answer in answers if answer.status_code == 409) - len(price_up)
                 created = [answer for answer in answers if answer.status_code == 201]
+                counters["ride_201"] += len(created)
                 if created:
                     ride_id, cancelled = created[0].json()["id"], False
                     cancel_at = time.monotonic() + (rng.uniform(0, 10) if rng.random() < 0.25 else 90)
@@ -944,6 +946,14 @@ async def scenario_chaos(ctx: dict) -> None:
     ctx["pricing_original"] = {name: rule[name] for name in PRICING_FIELDS}
     ctx["pricing_version_start"] = rule["version"]
 
+    # The metrics of every process before the run (M7.1), read right before the start time of the SQL comparison below.
+    ctx["metrics_before"] = []
+    if args.metrics_token:
+        for url in args.api_urls:
+            answer = await ctx["api"].get(f"{url}/metrics", headers={"Authorization": f"Bearer {args.metrics_token}"})
+            if answer.status_code != 200:
+                raise RuntimeError(f"GET {url}/metrics answered {answer.status_code}: is --metrics-token the backend's METRICS_TOKEN?")
+            ctx["metrics_before"].append(answer.text)
     since = (await sql(ctx, "SELECT now()"))[0]
     since_iso = (await sql(ctx, "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"))[0]
     mine = f"r.created_at >= '{since}' AND r.rider_id IN (SELECT id FROM users WHERE email LIKE '{RIDER_LIKE}')"
@@ -1462,6 +1472,85 @@ async def scenario_chaos(ctx: dict) -> None:
     counters["saved_view_mismatch"] += len(saved_problems)
     counters["history_view_mismatch"] += len(history_problems)
 
+    # Metrics against the database (M7.1), after the settle period and before the cleanup. Without --metrics-token nothing is checked,
+    # and the summary says so. Prometheus text is read with two regular expressions; no client library.
+    # (a) metrics_mismatch: the summed increase of ride_transitions_total per (from, to) equals the SQL count of ride_events created
+    # since the run started. Counted after the commit and best effort across a crash, so it is skipped when a backend restarted
+    # (process_start_time_seconds changed: the counters began again from 0).
+    # (b) POST /rides 201 increased by at least the 201s this tool saw (a lower bound: other clients may add more; also skipped after a restart).
+    # (c) no route label has a path segment that is only digits, and http_requests_total has at most 500 series.
+    # (d) observability_errors_total did not rise in any process during the run (an earlier outage keeps its count until the process restarts).
+    # (e) rides_active of the FIRST process equals SQL (the gauges read the database, so they are not summed over processes).
+    if args.metrics_token:
+        log.info("metrics: waiting 6 s for the gauges to refresh (they run every 5 s)")
+        await asyncio.sleep(6)
+        for attempt in (1, 2):
+            found, report, parsed = [], {}, {"before": [], "after": []}
+            for phase, texts in (("before", ctx["metrics_before"]), ("after", [None] * len(args.api_urls))):
+                for url, text in zip(args.api_urls, texts):
+                    if text is None:
+                        answer = await ctx["api"].get(f"{url}/metrics", headers={"Authorization": f"Bearer {args.metrics_token}"})
+                        text = answer.text
+                    values = {}
+                    for name, label_text, value in re.findall(r"^(\w+)(?:\{([^}]*)\})? (\S+)$", text, re.M):
+                        values[(name, tuple(sorted(re.findall(r'(\w+)="([^"]*)"', label_text))))] = float(value)
+                    parsed[phase].append(values)
+            restarted = any(
+                before.get(("process_start_time_seconds", ())) != after.get(("process_start_time_seconds", ()))
+                for before, after in zip(parsed["before"], parsed["after"])
+            )
+            increases = collections.Counter()
+            for before, after in zip(parsed["before"], parsed["after"]):
+                for key, value in after.items():
+                    if key[0] == "ride_transitions_total":
+                        labels = dict(key[1])
+                        increases[(labels["from_status"], labels["to_status"])] += value - before.get(key, 0)
+            if restarted:
+                report["transitions"] = report["post_rides"] = "SKIPPED: a backend process restarted during the run, so its counters began again from 0"
+            else:
+                in_sql = collections.Counter({
+                    (row.split("|")[0], row.split("|")[1]): int(row.split("|")[2]) for row in await sql(
+                        ctx, f"SELECT COALESCE(from_status, 'none'), to_status, count(*) FROM ride_events WHERE created_at >= '{since}' GROUP BY 1, 2")
+                })
+                increases = +increases
+                report["transitions"] = f"metrics {sum(increases.values()):.0f} vs SQL {sum(in_sql.values())} transitions in {len(in_sql)} kinds"
+                for pair in sorted(set(increases) | set(in_sql)):
+                    if increases[pair] != in_sql[pair]:
+                        found.append(f"transitions {pair[0]} -> {pair[1]}: metrics {increases[pair]:.0f}, SQL {in_sql[pair]}")
+                posted = sum(
+                    after.get(key, 0) - before.get(key, 0) for before, after in zip(parsed["before"], parsed["after"])
+                    for key in [("http_requests_total", (("method", "POST"), ("route", "/rides"), ("status", "201")))]
+                )
+                report["post_rides"] = f"metrics +{posted:.0f} vs {counters['ride_201']} seen by this tool (at least)"
+                if posted < counters["ride_201"]:
+                    found.append(f"POST /rides 201: metrics +{posted:.0f} is less than the {counters['ride_201']} this tool saw")
+            series_counts, error_counts, error_totals = [], [], []
+            for before, after in zip(parsed["before"], parsed["after"]):
+                routes = [dict(key[1]).get("route", "") for key in after if key[0] == "http_requests_total"]
+                series_counts.append(len(routes))
+                error_totals.append(sum(value for key, value in after.items() if key[0] == "observability_errors_total"))
+                error_counts.append(error_totals[-1] - sum(value for key, value in before.items() if key[0] == "observability_errors_total"))
+                found.extend(f"route label with a numeric segment: {route}" for route in set(routes) if any(part.isdigit() for part in route.split("/")))
+            report["series"] = (f"http_requests_total series per process {series_counts} (limit 500), observability_errors_total increase during the run "
+                                f"{error_counts} (should be 0; totals since the processes started {error_totals})")
+            found.extend(f"http_requests_total has {count} series" for count in series_counts if count > 500)
+            found.extend(f"observability_errors_total rose by {count:.0f} in a process during the run" for count in error_counts if count > 0)
+            gauge_sql = {row.split("|")[0]: int(row.split("|")[1]) for row in await sql(
+                ctx, "SELECT status, count(*) FROM rides WHERE status IN ('REQUESTED', 'DRIVER_ASSIGNED', 'DRIVER_ARRIVED', 'IN_PROGRESS') GROUP BY status")}
+            gauges = {dict(key[1])["status"]: int(value) for key, value in parsed["after"][0].items() if key[0] == "rides_active"}
+            report["rides_active"] = f"metrics {dict(sorted(gauges.items()))} vs SQL {dict(sorted(gauge_sql.items()))}"
+            found.extend(
+                f"rides_active {status}: metrics {gauges.get(status, 0)}, SQL {gauge_sql.get(status, 0)}"
+                for status in ("REQUESTED", "DRIVER_ASSIGNED", "DRIVER_ARRIVED", "IN_PROGRESS") if gauges.get(status, 0) != gauge_sql.get(status, 0)
+            )
+            if not found:
+                break
+            if attempt == 1:
+                log.warning("metrics: %d mismatches, asking again in 2 s", len(found))
+                await asyncio.sleep(2)
+        ctx["metrics_report"], ctx["metrics_mismatches"] = report, found
+        counters["metrics_mismatch"] += len(found)
+
 
 async def scenario_payments(ctx: dict) -> None:
     """Top-ups and webhooks under repetition (M5.3). Each round, for all riders at once: the same top-up request five times
@@ -1827,6 +1916,7 @@ async def main() -> int:
     parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos", "payments", "ratings", "places"], default="drivers")
     parser.add_argument("--admin-email", default=os.environ.get("SIM_ADMIN_EMAIL"), help="or env SIM_ADMIN_EMAIL")
     parser.add_argument("--admin-password", default=os.environ.get("SIM_ADMIN_PASSWORD"), help="or env SIM_ADMIN_PASSWORD")
+    parser.add_argument("--metrics-token", help="chaos scenario: the backend's METRICS_TOKEN; compares /metrics of every --api-url with the database (without it those checks are SKIPPED)")
     parser.add_argument("--webhook-secret", default=os.environ.get("STRIPE_WEBHOOK_SECRET"), help="payments scenario: the backend's webhook secret, or env STRIPE_WEBHOOK_SECRET")
     parser.add_argument("--api-url", default="http://127.0.0.1:8000", help="one URL, or several separated by commas (two backend processes)")
     parser.add_argument("--osrm-url", default="http://127.0.0.1:5000")
@@ -1907,7 +1997,7 @@ async def main() -> int:
         "driver_emails": [], "rounds": [], "checks": 0, "latencies": {}, "per_rider": {}, "fleet": {"rides": 0, "no_driver": 0},
         "finished": False, "unsettled": False, "offers": {"got": 0, "expected": 0, "lost_rounds": 0},
         "counters": collections.Counter(), "payment_problems": [], "stuck": {}, "chaos": {"ride": {}, "offer": {}}, "left_active": 0,
-        "admin_view_details": [], "pricing_original": None, "pricing_restore": None,
+        "admin_view_details": [], "pricing_original": None, "pricing_restore": None, "metrics_report": {}, "metrics_mismatches": [],
     }
     failure = None
     interrupted = False
@@ -2084,6 +2174,14 @@ async def main() -> int:
                  "%d rows compared; saved_view_mismatch %d, history_view_mismatch %d (both should be 0)",
                  ctx["saved_checked"]["riders"], ctx["saved_checked"]["places"], ctx["history_checked"]["riders"], ctx["history_checked"]["drivers"],
                  ctx["history_checked"]["rows"], counters["saved_view_mismatch"], counters["history_view_mismatch"])
+        if args.metrics_token:
+            for name, text in ctx["metrics_report"].items():
+                log.info("  metrics %s: %s", name, text)
+            log.info("  metrics checked against SQL; metrics_mismatch %d (should be 0)", counters["metrics_mismatch"])
+        else:
+            log.warning("  metrics checks SKIPPED: no --metrics-token (nothing was compared with /metrics; this is not a pass)")
+        for mismatch in ctx["metrics_mismatches"][:5]:
+            log.error("  METRICS MISMATCH %s", mismatch)
         for mismatch in ctx["saved_view_mismatches"][:5]:
             log.error("  SAVED VIEW MISMATCH %s", mismatch)
         for mismatch in ctx["history_view_mismatches"][:5]:
@@ -2130,6 +2228,8 @@ async def main() -> int:
             problems.append(f"{counters['rating_dup_error']} duplicate rating pairs without exactly one 201")
         if counters["admin_view_mismatch"]:
             problems.append(f"{counters['admin_view_mismatch']} admin view mismatches")
+        if counters["metrics_mismatch"]:
+            problems.append(f"{counters['metrics_mismatch']} metrics mismatches")
         if counters["saved_view_mismatch"]:
             problems.append(f"{counters['saved_view_mismatch']} saved place view mismatches")
         if counters["history_view_mismatch"]:

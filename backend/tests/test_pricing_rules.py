@@ -330,8 +330,7 @@ async def test_a_failure_halfway_leaves_neither_the_rule_nor_an_audit_row(client
     monkeypatch.setattr(pricing_repo, failing, broken)
     before = await stored(db)
 
-    with pytest.raises(RuntimeError):
-        await patch(client, admin, {"version": 1, "per_km": 1500, "commission_percent": 30})
+    assert (await patch(client, admin, {"version": 1, "per_km": 1500, "commission_percent": 30})).status_code == 500
 
     assert await stored(db) == before
     assert await audit(db) == []

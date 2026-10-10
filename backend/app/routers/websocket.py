@@ -6,6 +6,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from redis.exceptions import RedisError
 
 from app import database
+from app.observability import metrics
+from app.observability.context import request_context
 from app.repositories import events
 from app.security import user_from_token
 
@@ -18,6 +20,7 @@ CLOSE_BAD_MESSAGE = 4400
 CLOSE_UNAUTHORIZED = 4401
 CLOSE_AUTH_TIMEOUT = 4408
 CLOSE_REPLACED = 4409
+COUNTED_CLOSE_CODES = (1000, 1001, 1006, CLOSE_BAD_MESSAGE, CLOSE_UNAUTHORIZED, CLOSE_AUTH_TIMEOUT, CLOSE_REPLACED)  # any other code is counted as "other"
 
 # uvicorn's logger, because it is the one that has a handler and prints INFO.
 logger = logging.getLogger("uvicorn.error")
@@ -33,72 +36,87 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # The token is in the first message, never in the URL: URLs end up in logs and history,
     # and browsers cannot set headers on a WebSocket.
     await websocket.accept()
+    metrics.ws_connections.inc()
+    close_code = 1006  # what is counted when the connection just ends without a close frame
     try:
-        frame = await asyncio.wait_for(websocket.receive(), AUTH_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        await websocket.close(code=CLOSE_AUTH_TIMEOUT)
-        return
-    if frame["type"] == "websocket.disconnect":
-        return
+        try:
+            frame = await asyncio.wait_for(websocket.receive(), AUTH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            close_code = CLOSE_AUTH_TIMEOUT
+            await websocket.close(code=CLOSE_AUTH_TIMEOUT)
+            return
+        if frame["type"] == "websocket.disconnect":
+            close_code = frame.get("code", 1006)
+            return
 
-    try:
-        first = json.loads(frame["text"]) if frame.get("text") is not None else None
-    except ValueError:
-        first = None
-    data = first.get("data") if isinstance(first, dict) else None
-    token = data.get("token") if isinstance(data, dict) else None
-    if not isinstance(first, dict) or first.get("type") != "auth" or not isinstance(token, str):
-        await websocket.close(code=CLOSE_UNAUTHORIZED)
-        return
+        try:
+            first = json.loads(frame["text"]) if frame.get("text") is not None else None
+        except ValueError:
+            first = None
+        data = first.get("data") if isinstance(first, dict) else None
+        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(first, dict) or first.get("type") != "auth" or not isinstance(token, str):
+            close_code = CLOSE_UNAUTHORIZED
+            await websocket.close(code=CLOSE_UNAUTHORIZED)
+            return
 
-    # A short session just for this lookup. Depends(get_db) would hold a Postgres connection as long as the socket lives.
-    async with database.async_session() as db:
-        user = await user_from_token(db, token)
-    if user is None:
-        await websocket.close(code=CLOSE_UNAUTHORIZED)
-        return
-    user_id, role = user.id, user.role.value
+        # A short session just for this lookup. Depends(get_db) would hold a Postgres connection as long as the socket lives.
+        async with database.async_session() as db:
+            user = await user_from_token(db, token)
+        if user is None:
+            close_code = CLOSE_UNAUTHORIZED
+            await websocket.close(code=CLOSE_UNAUTHORIZED)
+            return
+        user_id, role = user.id, user.role.value
+        request_context.get().update(user_id=user_id, role=role)
 
-    # No await between the count check and the append. At the limit the newest wins, so a page reload
-    # is never locked out by a dead socket.
-    sockets = connections.setdefault(user_id, [])
-    oldest = sockets.pop(0) if len(sockets) >= MAX_CONNECTIONS_PER_USER else None
-    sockets.append(websocket)
+        # No await between the count check and the append. At the limit the newest wins, so a page reload
+        # is never locked out by a dead socket.
+        sockets = connections.setdefault(user_id, [])
+        oldest = sockets.pop(0) if len(sockets) >= MAX_CONNECTIONS_PER_USER else None
+        sockets.append(websocket)
 
-    try:
-        await websocket.send_json({"type": "auth_ok", "data": {"user_id": user_id, "role": role}})
-        logger.info("WebSocket connected: user %s (%s), %s connection(s)", user_id, role, len(sockets))
-        if oldest is not None:
-            try:
-                await asyncio.wait_for(oldest.close(code=CLOSE_REPLACED), SEND_TIMEOUT_SECONDS)
-            except Exception:
-                pass  # the old socket is probably dead already; it is out of the registry either way
+        try:
+            await websocket.send_json({"type": "auth_ok", "data": {"user_id": user_id, "role": role}})
+            logger.info("ws_connected", extra={"count": len(sockets)})
+            if oldest is not None:
+                try:
+                    await asyncio.wait_for(oldest.close(code=CLOSE_REPLACED), SEND_TIMEOUT_SECONDS)
+                except Exception:
+                    pass  # the old socket is probably dead already; it is out of the registry either way
 
-        while True:
-            frame = await websocket.receive()
-            if frame["type"] == "websocket.disconnect":
-                break
-            try:
-                message = json.loads(frame["text"]) if frame.get("text") is not None else None
-            except ValueError:
-                message = None
-            if not isinstance(message, dict) or not isinstance(message.get("type"), str):
-                await websocket.close(code=CLOSE_BAD_MESSAGE)
-                break
-            if message["type"] == "ping":
-                await websocket.send_json({"type": "pong", "data": {}})
-            else:
-                await websocket.send_json({"type": "error", "data": {"detail": f"Unknown message type: {message['type'][:50]}"}})
-    except WebSocketDisconnect:
-        pass  # a send to a client that has just gone away
+            while True:
+                frame = await websocket.receive()
+                if frame["type"] == "websocket.disconnect":
+                    close_code = frame.get("code", 1006)
+                    break
+                try:
+                    message = json.loads(frame["text"]) if frame.get("text") is not None else None
+                except ValueError:
+                    message = None
+                if not isinstance(message, dict) or not isinstance(message.get("type"), str):
+                    close_code = CLOSE_BAD_MESSAGE
+                    await websocket.close(code=CLOSE_BAD_MESSAGE)
+                    break
+                if message["type"] == "ping":
+                    await websocket.send_json({"type": "pong", "data": {}})
+                else:
+                    await websocket.send_json({"type": "error", "data": {"detail": f"Unknown message type: {message['type'][:50]}"}})
+        except WebSocketDisconnect as disconnect:
+            close_code = disconnect.code  # a send to a client that has just gone away
+        finally:
+            # The socket may already be gone from the list (replaced by a newer connection, or dropped by the listener).
+            remaining = connections.get(user_id, [])
+            if websocket in remaining:
+                remaining.remove(websocket)
+            if not remaining:
+                connections.pop(user_id, None)
     finally:
-        # The socket may already be gone from the list (replaced by a newer connection, or dropped by the listener).
-        remaining = connections.get(user_id, [])
-        if websocket in remaining:
-            remaining.remove(websocket)
-        if not remaining:
-            connections.pop(user_id, None)
-        logger.info("WebSocket disconnected: user %s (%s), %s connection(s)", user_id, role, len(remaining))
+        # uvicorn reports a connection that ended without any close status as 1005. That is the abnormal case, 1006.
+        close_code = 1006 if close_code == 1005 else close_code
+        metrics.ws_connections.dec()
+        metrics.ws_closes_total.labels(close_code if close_code in COUNTED_CLOSE_CODES else "other").inc()
+        logger.info("ws_closed", extra={"ws_close_code": close_code})
 
 
 async def listen_for_events() -> None:
@@ -146,7 +164,7 @@ async def listen_for_events() -> None:
                             pass
         except RedisError as error:
             if not is_down:
-                logger.warning("WebSocket event listener is down, retrying every %s s: %s", RECONNECT_DELAY_SECONDS, error)
+                logger.warning("WebSocket event listener is down, retrying every %s s: %s", RECONNECT_DELAY_SECONDS, type(error).__name__)
                 is_down = True
         finally:
             if pubsub is not None:

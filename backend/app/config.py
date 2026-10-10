@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     stripe_api_url: str = "https://api.stripe.com"
     app_base_url: str = "http://localhost:8000"
+    # Observability (M7.1). An empty metrics token switches /metrics off (404).
+    log_level: str = "INFO"
+    metrics_token: str = ""
 
     @property
     def postgres_url(self) -> str:

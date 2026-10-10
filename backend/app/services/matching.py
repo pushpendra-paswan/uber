@@ -64,5 +64,9 @@ async def offer_to_next_driver(db: AsyncSession, ride: Ride) -> RideOffer | None
             async with db.begin_nested():
                 return await offers_repo.create(db, ride.id, driver_id, round(distance_m), expires_at)
         except IntegrityError as error:
-            logger.warning("offer skipped for driver %s: %s", driver_id, error.orig)
+            # The constraint name and the SQLSTATE, not the driver's message (it carries values).
+            logger.warning(
+                "offer skipped for driver %s: constraint %s, sqlstate %s",
+                driver_id, getattr(error.orig.__cause__, "constraint_name", None), getattr(error.orig, "sqlstate", None),
+            )
     return None

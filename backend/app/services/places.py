@@ -2,6 +2,7 @@ import httpx
 from fastapi import HTTPException
 
 from app.config import settings
+from app.observability.metrics import timed_external
 from app.repositories import places as places_repo
 from app.schemas import MapConfigResponse, PlaceResponse
 from app.utils.geo import is_inside_bounds
@@ -21,15 +22,16 @@ async def call_nominatim(path: str, params: dict) -> dict | list:
 
     # Network calls fail for legitimate reasons, so this is one of the few places with a try/except.
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(
-                settings.nominatim_url + path,
-                params=params,
-                headers={"User-Agent": settings.nominatim_user_agent},
-            )
+        with timed_external("nominatim"):
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                response = await client.get(
+                    settings.nominatim_url + path,
+                    params=params,
+                    headers={"User-Agent": settings.nominatim_user_agent},
+                )
+            if response.status_code != 200:
+                raise HTTPException(status_code=502, detail="Place search is unavailable")
     except httpx.HTTPError:
-        raise HTTPException(status_code=502, detail="Place search is unavailable")
-    if response.status_code != 200:
         raise HTTPException(status_code=502, detail="Place search is unavailable")
     return response.json()
 

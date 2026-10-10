@@ -286,8 +286,7 @@ async def test_a_failing_summary_update_undoes_the_rating(client, db, rider, dri
 
     with monkeypatch.context() as patch:
         patch.setattr(ratings_repo, "add_to_summary", broken)
-        with pytest.raises(RuntimeError):
-            await rate(client, rider, ride.id, 4)
+        assert (await rate(client, rider, ride.id, 4)).status_code == 500
     assert await rating_rows(db) == []
     assert await summary_of(db, driver["user"].id) is None
 

@@ -1,3 +1,10 @@
+# Docker's own log files: rotated, so a long run cannot fill the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   db:
     image: postgis/postgis:16-3.4
@@ -53,7 +60,56 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --ws-max-size 65536 --reload
+    logging: *logging
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --ws-max-size 65536 --no-access-log --reload
+
+  # Metrics and dashboard (M7.1). Only started with: docker compose --profile observability up -d
+  # Both listen on 127.0.0.1 only. The token is passed through the container environment, written to a file that
+  # prometheus.yml reads, and then prometheus replaces the shell (exec) with the same arguments the image uses.
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    profiles: ["observability"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - printf '%s' "$$METRICS_TOKEN" > /tmp/metrics_token && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=3d
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - backend
+    logging: *logging
+
+  # The datasource and the dashboard come from provisioning files: nothing to click. An empty GRAFANA_ADMIN_PASSWORD would
+  # make Grafana use its default password (admin), so the start command refuses to run without one. (The more usual
+  # ${VAR:?} would stop every docker compose command, also without the profile, because compose reads the whole file.)
+  grafana:
+    image: grafana/grafana:13.2.3
+    profiles: ["observability"]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - '[ -n "$$GF_SECURITY_ADMIN_PASSWORD" ] || { echo "GRAFANA_ADMIN_PASSWORD is not set in .env" >&2; exit 1; }; exec /run.sh'
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    logging: *logging
 
 volumes:
   postgres_data:
+  prometheus_data:
+  grafana_data:

@@ -2,6 +2,7 @@ import httpx
 from fastapi import HTTPException
 
 from app.config import settings
+from app.observability.metrics import timed_external
 
 REQUEST_TIMEOUT_SECONDS = 5
 SNAP_RADIUS_M = 300  # how far OSRM may move a point to reach a road
@@ -21,9 +22,10 @@ async def get_route(pickup_lat: float, pickup_lng: float, dropoff_lat: float, dr
     # Network calls fail for legitimate reasons, so this is one of the few places with a try/except.
     # The body is read whatever the HTTP status is, because OSRM reports some problems with a 400.
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
-            response = await client.get(url, params=params)
-        body = response.json()
+        with timed_external("osrm"):
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                response = await client.get(url, params=params)
+            body = response.json()
     except (httpx.HTTPError, ValueError):
         raise HTTPException(status_code=502, detail="Routing is unavailable")
 

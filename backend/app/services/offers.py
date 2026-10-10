@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import database
 from app.models import OfferStatus, Ride, RideOffer, RideStatus, User, VerificationStatus
+from app.observability import metrics
 from app.repositories import drivers as drivers_repo
 from app.repositories import events
 from app.repositories import offers as offers_repo
@@ -197,21 +199,25 @@ async def expire_due_offers() -> None:
         except Exception as error:
             if offer_id not in failed_offer_ids:
                 failed_offer_ids.add(offer_id)
-                logger.warning("Offer sweeper could not handle offer %s (ride %s): %r", offer_id, ride_id, error)
+                logger.warning("Offer sweeper could not handle offer %s (ride %s): %s", offer_id, ride_id, type(error).__name__)
 
 
 async def sweep_forever() -> None:
     """Runs for the life of the process. State is in Postgres, so a restart loses nothing."""
     failing = False
     while True:
+        started = time.perf_counter()
         try:
             await expire_due_offers()
+            metrics.sweeper_last_success_timestamp_seconds.set(time.time())
             if failing:
                 logger.info("Offer sweeper recovered")
                 failing = False
-        except Exception as error:
-            # One line when a streak of failures starts, not one per second.
+        except Exception:
+            metrics.sweeper_errors_total.inc()
+            # One line when a streak of failures starts, not one per second. Type and stack only, never the message.
             if not failing:
-                logger.warning("Offer sweeper failed, retrying every %s s: %r", OFFER_SWEEP_INTERVAL_SECONDS, error)
+                logger.error("sweeper_error", exc_info=True)
                 failing = True
+        metrics.sweeper_tick_duration_seconds.observe(time.perf_counter() - started)
         await asyncio.sleep(OFFER_SWEEP_INTERVAL_SECONDS)

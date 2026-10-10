@@ -11,9 +11,14 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine, redis_client
-from app.routers import admin, auth, drivers, offers, payments, places, ratings, rides, saved_places, websocket
+from app.observability.hooks import refresh_gauges_forever, start_background_task
+from app.observability.logs import setup_logging
+from app.observability.middleware import observability_middleware
+from app.routers import admin, auth, drivers, metrics, offers, payments, places, ratings, rides, saved_places, websocket
 from app.services import offers as offers_service
 from app.services.payments import TEST_KEY_PREFIXES
+
+setup_logging()
 
 # uvicorn's logger, because it is the one that has a handler and prints INFO.
 logger = logging.getLogger("uvicorn.error")
@@ -31,7 +36,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.info("payments: stripe configured (test key), %s", webhook)
 
     # Starts even when Redis or Postgres is down: both tasks keep retrying in the background.
-    tasks = [asyncio.create_task(websocket.listen_for_events()), asyncio.create_task(offers_service.sweep_forever())]
+    tasks = [
+        start_background_task("ws_listener", websocket.listen_for_events()),
+        start_background_task("sweeper", offers_service.sweep_forever()),
+        start_background_task("gauges", refresh_gauges_forever()),
+    ]
     yield
     for task in tasks:
         task.cancel()
@@ -43,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 app = FastAPI(title="Uber Clone", lifespan=lifespan)
+app.add_middleware(observability_middleware)
 
 
 @app.exception_handler(RedisError)
@@ -81,6 +91,7 @@ app.include_router(places.router)
 app.include_router(ratings.router)
 app.include_router(saved_places.router)
 app.include_router(websocket.router)
+app.include_router(metrics.router)
 
 # Mounted last so it does not shadow the API routes above.
 app.mount("/", StaticFiles(directory="/frontend", html=True), name="frontend")

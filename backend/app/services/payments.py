@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import PaymentMethod, Ride, TopupStatus, User, WalletEntryKind, WalletTopup
+from app.observability.metrics import timed_external
 from app.repositories import earnings as earnings_repo
 from app.repositories import payments as payments_repo
 from app.repositories import pricing as pricing_repo
@@ -63,21 +64,22 @@ async def call_stripe(method: str, path: str, form: dict | None = None, idempote
         raise HTTPException(status_code=503, detail=NOT_CONFIGURED)
     headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
     try:
-        async with httpx.AsyncClient(timeout=STRIPE_TIMEOUT_S) as client:
-            response = await client.request(
-                method, settings.stripe_api_url.rstrip("/") + path, data=form, auth=(settings.stripe_secret_key, ""), headers=headers
-            )
-        body = response.json() if response.content else None
+        with timed_external("stripe"):
+            async with httpx.AsyncClient(timeout=STRIPE_TIMEOUT_S) as client:
+                response = await client.request(
+                    method, settings.stripe_api_url.rstrip("/") + path, data=form, auth=(settings.stripe_secret_key, ""), headers=headers
+                )
+            body = response.json() if response.content else None
+
+            error_code = body["error"].get("code") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
+            if response.status_code == 409:
+                logger.warning("Stripe %s %s answered 409 (%s)", method, path, error_code)
+                raise HTTPException(status_code=409, detail="Another request with this idempotency key is in progress. Retry in a moment.")
+            if not response.is_success or not isinstance(body, dict):
+                logger.warning("Stripe %s %s answered %s (%s)", method, path, response.status_code, error_code)
+                raise HTTPException(status_code=502, detail="Card payments are unavailable")
     except (httpx.HTTPError, ValueError) as error:
         logger.warning("Stripe %s %s failed: %s", method, path, type(error).__name__)
-        raise HTTPException(status_code=502, detail="Card payments are unavailable")
-
-    error_code = body["error"].get("code") if isinstance(body, dict) and isinstance(body.get("error"), dict) else None
-    if response.status_code == 409:
-        logger.warning("Stripe %s %s answered 409 (%s)", method, path, error_code)
-        raise HTTPException(status_code=409, detail="Another request with this idempotency key is in progress. Retry in a moment.")
-    if not response.is_success or not isinstance(body, dict):
-        logger.warning("Stripe %s %s answered %s (%s)", method, path, response.status_code, error_code)
         raise HTTPException(status_code=502, detail="Card payments are unavailable")
     return body
 

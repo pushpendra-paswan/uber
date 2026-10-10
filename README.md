@@ -593,7 +593,7 @@ export SIM_ADMIN_EMAIL=... SIM_ADMIN_PASSWORD=...        # or --admin-email / --
 
 Each round, for all riders at once: (1) the same top-up request five times at once (one top-up row per rider and key, the same id in every answer; a `409` "in progress" is retried once after a second); (2) the signed `checkout.session.completed` event delivered ten times at once with one event id, plus three times with another event id for the same session (every answer 200, exactly one `processed` per top-up and one `ignored` for the first delivery of the other event id, the rest `duplicate`; every top-up SUCCEEDED with exactly one `TOPUP` entry, each balance up by exactly the top-up); (3) three badly signed events (wrong secret, tampered body, a timestamp 10 minutes old): all `400`, and the database does not change; (4) I1 to I24. The summary counts top-ups, webhook answers (`processed`, `duplicate`, `ignored`), and ends with `PAYMENTS CLEAN` or `PAYMENTS FOUND PROBLEMS: ...`. Exit code 2 with `INVARIANTS NOT CHECKED: Stripe is not configured on the backend ...` when the backend has no test key.
 
-Other flags: `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url` (one URL or several separated by commas, see below), `--webhook-secret` (payments scenario), `--label` (free text printed in the summary header, so saved outputs identify themselves), `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
+Other flags: `--metrics-token` (chaos scenario, see "Observability"), `--riders` (2 to 100), `--drivers` (1 to 100), `--rounds` (1 to 50), `--repeat` (riders scenario), `--spread-m`, `--watch-seconds`, `--seed` (repeatable random points, not repeatable timing), `--api-url` (one URL or several separated by commas, see below), `--webhook-secret` (payments scenario), `--label` (free text printed in the summary header, so saved outputs identify themselves), `--osrm-url`, `--center-lat/--center-lng`, `--psql-user/--psql-db` (default from `.env`). Ctrl+C runs the cleanup, prints the summary, and exits with the usual code.
 
 **Against two backend processes.** The locks live in Postgres, so they must also hold across processes. `docker-compose.yml` publishes a second port (`127.0.0.1:8001`). Start a second uvicorn inside the same container (it does not auto-reload, so stop it and start it again after every code change, and it inherits the container's environment), then give the stress tool both URLs. Requests of a burst are spread over the URLs one after the other, and in the riders scenario the repeats of one rider alternate between the processes:
 
@@ -645,6 +645,78 @@ docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants
 **Exit codes:** 0 no violation observed, 1 at least one invariant broke (`RACE REPRODUCED: I1 in 4 of 5 rounds, ...`; in the chaos scenario also a stuck ride, or without `--tolerate-5xx` any 5xx or connection error), 2 the tool could not do its job (setup or login failed, an API URL is unreachable or unhealthy, `INVARIANTS NOT CHECKED: ...` when psql cannot run, the fleet scenario found no fleet or every ride ended NO_DRIVER_FOUND). A clean result is never printed when the check did not run. The snapshots are samples (after the burst, after the accepts, about every second in the fleet scenario), so a violation that disappears before the next snapshot would be missed.
 
 Before the fix (M4.1) the default run (20 riders, 3 drivers) broke I1 and I2 in every round (up to 10 offers and 9 active rides on one driver). After it, every scenario above, including two processes and the chaos scenario, gives exit code 0; the numbers are in `PROJECT_CONTEXT.md` under "Baseline for M4.2" and "Fix and compare results".
+
+## Observability (M7.1)
+
+The backend writes **JSON logs** (one object per line, on stdout), counts what happens in **metrics** (`GET /metrics`), and an optional **Prometheus + Grafana** stack draws them. None of it contains personal data.
+
+### Logs
+
+```bash
+docker compose logs backend --no-log-prefix -f | jq -c .                                   # follow everything
+docker compose logs backend --no-log-prefix | jq -c 'select(.ride_id == 42)'               # one ride: its requests and its status changes, in order
+docker compose logs backend --no-log-prefix | jq -c 'select(.request_id == "<id>")'        # one request: every line it wrote (the id is also the X-Request-ID response header)
+docker compose logs backend --no-log-prefix | jq -c 'select(.level == "ERROR")'            # errors only
+docker compose logs backend --no-log-prefix | jq -c 'select(.msg == "http_request" and .duration_ms > 500)'   # slow requests
+docker compose logs backend --no-log-prefix | jq -c 'select(.msg == "http_request" and .db_queries > 20)'     # a request with many SQL statements: suspect an N+1
+```
+
+(A few lines at the very start, from uvicorn's reloader process, are plain text: `INFO:     Will watch for changes ...`. Use `grep '^{'` before `jq` if you want to skip them.)
+
+A ride's story is its `ride_transition` lines (they equal the rows of `ride_events`, in order: a line is written only after the transaction that wrote the row has committed) plus the access lines of the requests that moved it. Only routes with a `ride_id` in the path put the id on the access line, so the request that CREATED the ride and the driver's accept (`/offers/{offer_id}/accept`) are found through the `request_id` of the transition lines:
+
+```bash
+docker compose logs backend --no-log-prefix | grep '^{' > /tmp/backend.jsonl
+jq -c --argjson ids "$(jq -s '[.[] | select(.ride_id == 42 and .msg == "ride_transition") | .request_id]' /tmp/backend.jsonl)" \
+  'select(.ride_id == 42 or (.request_id as $r | $ids | index($r)))' /tmp/backend.jsonl     # the whole life of ride 42, in order
+```
+
+| Field | Meaning |
+|---|---|
+| `ts`, `level`, `logger`, `msg` | UTC time with milliseconds, level, logger name, and the event name (`http_request`, `ride_transition`, `ws_connected`, `ws_closed`, `sweeper_error`, ...) or an older free-text sentence |
+| `request_id` | one per request (and per WebSocket); taken from an inbound `X-Request-ID` only if it matches `^[A-Za-z0-9._-]{8,64}$`, otherwise generated; background tasks have none |
+| `user_id`, `role` | the authenticated user, when there is one |
+| `component` | `sweeper`, `ws_listener` or `gauges` for lines written by a background task |
+| `ride_id`, `driver_id`, `offer_id` | ids only |
+| `method`, `route`, `status`, `duration_ms`, `db_queries`, `db_ms` | the access line: the route TEMPLATE (`/rides/{ride_id}`, `unmatched`, `static`), never the path or the query string |
+| `from_status`, `to_status` | a ride transition (`none` for the creation) |
+| `ws_close_code` | how a WebSocket ended |
+| `exc_type`, `stack`, `sqlstate`, `constraint` | an exception: its class, its frames, and for a database error the SQLSTATE and the constraint name. **Never the exception's message** (SQLAlchemy messages carry SQL parameters, httpx messages carry URLs) |
+| `service`, `outcome`, `count` | small extras of a few lines |
+
+Only these fields can appear in a line: the formatter drops every other key. **Never logged, under any name:** passwords, tokens, the Authorization header, the trip code, emails, phone numbers, license numbers, names, addresses, coordinates, rating comments, request or response bodies, query strings, WebSocket message contents, exception messages. `user_id` is pseudonymous personal data and stays in the container logs. `LOG_LEVEL` (default `INFO`) sets the level; `/health` and `/metrics` access lines are `DEBUG`. uvicorn's own access log is off (`--no-access-log`) because it prints full paths with query strings. Docker keeps three files of 10 MB per service.
+
+### Metrics
+
+`GET /metrics` needs `METRICS_TOKEN` from `.env`: empty means the endpoint does not exist (404); otherwise send `Authorization: Bearer <token>` (a user JWT never works). It lists HTTP requests and latency by route template, SQL statement latency, the database pool, calls to OSRM/Nominatim/Stripe by outcome, WebSocket connections and close codes, ride transitions, active rides by status, pending offers, online drivers, the offer sweeper's last success, and the errors of the observability code itself (`observability_errors_total`, which should stay 0), next to the standard Python process metrics.
+
+```bash
+curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8000/metrics | grep -E '^(ride_transitions_total|rides_active|drivers_online)'
+```
+
+Transitions are counted after the commit and are best effort across a crash (a crash between the commit and the count loses the count). Counters restart at 0 when the backend restarts. Database state (`rides_active`, `offers_pending`, the pool) is read by a background task every 5 seconds, not at scrape time.
+
+### Prometheus and Grafana (optional)
+
+```bash
+# in .env (see .env.example): METRICS_TOKEN=<a long random value> and GRAFANA_ADMIN_PASSWORD=<a password>
+docker compose --profile observability up -d      # starts prometheus and grafana next to the stack
+# Grafana:    http://127.0.0.1:3000   user admin, the password from .env; the "Ridehail" dashboard is already there
+# Prometheus: http://127.0.0.1:9090   (both listen on 127.0.0.1 only)
+docker compose --profile observability rm -sf prometheus grafana   # stops and removes only these two; the data stays in the named volumes
+docker volume rm uber_prometheus_data uber_grafana_data   # deletes the data (the volume prefix is the folder name)
+# Careful: "docker compose --profile observability down" removes the WHOLE project (db, redis, backend, osrm too); only the named volumes survive.
+```
+
+A plain `docker compose up` starts exactly the services it started before. Prometheus scrapes every 5 seconds and keeps 3 days; the token reaches it through the container environment (visible to anyone who can run `docker inspect`). The grafana container refuses to start with an empty `GRAFANA_ADMIN_PASSWORD`.
+
+The dashboard panels: request rate by route; latency p50/p95/p99 by route; 5xx and 4xx rate; requests in flight; ride transitions per minute by new status (CANCELLED and NO_DRIVER_FOUND show up there); active rides by status; pending offers; drivers online; WebSocket connections and closes by code; database pool in use against its size; database query p95; external call p95 by service and outcome; sweeper tick p95; seconds since the sweeper last succeeded (should stay below about 5); observability errors; process CPU and memory. An empty 5xx, external call or observability errors panel is the good case.
+
+**More than one backend process.** The registry lives in each process. Counters and rates add up across processes (`sum`), but the gauges that read the database (`rides_active`, `offers_pending`, the pool) are the same in every process, so they must be read with `max`, never `sum` (the dashboard does). Each process needs its own scrape target (the compose file scrapes `backend:8000` only).
+
+### Metrics against the database in the chaos run
+
+`stress.py --scenario chaos --metrics-token <METRICS_TOKEN>` reads `/metrics` of every `--api-url` process before the run and, after the settle period and a 6 second wait for the gauges, again before the cleanup, and counts `metrics_mismatch` (any non-zero value is a violation, exit 1, and the first five are printed with the numbers compared): (a) the summed increase of `ride_transitions_total` per `(from, to)` must equal the SQL count of `ride_events` created since the run began (skipped, with the reason printed, when a backend process restarted during the run, because its counters began again); (b) the summed increase of `http_requests_total` for `POST /rides` 201 must be at least the number of 201 answers the tool saw (a lower bound: other clients may add more); (c) no route label has a numeric path segment and `http_requests_total` has at most 500 series; (d) `observability_errors_total` did not rise in any process during the run; (e) `rides_active` of the first process equals SQL. A difference is asked again once after 2 seconds. **Without `--metrics-token` these checks are SKIPPED:** the summary says so in a warning, and a skipped check is not a pass.
 
 ## Run the tests
 
