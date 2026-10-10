@@ -414,7 +414,7 @@ Done when: an admin can run the platform without touching the database.
 ### Phase 7: Observability, Load Testing, Polish
 - **M7.1 Logging and metrics:** JSON logs on stdout with a request id and ride ids and no personal data (a field whitelist, no exception messages), a token-protected `/metrics` (HTTP, database, WebSocket, external call, sweeper and ride flow metrics; ride transitions counted after the commit by a session hook), a gauge task for database state, an optional Prometheus and Grafana stack under the `observability` compose profile with a provisioned dashboard, and `--metrics-token` checks of the metrics against the database in the chaos scenario
 - **M7.2 Load test:** an isolated load stack (own Postgres, Redis and backend, reset from a template database), Locust users that send the request mix of the real pages (riders, trip browsers, admins) plus the simulator fleet, a step load with warm-up and hold, SLOs per request group on the hold period (client and server latency), capacity and knee, single endpoint probes, correctness checks after every run, a 3-run baseline, and (planned, not yet done) one bottleneck confirmed by a one-variable experiment, one fix with a written prediction, and a revert run
-- **M7.3 Documentation:** README, architecture diagram, and a short demo recording
+- **M7.3 Documentation:** README (what it is, quick start, tour of the apps, "How it works", two Mermaid diagrams, the load test numbers, a demo script) with the older sections kept as a reference; the demo recording itself is a manual step
 
 Done when: you can state how many concurrent rides it handles and what broke first.
 

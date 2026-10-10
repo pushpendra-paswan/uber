@@ -1,24 +1,321 @@
 # Uber Clone
 
-A ride-hailing web app built for learning: riders request trips, nearby drivers accept them, and both sides see live location, fare, and trip status. Three apps (rider, driver, admin) share one FastAPI backend with PostgreSQL/PostGIS and Redis. Frontend is plain HTML, CSS, and JavaScript.
+A ride-hailing web app built for learning. Riders request trips, nearby drivers accept them, and both sides see live location, fare, and trip status. Three apps (rider, driver, admin) share one FastAPI backend with PostgreSQL/PostGIS and Redis. The frontend is plain HTML, CSS, and JavaScript.
 
-See `CLAUDE.md` for the architecture and milestones, and `PROJECT_CONTEXT.md` for current status.
+- One city, one ride type. Drivers are simulated by a script.
+- Payments are a wallet ledger plus Stripe **test mode** (or a local fake). No real money.
+- No ML. Surge pricing is rule-based (counts of waiting riders and free drivers).
+- What it teaches: a ride state machine, real time with WebSockets, Redis geo search, concurrency control, idempotent payments, metrics, and load testing.
 
-## Start
+`CLAUDE.md` holds the architecture rules and the milestone list. `PROJECT_CONTEXT.md` holds the current status, decisions, and bugs.
 
-```bash
-cp .env.example .env        # first time only; then set the city and OSM_EXTRACT_URL (see below)
-osrm/prepare.sh             # first time only: builds the routing data (large download, see below)
-docker compose up --build
-docker compose exec backend alembic upgrade head    # create the tables and the pricing rule (first time, and after a reset)
+**Contents:** [Architecture](#architecture) · [Quick start](#quick-start) · [Tour of the three apps](#tour-of-the-three-apps) · [How it works](#how-it-works) · [Demo script](#demo-script-two-windows-one-trip) · [Reference](#reference)
+
+## Architecture
+
+The code has three layers, and calls only go downward: **router → service → repository**. Routers handle HTTP and WebSocket. Services hold the business rules. Repositories hold every SQL statement and every Redis command.
+
+```mermaid
+flowchart TB
+  subgraph browsers["Browsers: plain HTML, CSS, JS, Leaflet"]
+    rider["Rider app<br/>/rider/"]
+    driver["Driver app<br/>/driver/"]
+    admin["Admin app<br/>/admin/"]
+  end
+
+  sim["Simulator on the host<br/>fake drivers, stress.py"]
+
+  subgraph backend["FastAPI backend: one process, also serves the static files"]
+    router["Routers<br/>HTTP and WebSocket /ws"]
+    service["Services<br/>state machine, matching, fares, wallet, ratings"]
+    repo["Repositories<br/>all SQL and all Redis commands"]
+    tasks["Background tasks<br/>offers sweeper, WebSocket listener, gauges"]
+    router --> service --> repo
+    tasks -.-> repo
+  end
+
+  pg[("PostgreSQL + PostGIS<br/>durable data, row locks")]
+  redis[("Redis<br/>GEO positions, presence keys,<br/>pub/sub, caches")]
+  osrm["OSRM<br/>routes, distance, duration"]
+  nominatim["Nominatim<br/>place search, cached in Redis"]
+  stripe["Stripe test mode<br/>or the local fake"]
+
+  rider -->|"REST and WebSocket"| router
+  driver -->|"REST and WebSocket"| router
+  admin -->|REST| router
+  sim -->|"REST: the public API only"| router
+  sim -->|routes| osrm
+
+  repo --> pg
+  repo --> redis
+  service --> osrm
+  service --> nominatim
+  service -->|"Checkout Session, httpx"| stripe
+  stripe -->|"signed webhook"| router
+
+  subgraph obs["Observability: optional compose profile"]
+    prom["Prometheus"]
+    graf["Grafana dashboard"]
+    prom --> graf
+  end
+  prom -->|"scrapes /metrics with a token"| router
+  backend -.->|"JSON logs on stdout"| logs["docker compose logs"]
+
+  subgraph load["Load test stack: docker-compose.loadtest.yml"]
+    locust["Locust harness on the host<br/>loadtest/run.py"]
+    bload["backend-load<br/>same image, port 8100"]
+    pgload[("postgres-load")]
+    redisload[("redis-load")]
+    locust -->|"page-like requests"| bload
+    bload --> pgload
+    bload --> redisload
+  end
+  bload -->|"routes: shared"| osrm
+  sim -.->|"the 80-driver fleet"| bload
 ```
 
-- Rider app: http://localhost:8000/rider/
-- Driver app: http://localhost:8000/driver/
-- Admin app: http://localhost:8000/admin/ (log in with an admin created below)
-- API: http://localhost:8000 (Swagger UI at `/docs`)
-- Health check: http://localhost:8000/health
-- Postgres: `localhost:5432`, Redis: `localhost:6379`, OSRM (debugging only): `127.0.0.1:5000`
+Locks that keep rides safe are **Postgres row locks** (`SELECT ... FOR UPDATE`), not Redis locks. M4.2 built both and compared them; Postgres won (see "Concurrency control" below). Redis holds driver positions, the "driver is online" keys, WebSocket fan-out (pub/sub), and caches.
+
+The ride and its offers, in one picture:
+
+```mermaid
+stateDiagram-v2
+  [*] --> REQUESTED: rider requests, offers start
+  REQUESTED --> DRIVER_ASSIGNED: a driver accepts an offer
+  REQUESTED --> NO_DRIVER_FOUND: nobody in range, or 5 offers used
+  REQUESTED --> CANCELLED: rider cancels
+  DRIVER_ASSIGNED --> DRIVER_ARRIVED: driver arrives
+  DRIVER_ASSIGNED --> CANCELLED: rider or driver cancels
+  DRIVER_ARRIVED --> IN_PROGRESS: driver sends the trip code
+  DRIVER_ARRIVED --> CANCELLED: rider or driver cancels
+  IN_PROGRESS --> COMPLETED: driver completes
+  COMPLETED --> [*]
+  CANCELLED --> [*]
+  NO_DRIVER_FOUND --> [*]
+```
+
+```mermaid
+sequenceDiagram
+  participant R as Rider
+  participant API as Backend
+  participant D1 as Nearest driver
+  participant D2 as Next driver
+  R->>API: POST /rides
+  API->>D1: WebSocket offer_created (15 s to answer)
+  alt D1 accepts in time
+    D1->>API: POST /offers/id/accept
+    API->>R: ride_updated DRIVER_ASSIGNED
+  else D1 rejects, or 15 s pass
+    API->>D2: WebSocket offer_created
+    Note over API,D2: up to 5 offers per ride
+  else nobody left
+    API->>R: ride_updated NO_DRIVER_FOUND
+  end
+```
+
+## Quick start
+
+**You need:**
+
+- Docker with Docker Compose v2 (`docker compose`, not `docker-compose`).
+- `curl` and `awk` (used by `osrm/prepare.sh`).
+- Python 3 on the host, only for the driver simulator and the stress and load tools (the backend runs in Docker; it uses Python 3.12).
+- A browser, and about 600 MB of disk for the map download (the default extract is about 560 MB).
+
+**Steps**, from the repository root:
+
+```bash
+# 1. Settings. Put your contact email in NOMINATIM_USER_AGENT. The city defaults to Bengaluru; to change it see "Set your contact email and city" below.
+cp .env.example .env
+
+# 2. Routing data, once. Downloads a regional map, clips it to the city, builds the OSRM data. Takes a while.
+osrm/prepare.sh
+
+# 3. Start everything: backend, Postgres+PostGIS, Redis, OSRM.
+docker compose up --build -d
+
+# 4. Create the tables and the pricing rule (first time, and after a reset).
+docker compose exec backend alembic upgrade head
+
+# 5. Create an admin. Admins cannot register through the API.
+docker compose exec backend python create_admin.py --email admin@example.com --name "Admin" --password 'at-least-8-chars'
+
+# 6. Check it is up.
+curl -s localhost:8000/health
+```
+
+**Add simulated drivers** (optional, on the host; it needs only `httpx`):
+
+```bash
+python3 -m venv .venv-sim
+.venv-sim/bin/pip install -r simulator/requirements.txt
+.venv-sim/bin/python simulator/simulator.py --drivers 30 --speed-kmh 30 --admin-email admin@example.com --admin-password 'at-least-8-chars'
+```
+
+Press Ctrl+C to stop it. The flags are in "Run the driver simulator" below.
+
+**Run the tests, stop, reset:**
+
+```bash
+docker compose exec backend pytest        # uses its own database and Redis database 1
+docker compose down                       # stop, keep the data
+docker compose down -v                    # stop and DELETE the database; then repeat steps 3 and 4
+```
+
+| Where | Address |
+|---|---|
+| Rider app | http://localhost:8000/rider/ |
+| Driver app | http://localhost:8000/driver/ |
+| Admin app | http://localhost:8000/admin/ (log in with the admin from step 5) |
+| API docs (Swagger) | http://localhost:8000/docs |
+| Health check | http://localhost:8000/health |
+| Postgres, Redis | `localhost:5432`, `localhost:6379` |
+| OSRM (debugging only) | `127.0.0.1:5000` |
+
+Until `osrm/prepare.sh` has run, the `osrm` container exits and fare estimates answer 502 "Routing is unavailable". The API itself still starts.
+
+## Tour of the three apps
+
+Each app is one page. Open them in separate tabs or windows: every tab keeps its own login.
+
+| App | Who uses it | What you do there |
+|---|---|---|
+| **Rider** `/rider/` | A person who wants a trip | Register, pick pickup and drop-off by searching or clicking the map, see the route and fare (with surge if there is any), choose cash or wallet, press **Request ride**. Then watch the status, the trip code, and the driver's marker move. After the trip: the receipt, the rating form, **My trips** (history), **Saved places**, and the wallet (Stripe top-up). |
+| **Driver** `/driver/` | A person who drives | Register, add a license number and a vehicle, wait for approval. Then click the map to set your position, press **Go online**, and answer offers with **Accept** or **Reject** (15 seconds). During a trip: **I have arrived**, the trip code, **Start trip**, **Complete trip**. Also **Earnings** and **My trips**. |
+| **Admin** `/admin/` | The platform | Five tabs: **Overview** (rides, rates, money, charts), **Live map** (online drivers and active rides, surge zones), **Drivers** (search, **Approve** and reject), **Rides** (filters and the full detail of one ride), **Pricing** (edit the fare rules with a version check and an audit history). |
+
+The **simulator** (`simulator/simulator.py`) is not a page. It plays many drivers through the public API. Do not log in to a simulated driver on the driver page while it runs.
+
+## How it works
+
+The short version of each idea. The detailed sections below the "Reference" heading have the exact rules, endpoints, and commands.
+
+### The ride state machine
+
+A ride is always in one of seven states: `REQUESTED`, `DRIVER_ASSIGNED`, `DRIVER_ARRIVED`, `IN_PROGRESS`, `COMPLETED`, `CANCELLED`, and `NO_DRIVER_FOUND`. The last three are end states. The diagram above shows the allowed moves. Every move goes through one function, `change_ride_status()`, which checks the move against a table and writes a row to `ride_events`. Nothing else may set a ride's status. An illegal move is a `409`.
+
+When a driver is assigned, the ride gets a trip code (always `1234` in this project, on purpose). Only the rider can read it. The driver must type it to start the trip.
+
+When a trip ends, the server works out the fare in the same transaction as the status change (see "Money" below). That way a finished ride always has its fare.
+
+### Matching and offers
+
+When a rider requests a ride, the server asks Redis for online drivers within 3 km of the pickup (`GEOSEARCH`) and sorts them by distance. It offers the ride to the nearest free one. "Free" means online, approved, with no active ride and no pending offer.
+
+An offer is a row in `ride_offers`. The driver has 15 seconds. If the driver accepts, the ride becomes `DRIVER_ASSIGNED`. If the driver rejects, or the time runs out, the server offers the ride to the next nearest driver. After 5 offers, or when nobody is left, the ride becomes `NO_DRIVER_FOUND`.
+
+A background task, the **offers sweeper**, runs once per backend process. It closes offers whose time has passed, and offers whose driver has vanished (went offline or stopped pinging). Because offers are rows, they survive a restart.
+
+### Real time with WebSockets
+
+Each page opens one WebSocket (`/ws`) after login. The first message carries the token, never the URL. The server pushes small "something changed" events: `offer_created`, `offer_closed`, `ride_updated`, and `driver_location` (the driver's position every 3 seconds, which the rider's page glides the marker toward).
+
+Events go through Redis pub/sub, so any backend process can reach any user's socket. Events carry no personal data and are published only **after** the database commit. REST is the source of truth: a page that gets an event calls REST to refresh, and it also polls every 3 seconds as a safety net. So a lost event costs a few seconds, nothing more. `frontend/shared/ws.js` reconnects with backoff, pings to find dead connections, and makes the page re-fetch after every reconnect.
+
+### Concurrency control
+
+The classic bug: two riders ask for the same free driver at the same instant. Both checks say "free", both offers are written. The stress tool (`simulator/stress.py`) reproduced this in M4.1 (up to 10 offers on one driver).
+
+The fix has two layers.
+
+1. **Locks.** Three places read "is this free?" and then write: creating a ride, offering to a driver, and accepting an offer. Each takes a Postgres row lock (`FOR UPDATE`) first, then checks in a separate statement, writes, and commits. Matching skips a driver whose row is locked (`SKIP LOCKED`) instead of waiting. Rows are always locked in the same order (ride, then offer, then driver), so locks cannot deadlock.
+2. **Safety net.** Three partial unique indexes make the bad states impossible even if a lock is ever missed: one pending offer per driver, one active ride per driver, one active ride per rider.
+
+M4.2 also built the same protection with Redis `SET NX PX` locks and ran the same tests. Both were correct. Postgres won because there is nothing to release by hand, no timer to tune, and a lock that expires inside a slow request cannot break correctness.
+
+Twenty-four invariants (`simulator/invariants.sql`, I1 to I24) describe states that must never exist, from a double-booked driver to a wallet that does not add up. Every stress scenario checks them. The `chaos` scenario (random riders and drivers acting for 60 seconds) must end `CHAOS CLEAN`.
+
+### Money: the ledger and idempotent payments
+
+Amounts are integer paise, never floats.
+
+- **Fare.** `base + per_km × distance + per_min × time`, at least the minimum fare. Distance comes from the driver's location pings during the trip (if tracking is missing or unreliable, the estimated distance is billed). The fare can never exceed 150 percent of the estimate. Surge multiplies the fare, is locked on the ride when it is requested, and a rider is never charged more than the multiplier they saw. Cancellation fees apply to riders only, and are never surged.
+- **Wallet.** `wallet_entries` is an append-only ledger; `wallets.balance` always equals the sum of a user's entries. One function, `post_entry`, is the only writer, and it commits with whatever caused the entry. A wallet ride needs a balance of at least the fare cap, so the final charge can always be paid.
+- **Idempotency.** Completing or cancelling twice is refused by the state machine. Top-ups and admin credits need an `Idempotency-Key` header: the same key gives the same row, and the same key with another body is a `409`. The Stripe call carries its own key, derived from our top-up row, and the row is saved before the call. Stripe webhooks are checked by hand (HMAC over the raw body, 5 minute tolerance), and the event id is saved in the **same transaction** as the credit, so a replayed event does nothing.
+- **Commission.** Each payment is split once into a platform fee and a driver earning (half-up rounding, the two always add up), stored in the payment's own transaction. Drivers see their earnings, admins see revenue, and riders get a receipt built from stored values.
+
+### Ratings
+
+After a completed trip, the rider and the driver can rate each other once, from 1 to 5, within 7 days. A rating is final. Each user's count and total are kept in `rating_summaries` and changed by one atomic upsert in the same transaction as the rating, so ratings of one popular driver cannot lose an update. Averages use integer arithmetic, rounded half up. Other people see an average only from 3 ratings. A person never sees the individual ratings or comments written about them.
+
+### Observability
+
+The backend writes **JSON logs** on stdout: one object per line, with a request id and ride ids, and no personal data (a field whitelist drops everything else, and exception messages are never logged). `GET /metrics` (protected by `METRICS_TOKEN`) exposes HTTP, database, WebSocket, external-call, sweeper, and ride metrics. Ride transitions are counted after the commit by a database session hook. An optional Prometheus and Grafana stack (`docker compose --profile observability up -d`) draws a ready-made dashboard. The chaos stress run can compare the metrics with the database (`--metrics-token`).
+
+```bash
+docker compose logs backend --no-log-prefix | jq -c 'select(.ride_id == 42)'     # the story of ride 42
+curl -s -H "Authorization: Bearer $(grep '^METRICS_TOKEN=' .env | cut -d= -f2-)" localhost:8000/metrics | grep -E '^(ride_transitions_total|rides_active|drivers_online)'
+```
+
+### Load testing (M7.2, partly done)
+
+A load test uses its own copy of the stack (`docker-compose.loadtest.yml`: its own Postgres, Redis, and backend on port 8100), so it never touches your data. Locust users send the requests the real pages send (riders polling every 3 seconds, 30 percent of them requesting rides, trip browsers, two admin viewers) while the simulator runs 80 drivers. Load goes up in steps (10, 25, 50, 100, 150, 200, 300, 400 users). Each step has a 30 second warm-up and a 90 second hold, and the numbers come from the hold. After every run, correctness checks run (invariants I1 to I24, metrics against the database, and no stuck ride).
+
+**Baseline, three runs on one machine, one backend process:**
+
+| Users | Requests per second (users only) | Core GET p95 | Core GET p99 |
+|---|---|---|---|
+| 50 | 70 | 49-83 ms | 76-125 ms |
+| **100** | 143 | 112-130 ms | 169-203 ms |
+| **150** | 202-207 | 1847-2156 ms | 3029-3483 ms |
+| 400 | 221-228 | 8318-8634 ms | 14078-14376 ms |
+
+- **Capacity: 100 users. Knee: 150 users**, the same in all three runs. The steps are coarse, so the true limit is somewhere between 100 and 150. (Capacity is the highest step where every SLO holds. The SLOs: core `GET` p95 under 300 ms and p99 under 1 s, `POST /rides` and the estimate p95 under 800 ms, errors under 0.5 percent.)
+- Past the knee, throughput stops growing (about 225 requests per second from the users, about 268 with the fleet) and latency grows with the number of users. There are almost no errors. Requests just wait.
+- All correctness checks passed in all three runs.
+- Single-endpoint probes (20 users): `GET /health` 449 req/s, `GET /rides/active` 236, `GET /wallet` 197, `GET /rides/history` 150, `POST /rides/estimate` 41, `GET /admin/stats` 45, and `POST /auth/login` 6 (password hashing costs about 110 ms of event loop per login).
+
+**What probably broke first: the single Python event loop.** Four signals point at it. The backend container sits at 102 percent of one core from 150 users, at a constant 3.8 ms of CPU per request. Postgres is idle (about 1 ms per request, mean statement time 0.02 ms). The slow time is outside the database (`GET /wallet` goes from 57 ms to 775 ms on the server while its database time stays near 30 ms). And the event loop wakes up late more and more often (over 10 ms late in 0.6 percent of wake-ups at 10 users, 20 percent at 100, 58 to 65 percent from 150).
+
+**The open question.** This is a hypothesis, not a confirmed cause. The database connection pool (15 connections) is full from 100 users, with 236 to 576 requests in flight above the knee, so a request may be waiting for a pool connection instead of for the CPU. Three one-variable experiments would settle it: a larger pool, `LOG_LEVEL=WARNING` to price the access log, and a throwaway cProfile run to see where the 3.8 ms go. **They were not run.** There was no fix, no after-fix run, and no revert run. The numbers also come from one machine where the load generator, the fleet, Postgres, Redis, OSRM and the backend share the CPU, with `--reload` on and an empty database at the start. They say where one backend process gives out here, not how a deployment would behave. The method and tables are in `loadtest/RESULTS.md`; the commands are in "Load testing (M7.2)" below.
+
+## Demo script: two windows, one trip
+
+A script for recording a trip by hand. Nothing here records anything for you. Total time: about 5 minutes after the setup.
+
+### Before recording (setup)
+
+1. The stack is up and migrated, and an admin exists (Quick start, steps 1 to 5).
+2. **Stop the simulator** if it is running (Ctrl+C in its terminal) and wait 30 seconds. Its drivers would otherwise be offered your demo ride, and a stale driver would sit near your pickup.
+3. Open `http://localhost:8000/admin/` in a browser tab and log in as the admin.
+4. Open `http://localhost:8000/driver/` in a **second tab**. Register a driver (name, email, password), save a license number (5 to 30 characters) and a vehicle (plate, model, color).
+5. In the admin tab, open **Drivers** and press **Approve** on that driver.
+6. Open `http://localhost:8000/rider/` in a **third tab** and register a rider.
+7. Arrange the recording: drag the driver tab into its own window and put it next to the rider window (rider on the left, driver on the right). Each tab keeps its own login, so one browser is enough. Keep the admin tab for the end.
+8. Optional, for a log view: `docker compose logs backend --no-log-prefix -f | jq -c 'select(.msg == "ride_transition")'` in a terminal (needs `jq`).
+
+### The recording
+
+1. **Driver window.** The page shows the map once the driver is approved (reload if it still says it is waiting). Click the map near the city center, then press **Go online**. Say: "The driver is online; the position lives in Redis."
+2. **Rider window.** Click the map for the **pickup** about 1 km from the driver. Select **Drop-off** and click about 2 to 3 km away. The route and the estimated fare appear. Leave **Pay with cash** selected. Press **Request ride**. The page says "Looking for a driver".
+3. **Driver window.** Within a second, **New ride request** appears with a countdown. Press **Accept**.
+4. **Rider window.** It shows "Your driver is on the way", the driver and vehicle, the big trip code `1234`, and a blue driver marker. Say: "Nobody refreshed anything; that came over the WebSocket."
+5. **Make the marker move.** In the driver window, click the map a little closer to the pickup, a few times, a few seconds apart (clicks under 500 m glide; bigger jumps teleport). The rider's marker follows.
+6. **Driver window.** Click the map on the pickup, then press **I have arrived**. The rider's page changes within a second.
+7. **Wrong code.** In the driver window type `0000` as the trip code and press Enter (**Start trip**). It shows "Incorrect trip code" and nothing changes. Then type `1234` and press **Start trip**. Both windows show "Trip in progress", and the code disappears from the rider's page.
+8. **The trip.** Click the driver map a few times along the way toward the drop-off, 3 or more seconds apart.
+9. **Driver window.** Press **Complete trip**. The driver sees "Collect Rs X in cash from the rider". The rider sees the final fare and the receipt (**Print receipt**).
+10. **Ratings.** In both windows pick 5 stars and press **Submit rating**.
+11. **History.** In the rider window press **My trips** and show the finished ride. In the driver window show **Earnings** (Today) and **My trips**.
+12. **Admin tab.** Open **Rides**, press **Search**, open the ride: timeline, offers, payment, earning, ratings, fare breakdown. Then **Overview** and **Live map**.
+
+### Extras (pick one or two)
+
+- **Live movement without clicking.** Run the simulator and request a ride as a rider with no driver window: `.venv-sim/bin/python simulator/simulator.py --drivers 20 --speed-kmh 90 --admin-email admin@example.com --admin-password 'at-least-8-chars'`. A simulated driver accepts (about 70 percent of offers), drives to you, and completes the trip by itself; with `--speed-kmh 90` a trip takes a few minutes. Do not do this in the same take as the two-window trip.
+- **Pay from the wallet.** Find the rider's id with `docker compose exec -T db psql -U uber -d uber -c "SELECT id, email FROM users WHERE role = 'rider'"`, credit the wallet as the admin, then choose **Pay from wallet** on the rider page:
+  ```bash
+  ADMIN_TOKEN=$(curl -s -X POST localhost:8000/auth/login -H 'Content-Type: application/json' -d '{"email":"admin@example.com","password":"at-least-8-chars"}' | jq -r .access_token)
+  curl -s -X POST localhost:8000/admin/wallets/<rider id>/adjust -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -H "Idempotency-Key: demo-fund-1" -d '{"amount": 50000, "note": "demo"}'
+  ```
+  The amount is in paise (50000 is Rs 500).
+- **Surge.** See "Make surge for a demo" under "Surge pricing" below.
+- **Concurrency.** Stop the simulator, then run `.venv-sim/bin/python simulator/stress.py --scenario drivers --rounds 20 --admin-email admin@example.com --admin-password 'at-least-8-chars'` and show it end with exit code 0 (no double assignment).
+
+---
+
+# Reference
+
+Everything below is the detailed reference, in the order the project was built. Names like "(M3.3)" are milestone numbers from `CLAUDE.md`.
 
 ## Set your contact email and city
 

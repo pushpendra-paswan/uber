@@ -9,8 +9,9 @@ Uber-like ride-hailing web app for learning. FastAPI + PostgreSQL/PostGIS + Redi
 ## Current status
 
 - Current phase: **Phase 7 (Observability, Load Testing, Polish) has started.** Phases 0 to 6 are complete (the MVP, real-time, concurrency hardening, pricing and payments, ratings, the admin dashboard, history). **M7.1 adds JSON logs with a request id and ride ids and no personal data, a token-protected `/metrics`, ride transitions counted after the commit by a session hook, a gauge task for database state, and an optional Prometheus + Grafana stack under the `observability` compose profile with a provisioned dashboard. The chaos scenario of `stress.py` compares the metrics with the database (`--metrics-token`).**
-- Last completed milestone: M7.1 Logging and metrics (2026-10-10). **M7.2 Load test is PARTLY DONE (2026-10-10): the load stack, the harness, the validation and a 3-run baseline exist; it was stopped on request before any bottleneck experiment, fix, after-fix run or revert run.**
-- Next milestone: finish M7.2 (the three one-variable experiments, a written prediction, ONE fix, 3 after-fix runs and a revert run; see `loadtest/RESULTS.md`), or go on to M7.3 Documentation
+- Last completed milestone: M7.3 Documentation (2026-10-10; the demo recording not done). Before it: M7.1 Logging and metrics (2026-10-10). **M7.2 Load test is PARTLY DONE (2026-10-10): the load stack, the harness, the validation and a 3-run baseline exist; it was stopped on request before any bottleneck experiment, fix, after-fix run or revert run.**
+- **M7.3 Documentation is DONE except the demo recording (2026-10-10):** `README.md` was restructured (what it is, two Mermaid architecture and ride diagrams, quick start, tour of the three apps, "How it works", the load test numbers and the open question, a demo script), with all older sections kept below a "Reference" heading. **The recording itself is a manual step and is NOT done.**
+- Next milestone: nothing is required. Optional: record the demo (README "Demo script"), or finish M7.2 (the three one-variable experiments, a written prediction, ONE fix, 3 after-fix runs and a revert run; see `loadtest/RESULTS.md`)
 - Last updated: 2026-10-10
 
 ## Milestone tracker
@@ -47,7 +48,7 @@ Status values: Not started, In progress, Done.
 | M6.3 | Rider and driver history | Done | 2026-10-10 |
 | M7.1 | Logging and metrics | Done | 2026-10-10 |
 | M7.2 | Load test | Partly done (harness and baseline; no fix) | 2026-10-10 |
-| M7.3 | Documentation | Not started | |
+| M7.3 | Documentation | Done (README, diagrams and the demo script; the demo recording is a manual step, not done) | 2026-10-10 |
 
 ## What exists now
 
@@ -1144,6 +1145,9 @@ One line per decision: milestone, what was chosen, what was rejected, why.
 | M7.1 | `--no-access-log` plus our own `http_request` line; uvicorn's WebSocket `[accepted]` line is dropped by a handler filter; httpx, httpcore and websockets are pinned to WARNING | Keeping uvicorn's access log; redacting it | uvicorn prints full paths with query strings (and the client address for WebSockets); httpx logs every URL at INFO; websockets logs frames at DEBUG, including the first one, which carries the token. Found while building: the first two would have leaked without the filters. |
 | M7.1 | The chaos run compares the metrics with the database (transitions exactly, `POST /rides` 201 as a LOWER bound, series and error counts, `rides_active` of the first process) and skips the counter checks when `process_start_time_seconds` changed | An exact HTTP comparison; asking the user whether a restart happened | Other clients may add requests, so only a lower bound is true; the transition counters are exact because every event is counted once after its commit. A restart resets the counters (and a crash between the commit and the hook loses a count), so the check says it was skipped instead of failing. `observability_errors_total` is compared as the INCREASE during the run, so an earlier outage does not fail a clean run. |
 | M7.1 | A close that ends without a status is counted as 1006 (uvicorn reports it as 1005) | Counting 1005 as `other` | The abrupt drop is the case the 1006 label exists for; uvicorn gives the same 1005 for it and for an empty close frame, so they cannot be told apart. |
+| M7.3 | The demo script lives inside `README.md` ("Demo script: two windows, one trip"); the older README sections were kept unchanged under a "# Reference" heading, and only the old intro and the "Start" section were replaced by the new top | A `docs/DEMO.md` (a new folder); shortening the reference sections | No new folder was needed, the reference sections are cross-referenced by name ("Create an admin", "Make surge for a demo"), and the brief asked to keep them. |
+| M7.3 | The architecture diagram shows Redis as GEO positions, presence keys, pub/sub and caches, and says the ride locks are Postgres row locks | Drawing "Redis locks" | M4.2 chose Postgres row locks; the only Redis `SET NX` left is the Nominatim rate-limit slot. |
+| M7.3 | The load test is documented as it is: capacity 100 users, knee 150 users, the event loop as a hypothesis, the full pool as the open question, no fix | Calling the event loop the confirmed cause; stating a number of concurrent rides | The three experiments were not run, and no concurrent-rides figure was measured (the numbers are in users, 30 percent of them requesting rides). |
 
 ## Bugs hit
 
@@ -1179,6 +1183,7 @@ One entry per notable bug: milestone, symptom, root cause, fix.
 
 ## Open issues and TODOs
 
+- **M7.3: the demo recording is not made** (a manual step; the script is in the README). **The Mermaid diagrams in `README.md` were written carefully but never rendered** in this session (no Mermaid tool; GitHub renders them): open the README on GitHub or in a Mermaid-aware preview once and fix any syntax error. No concurrent-rides figure for the load test exists, only users.
 - **M7.2: the numbers come from ONE machine** on which the generator, the fleet, Postgres, Redis, OSRM and the backend share 12 cores and 7.2 GB, and Docker networking differs by platform.
 - **M7.2: one backend process only** (and in `--reload` mode); multi-worker uvicorn was out of scope, so per-process metrics and sweepers are untested under load.
 - **M7.2: the bottleneck is a hypothesis.** The single event loop at 102 percent CPU (3.8 ms per request) fits four signals, but the full pool (15 connections, up to 576 requests in flight) is not ruled out. Next: a cProfile of the loop, `LOG_LEVEL=WARNING` (the access line at INFO for polling traffic has an unmeasured cost) and a larger pool, one at a time; then one fix with a written prediction. Login (argon2 on the event loop, 6 req/s) is the most expensive endpoint but is not part of the steady-state polling load.
