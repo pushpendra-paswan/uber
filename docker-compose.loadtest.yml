@@ -1,0 +1,58 @@
+# The load test environment (M7.2): its own Postgres, Redis and backend, so a load run never touches the dev data.
+# Only started with both files:  docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d postgres-load redis-load
+# The harness (loadtest/run.py) starts, resets and stops these three services itself. Plain `docker compose up` ignores this file.
+#
+# The one dev service these use is osrm (stateless routing, read only). The dev backend, db and redis are not used.
+
+services:
+  postgres-load:
+    image: postgis/postgis:16-3.4  # the same image as db
+    # The only change to Postgres: pg_stat_statements, to see which statements cost the most. Every other setting is the default.
+    command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=5000
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ridehail_load
+    volumes:
+      - postgres_load_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ridehail_load"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-load:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Everything of `backend` (build, env file, volumes, extra_hosts, logging, the uvicorn command) comes from the extends line,
+  # so the two cannot drift. Only what is listed here differs. `docker compose config backend backend-load` shows both.
+  backend-load:
+    extends:
+      file: docker-compose.yml
+      service: backend
+    image: uber-backend  # the very image of the dev backend (same name, same build), not a second copy
+    # The dev ports are not published again, and the dev db and redis are not started by this service.
+    ports: !override
+      - "127.0.0.1:8100:8000"
+    depends_on: !override
+      postgres-load:
+        condition: service_healthy
+      redis-load:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres-load
+      POSTGRES_DB: ridehail_load
+      REDIS_HOST: redis-load
+      LOG_LEVEL: ${LOADTEST_LOG_LEVEL:-INFO}  # INFO, like dev; a load run can set another one for a one-variable experiment
+      # A load run never calls Stripe or the public Nominatim: no key means "not configured", and the address below does not answer.
+      STRIPE_SECRET_KEY: ""
+      STRIPE_WEBHOOK_SECRET: ""
+      NOMINATIM_URL: http://127.0.0.1:9
+
+volumes:
+  postgres_load_data:

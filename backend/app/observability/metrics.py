@@ -37,6 +37,10 @@ sweeper_tick_duration_seconds = Histogram(
 )
 sweeper_last_success_timestamp_seconds = Gauge("sweeper_last_success_timestamp_seconds", "Epoch seconds of the last sweeper pass that did not fail")
 sweeper_errors_total = Counter("sweeper_errors_total", "Failed sweeper passes")
+event_loop_lag_seconds = Histogram(
+    "event_loop_lag_seconds", "How much later than requested the event loop woke a 0.1 s sleep (loop_lag_monitor)",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5),
+)
 observability_errors_total = Counter("observability_errors_total", "Failures of the observability code itself", ["source"])
 
 

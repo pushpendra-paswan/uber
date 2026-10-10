@@ -1,0 +1,4 @@
+# The load test runs on the host, in its own venv (python3 -m venv .venv-load && .venv-load/bin/pip install -r loadtest/requirements.txt).
+# Never part of the backend image or backend/requirements.txt. Locust brings gevent, requests and psutil.
+locust==2.46.7
+pytest==9.1.1

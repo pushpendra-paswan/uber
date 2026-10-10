@@ -56,6 +56,7 @@ uber-clone/
 ├── PROJECT_CONTEXT.md
 ├── README.md
 ├── docker-compose.yml         # the default stack, plus prometheus and grafana under the "observability" profile (M7.1)
+├── docker-compose.loadtest.yml  # an override file, used only as `-f docker-compose.yml -f docker-compose.loadtest.yml`: postgres-load (pg_stat_statements), redis-load and backend-load (extends backend, port 127.0.0.1:8100); a plain `docker compose up` ignores it (M7.2)
 ├── .env.example
 ├── backend/
 │   ├── Dockerfile
@@ -133,12 +134,26 @@ uber-clone/
 │   ├── rider/                 # index.html, rider.js, rider.css
 │   ├── driver/                # index.html, driver.js, driver.css
 │   └── admin/                 # index.html, admin.js, admin.css: five tabs (overview, live map, drivers, rides, pricing); admin.js is one long file on purpose (M6.2)
-└── simulator/
-    ├── simulator.py           # fake drivers (M2.5)
-    ├── stress.py              # fires simultaneous requests and checks twenty-four database invariants (and, with --metrics-token, /metrics against the database in the chaos scenario, M7.1); scenarios drivers, riders, fleet (M4.1), chaos (M4.3, with wallets since M5.3, the money-view cross-check since M5.4, ratings with a rating-view cross-check since M6.1, and since M6.2 pricing edits by the admin and a cross-check of the admin views, and since M6.3 saved places managed by the riders and a cross-check of the saved places and trip history lists), payments (M5.3), ratings (M6.1) and places (M6.3)
-    ├── invariants.sql         # the twenty-four invariants I1 to I24, read-only SQL, run by stress.py or by hand
-    ├── fake_stripe.py         # a local fake of the Stripe API the backend uses (M5.3), standard library only, NOT part of the app
-    └── requirements.txt       # httpx only
+├── simulator/
+│   ├── simulator.py           # fake drivers (M2.5)
+│   ├── stress.py              # fires simultaneous requests and checks twenty-four database invariants (and, with --metrics-token, /metrics against the database in the chaos scenario, M7.1); scenarios drivers, riders, fleet (M4.1), chaos (M4.3, with wallets since M5.3, the money-view cross-check since M5.4, ratings with a rating-view cross-check since M6.1, and since M6.2 pricing edits by the admin and a cross-check of the admin views, and since M6.3 saved places managed by the riders and a cross-check of the saved places and trip history lists), payments (M5.3), ratings (M6.1) and places (M6.3)
+│   ├── invariants.sql         # the twenty-four invariants I1 to I24, read-only SQL, run by stress.py or by hand
+│   ├── fake_stripe.py         # a local fake of the Stripe API the backend uses (M5.3), standard library only, NOT part of the app
+│   └── requirements.txt       # httpx only
+└── loadtest/                  # the load test harness (M7.2), run on the host in its own venv (.venv-load, never part of the backend image)
+    ├── requirements.txt       # Locust 2.46.7 and pytest
+    ├── common.py              # names, ports, the fixed point pairs, compose/psql helpers
+    ├── seed.py                # migrations, admins, riders (half funded), the simulator's driver accounts, then the template database
+    ├── run.py                 # CLI: seed, reset, probe, run, report; the constants (STEP_USERS, WARMUP_S, HOLD_S, ...) are at its top
+    ├── locustfile.py          # RiderSession, HistoryBrowser, AdminLiveViewer, AdminOverviewViewer: the requests of the real pages
+    ├── shape.py               # the step load shape, steps.json, the collapse stop
+    ├── probes.py              # one task per core endpoint, selected by Locust tag
+    ├── collect.py             # samplers (/metrics, docker stats, pg_stat_activity, logs, processes), machine facts, the correctness checks
+    ├── stats.py               # pure functions: percentiles, the Prometheus histogram rule, steps by timestamp, SLOs, capacity and knee
+    ├── report.py              # per-step and probe tables from a run directory
+    ├── test_stats.py          # pytest loadtest (no database)
+    ├── RESULTS.md             # method, numbers, the bottleneck report and the fix
+    └── results/               # one directory per run, gitignored
 ```
 
 ## Architecture: routers → services → repositories
@@ -398,7 +413,7 @@ Done when: an admin can run the platform without touching the database.
 
 ### Phase 7: Observability, Load Testing, Polish
 - **M7.1 Logging and metrics:** JSON logs on stdout with a request id and ride ids and no personal data (a field whitelist, no exception messages), a token-protected `/metrics` (HTTP, database, WebSocket, external call, sweeper and ride flow metrics; ride transitions counted after the commit by a session hook), a gauge task for database state, an optional Prometheus and Grafana stack under the `observability` compose profile with a provisioned dashboard, and `--metrics-token` checks of the metrics against the database in the chaos scenario
-- **M7.2 Load test:** Locust scenarios, find the first bottleneck, fix one, and re-measure
+- **M7.2 Load test:** an isolated load stack (own Postgres, Redis and backend, reset from a template database), Locust users that send the request mix of the real pages (riders, trip browsers, admins) plus the simulator fleet, a step load with warm-up and hold, SLOs per request group on the hold period (client and server latency), capacity and knee, single endpoint probes, correctness checks after every run, a 3-run baseline, and (planned, not yet done) one bottleneck confirmed by a one-variable experiment, one fix with a written prediction, and a revert run
 - **M7.3 Documentation:** README, architecture diagram, and a short demo recording
 
 Done when: you can state how many concurrent rides it handles and what broke first.

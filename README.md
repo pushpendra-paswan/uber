@@ -688,7 +688,7 @@ Only these fields can appear in a line: the formatter drops every other key. **N
 
 ### Metrics
 
-`GET /metrics` needs `METRICS_TOKEN` from `.env`: empty means the endpoint does not exist (404); otherwise send `Authorization: Bearer <token>` (a user JWT never works). It lists HTTP requests and latency by route template, SQL statement latency, the database pool, calls to OSRM/Nominatim/Stripe by outcome, WebSocket connections and close codes, ride transitions, active rides by status, pending offers, online drivers, the offer sweeper's last success, and the errors of the observability code itself (`observability_errors_total`, which should stay 0), next to the standard Python process metrics.
+`GET /metrics` needs `METRICS_TOKEN` from `.env`: empty means the endpoint does not exist (404); otherwise send `Authorization: Bearer <token>` (a user JWT never works). It lists HTTP requests and latency by route template, SQL statement latency, the database pool, calls to OSRM/Nominatim/Stripe by outcome, WebSocket connections and close codes, ride transitions, active rides by status, pending offers, online drivers, the offer sweeper's last success, how late the event loop wakes up (`event_loop_lag_seconds`, M7.2), and the errors of the observability code itself (`observability_errors_total`, which should stay 0), next to the standard Python process metrics.
 
 ```bash
 curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8000/metrics | grep -E '^(ride_transitions_total|rides_active|drivers_online)'
@@ -717,6 +717,40 @@ The dashboard panels: request rate by route; latency p50/p95/p99 by route; 5xx a
 ### Metrics against the database in the chaos run
 
 `stress.py --scenario chaos --metrics-token <METRICS_TOKEN>` reads `/metrics` of every `--api-url` process before the run and, after the settle period and a 6 second wait for the gauges, again before the cleanup, and counts `metrics_mismatch` (any non-zero value is a violation, exit 1, and the first five are printed with the numbers compared): (a) the summed increase of `ride_transitions_total` per `(from, to)` must equal the SQL count of `ride_events` created since the run began (skipped, with the reason printed, when a backend process restarted during the run, because its counters began again); (b) the summed increase of `http_requests_total` for `POST /rides` 201 must be at least the number of 201 answers the tool saw (a lower bound: other clients may add more); (c) no route label has a numeric path segment and `http_requests_total` has at most 500 series; (d) `observability_errors_total` did not rise in any process during the run; (e) `rides_active` of the first process equals SQL. A difference is asked again once after 2 seconds. **Without `--metrics-token` these checks are SKIPPED:** the summary says so in a warning, and a skipped check is not a pass.
+
+## Load testing (M7.2)
+
+A load test needs its own copy of the stack so it never touches your dev data: `docker-compose.loadtest.yml` adds `postgres-load` (with `pg_stat_statements`), `redis-load` and `backend-load` (the same image, command and settings as `backend`, reachable on `127.0.0.1:8100`). A plain `docker compose up` ignores that file. The dev `backend`, `db` and `redis` are not used; the only shared service is `osrm` (stateless routing). Stop the dev backend first (`docker compose stop backend`) so the machine is quiet. The harness runs on the host in its own venv:
+
+```bash
+python3 -m venv .venv-load && .venv-load/bin/pip install -r loadtest/requirements.txt
+python3 -m venv .venv-sim && .venv-sim/bin/pip install -r simulator/requirements.txt   # the simulated drivers (once, if you have no .venv-sim yet)
+.venv-load/bin/python loadtest/run.py seed       # once, about 3 minutes: migrations, 3 admins, 1000 riders (500 funded), 80 driver accounts, then the template database
+.venv-load/bin/python loadtest/run.py reset      # drops ridehail_load, recreates it from the template, flushes redis-load, restarts backend-load (about 3 seconds)
+.venv-load/bin/python loadtest/run.py probe      # the capacity of single endpoints: 20 users on one endpoint at a time, about 10 minutes
+.venv-load/bin/python loadtest/run.py run        # the stepped load test: reset, fleet, load, settle, correctness checks, report (about 25 minutes)
+.venv-load/bin/python loadtest/run.py report <run id>   # print the report of a finished run again
+.venv-load/bin/pytest loadtest                   # the tests of the statistics code (no database needed)
+```
+
+`run` always starts with a `reset`, so every run begins with the same empty database (apart from the seeded accounts), zero metric counters and an empty Redis. The password of the throwaway accounts is a fixed value in `common.py` (`LOADTEST_PASSWORD` overrides it); they exist only in the load database. Everything is configurable (`run.py run --help`: steps, warm-up, hold, fleet size, requester ratio, seed, Locust processes). Results go to `loadtest/results/<run id>/` (ignored by git): the per-request log, every `/metrics` scrape, `docker stats`, `pg_stat_activity` every second, the backend log, `pg_stat_statements`, the machine facts and `report.md`.
+
+**What is simulated, and where the request mix comes from.** Each user sends exactly the requests that the real page sends on its 3 second poll (`frontend/rider/rider.js` `refresh()`, `frontend/admin/admin.js` `loadTab()`), in each state of the page, and the page-open requests once:
+
+- `RiderSession` (weight 9): logs in (`SETUP login`, never counted), opens the page (map config, wallet, wallet entries, top-ups, the active ride, own rating, saved places), then every 3 seconds the wallet reads, the active ride and, with a ride, its events. 30 percent of the riders (`REQUESTER_RATIO`) are requesters: after 5 to 20 idle seconds they ask for the estimate, look at the price, request a ride (cash or wallet by whether the account is funded; trips come from a fixed list of 48 road-snapped point pairs, 2.8 to 8.0 km), poll until it ends, may cancel while waiting (5 percent), rate 5 stars after a completed trip (30 percent) and start over. The others are idle viewers.
+- `HistoryBrowser` (weight 1): a rider who every 15 to 40 seconds opens "My trips" (history, saved places, a receipt).
+- `AdminLiveViewer` and `AdminOverviewViewer` (one each): the admin page on the Live tab (live map every tick, surge every third) and on the Overview tab (stats every third tick).
+- The driver side is the unchanged simulator (`--drivers 80 --speed-kmh 90 --seed 1`), started by the harness. It sends about 1 request per second per driver and opens no WebSocket.
+
+Not simulated: rider and driver WebSockets, geocoding (the public Nominatim) and Stripe. `backend-load` has no Stripe key and its Nominatim address does not answer, so a stray call would fail instead of leaving the machine. All randomness comes from `--seed`.
+
+**The steps, the SLOs and the verdict.** `STEP_USERS = 10, 25, 50, 100, 150, 200, 300, 400` (total users, admins included), each with a 30 s warm-up and a 90 s hold. Every number is computed from the hold period only. SLOs: every `GET` of the page request lists p95 below 300 ms and p99 below 1000 ms; `POST /rides/estimate` and `POST /rides` p95 below 800 ms; error rate below 0.5 percent (a status of 500 or more, a timeout, a refused connection, or a 4xx the user did not expect; a ride that ends NO_DRIVER_FOUND is an outcome, not an error). **Capacity** is the highest step where every SLO holds and the step is not INVALID; the **knee** is the first step that violates one. A step is INVALID when a Locust process used more than 70 percent of one core on average (the generator, not the server, would be the limit): use `--processes`. The p95 decides, never the mean, because a mean hides the slow requests users feel. A run stops early when 10 seconds of requests have an error rate of 5 percent or more, or a p95 of 5 s or more, in two checks in a row.
+
+**How to read the report.** The tables show the client side (Locust: includes any wait before the app reads the request) and the server side (the `http_request_duration_seconds` histogram: starts when the app has the request); a gap between them is queueing in front of the app. The next table shows the event loop lag (`event_loop_lag_seconds`: how late a 0.1 s sleep wakes up, the number that says whether a single async process is busy), the database pool, requests in flight, the CPU of each container and the connections by state. The last checks are the correctness checks that follow every run: the invariants I1 to I24, `ride_transitions_total` equal to the `ride_events` rows, `POST /rides` 201 equal in the metrics, in Locust and in the table, `observability_errors_total` at 0, and no ride left in an active status. A failure there outranks any performance finding.
+
+**Limits.** The numbers come from one machine on which the generator, the fleet, the database, Redis, OSRM and the backend all run, so they say where one backend process gives out on this machine, not how a deployment would behave. One backend process only. The database starts empty, so history and admin queries get slower as it grows. See `loadtest/RESULTS.md` for the method, the numbers and the bottleneck report.
+
+To remove the load stack and its data: `docker compose -f docker-compose.yml -f docker-compose.loadtest.yml rm -sf backend-load postgres-load redis-load && docker volume rm uber_postgres_load_data` (the volume prefix is the folder name). Careful: `down` with both files would remove the dev containers too.
 
 ## Run the tests
 

@@ -897,6 +897,64 @@
           "legendFormat": "resident memory"
         }
       ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Event loop lag p95 and max",
+      "description": "How much later than requested the event loop woke a 0.1 s sleep. p95 comes from the histogram; max is the upper bound of the highest bucket seen in the window (a histogram has no exact maximum). Near 0 means the loop is idle or keeping up; tens of milliseconds or more means requests wait behind other work. Per backend process.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(event_loop_lag_seconds_bucket{job=\"backend\"}[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(1, sum by (le) (rate(event_loop_lag_seconds_bucket{job=\"backend\"}[1m])))",
+          "legendFormat": "max (bucket bound)"
+        }
+      ]
     }
   ]
 }

@@ -14,6 +14,7 @@ from app.repositories import drivers as drivers_repo
 from app.repositories import stats as stats_repo
 
 METRICS_REFRESH_SECONDS = 5
+LAG_SLEEP_SECONDS = 0.1
 
 logger = logging.getLogger("app.observability")
 
@@ -95,3 +96,21 @@ async def refresh_gauges_forever() -> None:
             logger.error("gauges_error", exc_info=True, extra={"service": "redis"})
 
         await asyncio.sleep(METRICS_REFRESH_SECONDS)
+
+
+async def loop_lag_monitor() -> None:
+    """Runs for the life of the process. A sleep of LAG_SLEEP_SECONDS that wakes up later than that shows how long the event
+    loop was busy with something else (a blocking call, or more ready callbacks than it could run)."""
+    loop = asyncio.get_running_loop()
+    failing = False
+    while True:
+        try:
+            started = loop.time()
+            await asyncio.sleep(LAG_SLEEP_SECONDS)
+            metrics.event_loop_lag_seconds.observe(max(0.0, loop.time() - started - LAG_SLEEP_SECONDS))
+            failing = False
+        except Exception:
+            metrics.observability_errors_total.labels("hook").inc()
+            if not failing:  # one line per streak of failures, not ten per second
+                logger.error("loop_lag_error", exc_info=True)
+                failing = True

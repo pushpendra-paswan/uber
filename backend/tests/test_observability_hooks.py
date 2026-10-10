@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import pytest
 from prometheus_client import REGISTRY
@@ -6,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.models import RideEvent, RideStatus
-from app.observability import hooks, middleware
+from app.observability import hooks, metrics, middleware
 from app.observability.hooks import start_background_task
 from app.repositories import rides as rides_repo
 from app.services import offers as offers_service
@@ -229,3 +230,85 @@ async def test_no_driver_found_from_the_sweeper_is_emitted_once_with_the_sweeper
     assert transitions(new_lines, ride_id) == [("REQUESTED", "NO_DRIVER_FOUND")]
     assert await events_in_sql(db, ride_id) == [("none", "REQUESTED"), ("REQUESTED", "NO_DRIVER_FOUND")]
     assert new_lines and all(line.get("component") == "sweeper" and "request_id" not in line for line in new_lines)
+
+
+# --- the event loop lag monitor ---
+
+
+def lag_sample(suffix: str, **labels) -> float:
+    return REGISTRY.get_sample_value(f"event_loop_lag_seconds_{suffix}", labels) or 0
+
+
+async def run_monitor_for(seconds: float) -> None:
+    task = start_background_task("loop_lag", hooks.loop_lag_monitor())
+    await asyncio.sleep(seconds)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_the_monitor_sees_a_blocked_loop():
+    sum_before, count_before = lag_sample("sum"), lag_sample("count")
+    quarter_before, half_before = lag_sample("bucket", le="0.25"), lag_sample("bucket", le="0.5")
+
+    task = start_background_task("loop_lag", hooks.loop_lag_monitor())
+    await asyncio.sleep(0.25)  # a few normal wake-ups first
+    # A free-running 0.1 s sleep that is overtaken by a 0.4 s block wakes 0.3 to 0.4 s late, whatever the phase.
+    time.sleep(0.4)
+    await asyncio.sleep(0.15)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The overshoot, not the sleep itself: the one blocked wake-up adds at least 0.25 s, and the others almost nothing.
+    assert lag_sample("sum") - sum_before >= 0.25
+    observed = lag_sample("count") - count_before
+    assert observed >= 3
+    assert observed - (lag_sample("bucket", le="0.25") - quarter_before) == 1  # exactly one wake-up was more than 0.25 s late
+    assert lag_sample("bucket", le="0.5") - half_before == observed  # and none was more than 0.5 s late
+
+
+async def test_the_monitor_sees_almost_no_lag_on_an_idle_loop():
+    count_before, below_before = lag_sample("count"), lag_sample("bucket", le="0.1")
+
+    await run_monitor_for(0.6)
+
+    observed = lag_sample("count") - count_before
+    assert observed >= 4
+    # Every wake-up was less than 0.1 s late (the sleep itself is 0.1 s, so a raw sleep time would land above this bucket).
+    assert lag_sample("bucket", le="0.1") - below_before == observed
+
+
+async def test_the_monitor_is_cancelled_cleanly():
+    task = start_background_task("loop_lag", hooks.loop_lag_monitor())
+    await asyncio.sleep(0.15)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    assert task not in asyncio.all_tasks()
+
+
+async def test_a_failure_in_the_monitor_is_isolated_counted_and_logged_once(log_lines, monkeypatch):
+    errors_before, count_before = hook_errors(), lag_sample("count")
+
+    def broken(seconds):
+        raise RuntimeError("secret-" + "text")
+
+    monkeypatch.setattr(metrics.event_loop_lag_seconds, "observe", broken)
+    task = start_background_task("loop_lag", hooks.loop_lag_monitor())
+    await asyncio.sleep(0.5)  # several failures in a row
+    assert not task.done()  # the task survives its own failure
+    monkeypatch.undo()
+    await asyncio.sleep(0.3)  # and observes again once the failure is gone
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert hook_errors() - errors_before >= 3
+    assert lag_sample("count") - count_before >= 1
+    lines = [line for line in log_lines() if line["msg"] == "loop_lag_error"]
+    assert len(lines) == 1 and lines[0]["exc_type"] == "RuntimeError" and lines[0]["component"] == "loop_lag"
+    assert "secret-text" not in str(lines[0])

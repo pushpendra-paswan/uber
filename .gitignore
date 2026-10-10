@@ -23,3 +23,6 @@ pgdata/
 .vscode/
 *.swp
 .DS_Store
+
+# Load test output (M7.2): per-request logs, metrics scrapes, reports
+loadtest/results/

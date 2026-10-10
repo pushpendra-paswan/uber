@@ -11,7 +11,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine, redis_client
-from app.observability.hooks import refresh_gauges_forever, start_background_task
+from app.observability.hooks import loop_lag_monitor, refresh_gauges_forever, start_background_task
 from app.observability.logs import setup_logging
 from app.observability.middleware import observability_middleware
 from app.routers import admin, auth, drivers, metrics, offers, payments, places, ratings, rides, saved_places, websocket
@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         start_background_task("ws_listener", websocket.listen_for_events()),
         start_background_task("sweeper", offers_service.sweep_forever()),
         start_background_task("gauges", refresh_gauges_forever()),
+        start_background_task("loop_lag", loop_lag_monitor()),
     ]
     yield
     for task in tasks:
