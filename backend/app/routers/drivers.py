@@ -3,10 +3,11 @@ from pydantic import AwareDatetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import Driver, User
+from app.models import Driver, RideStatus, User
 from app.schemas import (
     DriverProfileCreate,
     DriverResponse,
+    DriverTripRow,
     EarningEntryResponse,
     EarningsSummaryResponse,
     LocationUpdate,
@@ -17,6 +18,7 @@ from app.schemas import (
 from app.security import require_role
 from app.services import drivers as drivers_service
 from app.services import earnings as earnings_service
+from app.services import history as history_service
 from app.services import offers as offers_service
 
 router = APIRouter(prefix="/drivers", tags=["drivers"])
@@ -86,3 +88,14 @@ async def list_earning_entries(
     user: User = Depends(require_role("driver")), db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
     return await earnings_service.list_entries(db, user, since, until, limit, before_id)
+
+
+# The driver's finished rides (COMPLETED and CANCELLED), newest first. since is inclusive and until exclusive, compared with the
+# request time of the ride.
+@router.get("/me/history", response_model=list[DriverTripRow])
+async def list_history(
+    status: RideStatus | None = None, since: AwareDatetime | None = None, until: AwareDatetime | None = None,
+    limit: int = history_service.HISTORY_DEFAULT_LIMIT, before_id: int | None = None,
+    user: User = Depends(require_role("driver")), db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    return await history_service.list_driver_trips(db, user, status, since, until, limit, before_id)

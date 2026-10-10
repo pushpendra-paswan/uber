@@ -42,6 +42,7 @@ const RIDE_MARKER_LABEL = { pickup: "Pickup", dropoff: "Drop-off" };
 const RIDE_MARKER_COLOR = { pickup: "#1a7f37", dropoff: "#b42318" };
 const FIT_PADDING = [40, 40];
 const ENTRIES_PAGE = 10; // earning entries shown at first, and added by each "Show more"
+const TRIPS_PAGE = 20; // trip rows asked for at a time: the API default (its maximum is 50)
 const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
 // "★★★★☆". Built as text, never as markup.
@@ -73,6 +74,13 @@ const state = {
   earningsPeriod: "today", // "today", "week" or "all", written only by the period buttons' handlers
   earningsSince: null, // the since (ISO) that the shown earnings were asked for, so "Show more" pages the same window
   earningsKey: null, // "start" or "ride:<id>": what the earnings were last loaded for; set before the call so a failure is not retried every poll
+  view: "drive", // "drive" or "trips"; written only by the view buttons' handler
+  trips: null, // rows of GET /drivers/me/history shown in My trips; null until the view was opened
+  tripsMore: false, // true while the last page was full, so there may be more
+  tripStatus: "", // the status filter ("" is all); written only by its change handler
+  tripPeriod: "all", // "all", "7" or "30" days; written only by its change handler
+  fromTrips: false, // true while the shown finished ride was opened from My trips ("Back to my trips")
+  openedTrip: null, // the My trips row of that ride: it has the fare split even when the ride is not among the loaded earnings
   myRating: null, // answer of GET /ratings/me: {count, average}
   ratingStatus: null, // answer of GET /rides/{id}/rating for a COMPLETED ride
   ratingKey: null, // the finished ride's id ("none" while there is none) the ratings were loaded for; set before the calls so a failure is not retried every poll
@@ -83,6 +91,7 @@ const state = {
 };
 let refreshing = false;
 let countdownTimer = null; // setInterval id while an offer is showing
+let shownTrips = null; // the JSON of the trip rows in the DOM, so polling does not rebuild their buttons under a click
 
 const message = document.getElementById("message");
 const noticeText = document.getElementById("notice");
@@ -157,6 +166,18 @@ const earningsWallet = document.getElementById("earnings-wallet");
 const earningsBalance = document.getElementById("earnings-balance");
 const earningsList = document.getElementById("earnings-list");
 const earningsMoreButton = document.getElementById("earnings-more-button");
+const viewNav = document.getElementById("view-nav");
+const viewButtons = document.querySelectorAll("[data-view]"); // the two nav buttons and "Go to ride"
+const busyBanner = document.getElementById("busy-banner");
+const busyBannerText = document.getElementById("busy-banner-text");
+const backToTripsButton = document.getElementById("back-to-trips-button");
+const tripsSection = document.getElementById("trips-section");
+const tripStatusSelect = document.getElementById("trip-status");
+const tripPeriodSelect = document.getElementById("trip-period");
+const tripsRefreshButton = document.getElementById("trips-refresh-button");
+const tripsEmpty = document.getElementById("trips-empty");
+const tripList = document.getElementById("trip-list");
+const tripsMoreButton = document.getElementById("trips-more-button");
 
 async function login(email, password) {
   const data = await api("POST", "/auth/login", { email, password });
@@ -218,6 +239,24 @@ async function loadEarnings() {
   const entries = await api("GET", `/drivers/me/earnings/entries?limit=${ENTRIES_PAGE}&${sinceQuery}`);
   state.earningsSince = since;
   state.earnings = { summary, entries, hasMore: entries.length === ENTRIES_PAGE };
+}
+
+// The first page of the trip list (append is false), or the page after the last row shown (append is true). The window comes
+// from the browser's local midnight, so the server needs no timezone. Called when the view opens, on a filter change, on Refresh
+// and on "Load more", never on the poll.
+async function loadTrips(append) {
+  const query = new URLSearchParams({ limit: TRIPS_PAGE });
+  if (state.tripStatus !== "") query.set("status", state.tripStatus);
+  if (state.tripPeriod !== "all") {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - (Number(state.tripPeriod) - 1));
+    query.set("since", start.toISOString());
+  }
+  if (append) query.set("before_id", state.trips[state.trips.length - 1].id);
+  const rows = await api("GET", `/drivers/me/history?${query}`);
+  state.trips = append ? [...state.trips, ...rows] : rows;
+  state.tripsMore = rows.length === TRIPS_PAGE;
 }
 
 // Your own rating, and the rating status of a COMPLETED ride. Not called on every poll: refresh() calls it when the page
@@ -331,7 +370,8 @@ function render() {
   const hasVehicle = hasProfile && state.driver.vehicle !== null;
   const approved = hasVehicle && state.driver.verification_status === "approved";
   const showRide = approved && state.ride !== null;
-  const showMap = approved && state.config !== null;
+  // The map is touched only in the Drive view: Leaflet cannot measure a hidden container, and polling never moves it.
+  const showMap = approved && state.config !== null && state.view === "drive";
   const online = state.presence !== null && state.presence.online;
   const hasActiveRide = state.ride !== null && !FINISHED.includes(state.ride.status);
   const showOffer = approved && state.offer !== null && !hasActiveRide;
@@ -371,8 +411,9 @@ function render() {
   profileSection.hidden = !isDriver || !state.loaded || hasProfile;
   vehicleSection.hidden = !hasProfile || hasVehicle;
   presenceSection.hidden = !showMap;
-  noRideSection.hidden = !approved || showRide || showOffer;
-  rideSection.hidden = !showRide;
+  // The views: the offer panel is in both of them, so an offer can be answered from My trips too.
+  noRideSection.hidden = !approved || showRide || showOffer || state.view !== "drive";
+  rideSection.hidden = !showRide || state.view !== "drive";
   offerSection.hidden = !showOffer;
 
   if (showMap) {
@@ -511,8 +552,12 @@ function render() {
     if (showFare) {
       rideFare.textContent = `Trip fare: ${money.format(state.ride.final_fare / 100)} (${(breakdown.distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(breakdown.duration_s / 60))} min). ${paidText}`;
     }
-    // The earning row of this ride, once the earnings list has it (a ride with nothing to pay has none).
-    const earning = state.earnings === null ? undefined : state.earnings.entries.find((entry) => entry.ride_id === state.ride.id);
+    // The earning row of this ride, once the earnings list has it (a ride with nothing to pay has none). A ride opened from
+    // My trips may be older than the loaded earnings: its row has the same numbers.
+    let earning = state.earnings === null ? undefined : state.earnings.entries.find((entry) => entry.ride_id === state.ride.id);
+    if (earning === undefined && state.openedTrip !== null && state.openedTrip.id === state.ride.id && state.openedTrip.driver_earning !== null) {
+      earning = { driver_earning: state.openedTrip.driver_earning, gross_amount: state.openedTrip.fare, platform_fee: state.openedTrip.platform_fee };
+    }
     rideEarning.hidden = earning === undefined;
     if (earning !== undefined) {
       rideEarning.textContent = `You earn ${money.format(earning.driver_earning / 100)} (${money.format(earning.gross_amount / 100)} fare minus ${money.format(earning.platform_fee / 100)} platform fee).`;
@@ -553,7 +598,7 @@ function render() {
   }
 
   // Only textContent below: addresses are plain text.
-  earningsSection.hidden = !isDriver || state.earnings === null;
+  earningsSection.hidden = !isDriver || state.earnings === null || state.view !== "drive";
   for (const button of periodButtons) button.setAttribute("aria-pressed", String(button.dataset.period === state.earningsPeriod));
   if (!earningsSection.hidden) {
     const { summary, entries, hasMore } = state.earnings;
@@ -581,7 +626,72 @@ function render() {
     earningsMoreButton.hidden = !hasMore;
   }
 
+  // Views and trips. Only textContent below: addresses are plain text, and nothing about the rider is ever on this page.
+  viewNav.hidden = !approved;
+  for (const button of viewNav.querySelectorAll("button")) {
+    if (button.dataset.view === state.view) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  busyBanner.hidden = !hasActiveRide || state.view === "drive";
+  if (hasActiveRide) busyBannerText.textContent = `You have a ride in progress: ${STATUS_TEXT[state.ride.status]}.`;
+  backToTripsButton.hidden = !showRide || !state.fromTrips;
+
+  tripsSection.hidden = !approved || state.view !== "trips";
+  tripsEmpty.hidden = state.trips === null || state.trips.length > 0;
+  tripsMoreButton.hidden = !state.tripsMore;
+  const tripsJson = JSON.stringify(state.trips);
+  if (tripsJson !== shownTrips) {
+    shownTrips = tripsJson;
+    tripList.replaceChildren(
+      ...(state.trips === null ? [] : state.trips).map((trip) => {
+        const row = document.createElement("li");
+        const split = [
+          trip.fare === null ? "" : `Fare ${money.format(trip.fare / 100)}`,
+          trip.platform_fee === null ? "" : `Platform fee ${money.format(trip.platform_fee / 100)}`,
+          trip.driver_earning === null ? "No earnings" : `You earned ${money.format(trip.driver_earning / 100)}`,
+        ];
+        const lines = [
+          `${new Date(trip.created_at).toLocaleString()}: ${STATUS_TEXT[trip.status]}`,
+          `${trip.pickup_address} \u2192 ${trip.dropoff_address}`,
+          trip.distance_m === null || trip.duration_s === null ? "-" : `${(trip.distance_m / 1000).toFixed(1)} km, ${Math.max(1, Math.round(trip.duration_s / 60))} min`,
+          `${split.filter((part) => part !== "").join(", ")} (${trip.payment_method})`,
+          { rider: "The rider cancelled", driver: "You cancelled" }[trip.cancelled_by] || "",
+          trip.my_rating !== null ? `You rated ${stars(trip.my_rating)}` : trip.can_rate ? "Rate this rider" : "",
+        ];
+        for (const line of lines.filter((text) => text !== "")) {
+          const paragraph = document.createElement("p");
+          paragraph.textContent = line;
+          row.append(paragraph);
+        }
+        const open = document.createElement("button");
+        open.type = "button";
+        open.textContent = "Open";
+        // The finished-ride view shows one remembered ride, and a ride or an offer takes the driver's attention first.
+        open.addEventListener("click", () =>
+          act(async () => {
+            if ((state.ride !== null && !FINISHED.includes(state.ride.status)) || state.offer !== null) {
+              throw new Error("Finish your current ride or answer your offer first.");
+            }
+            const ride = await api("GET", `/rides/${trip.id}`);
+            // refresh() loads the events, and the rating status once per ride id.
+            state.ride = ride;
+            state.rideId = ride.id;
+            state.ratingStatus = null;
+            state.ratingKey = null;
+            ratingForm.reset();
+            state.openedTrip = trip;
+            state.fromTrips = true;
+            state.view = "drive";
+          })
+        );
+        row.append(open);
+        return row;
+      })
+    );
+  }
+
   for (const button of document.querySelectorAll("button")) button.disabled = state.busy;
+  for (const select of [tripStatusSelect, tripPeriodSelect]) select.disabled = state.busy;
   onlineButton.disabled = state.busy || state.position === null;
   offlineButton.disabled = state.busy || hasActiveRide;
 }
@@ -701,17 +811,53 @@ cancelButton.addEventListener("click", () => {
   act(() => api("POST", `/rides/${state.ride.id}/cancel`));
 });
 
-doneButton.addEventListener("click", () => {
-  codeInput.value = "";
-  ratingForm.reset();
-  act(async () => {
-    state.ride = null;
-    state.rideId = null;
-    state.events = [];
-    state.ratingStatus = null;
-    state.ratingKey = null; // the next refresh loads your rating again
+// "Wait for a new ride" and "Back to my trips" forget the finished ride in the same way; Back then opens the list again.
+for (const button of [doneButton, backToTripsButton]) {
+  button.addEventListener("click", () => {
+    codeInput.value = "";
+    ratingForm.reset();
+    act(async () => {
+      state.ride = null;
+      state.rideId = null;
+      state.events = [];
+      state.ratingStatus = null;
+      state.ratingKey = null; // the next refresh loads your rating again
+      state.fromTrips = false;
+      state.openedTrip = null;
+      if (button === backToTripsButton) {
+        state.view = "trips";
+        await loadTrips(false);
+      }
+    });
   });
+}
+
+// The view buttons: Drive, My trips, and "Go to ride" of the banner. The page keeps polling in both views.
+for (const button of viewButtons) {
+  button.addEventListener("click", () => {
+    act(async () => {
+      state.view = button.dataset.view;
+      if (state.view === "trips") await loadTrips(false);
+      if (state.view === "drive") {
+        // The map was hidden and may have been resized meanwhile. Shown first, then measured again once, here.
+        render();
+        if (state.map !== null) state.map.invalidateSize({ animate: false, pan: false });
+      }
+    });
+  });
+}
+
+// The filters and the buttons of My trips. The selects are written by the browser, and read only here.
+tripStatusSelect.addEventListener("change", () => {
+  state.tripStatus = tripStatusSelect.value;
+  act(() => loadTrips(false));
 });
+tripPeriodSelect.addEventListener("change", () => {
+  state.tripPeriod = tripPeriodSelect.value;
+  act(() => loadTrips(false));
+});
+tripsRefreshButton.addEventListener("click", () => act(() => loadTrips(false)));
+tripsMoreButton.addEventListener("click", () => act(() => loadTrips(true)));
 
 // The period and the entries are written only here: render() shows them and never changes them.
 for (const button of periodButtons) {

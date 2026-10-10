@@ -23,6 +23,15 @@
     <p id="live-status" class="note" hidden></p>
     <button id="reconnect-button" type="button" hidden>Reconnect</button>
 
+    <nav id="view-nav" class="view-nav" aria-label="Pages" hidden>
+      <button type="button" data-view="drive">Drive</button>
+      <button type="button" data-view="trips">My trips</button>
+    </nav>
+    <p id="busy-banner" class="banner" role="status" hidden>
+      <span id="busy-banner-text"></span>
+      <button id="go-to-ride-button" type="button" data-view="drive">Go to ride</button>
+    </p>
+
     <section id="login-section" hidden>
       <h2>Log in</h2>
       <form id="login-form">
@@ -165,6 +174,7 @@
       <button id="complete-button" type="button" hidden>Complete trip</button>
       <button id="cancel-button" type="button" hidden>Cancel ride</button>
       <button id="done-button" type="button" hidden>Wait for a new ride</button>
+      <button id="back-to-trips-button" type="button" hidden>Back to my trips</button>
 
       <h3>Timeline</h3>
       <div class="table-scroll">
@@ -197,6 +207,32 @@
       <h3>Latest rides</h3>
       <ul id="earnings-list" class="plain-list"></ul>
       <button id="earnings-more-button" type="button" hidden>Show more</button>
+    </section>
+
+    <section id="trips-section" hidden>
+      <h2>My trips</h2>
+      <div class="filter-row">
+        <div>
+          <label for="trip-status">Status</label>
+          <select id="trip-status">
+            <option value="">All</option>
+            <option value="COMPLETED">Completed</option>
+            <option value="CANCELLED">Cancelled</option>
+          </select>
+        </div>
+        <div>
+          <label for="trip-period">Period</label>
+          <select id="trip-period">
+            <option value="all">All time</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </div>
+      </div>
+      <button id="trips-refresh-button" type="button">Refresh</button>
+      <p id="trips-empty" class="note" hidden>No trips found.</p>
+      <ul id="trip-list" class="trip-list"></ul>
+      <button id="trips-more-button" type="button" hidden>Load more</button>
     </section>
   </main>
 

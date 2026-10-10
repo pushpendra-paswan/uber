@@ -17,7 +17,11 @@ rule every ~10 s (30 percent of the time the same edit twice at once), reads the
 period the admin stats, rides and drivers lists and ride details are compared with the database), payments (M5.3: top-up
 requests repeated at once, signed webhooks delivered many times at once, bad signatures refused; needs the backend to use the
 local fake Stripe, simulator/fake_stripe.py), ratings (M6.1: one stress driver completes a ride for each rider, then everyone
-rates everyone at once, three copies of every request, all landing on the driver's one summary row).
+rates everyone at once, three copies of every request, all landing on the driver's one summary row), places (M6.3: saved places
+under simultaneous requests: the cap of 10, the case-insensitive label, simultaneous renames, a delete racing a create). Since
+M6.3 the chaos riders also manage saved places, and after the settle period the saved places and the trip history lists of every
+stress rider and driver are compared with the database (saved_view_mismatch, history_view_mismatch); the cleanup deletes the stress
+riders' saved places through the API.
 Stop simulator.py for the drivers, riders and chaos scenarios: its drivers would join the test.
 Exit codes: 0 no violation (expected for every scenario), 1 a violation, a stuck ride, or a 5xx, 2 the check could not run.
 --api-url takes several comma-separated URLs (two backend processes): requests are spread over them round-robin.
@@ -71,6 +75,18 @@ INVARIANTS_FILE = ROOT / "simulator" / "invariants.sql"
 CHAOS_PLACES = 60  # pickup / drop-off pairs, snapped once before the agents start
 CHAOS_STATUS_INTERVAL_S = 10
 FINISHED_STATUSES = ("COMPLETED", "CANCELLED", "NO_DRIVER_FOUND")
+# Chaos riders manage saved places with these names: 12 entries, 11 different ones ignoring case ("Home" and "home" clash), so a
+# rider can reach the cap of 10 places and the name-taken answer both happen.
+SAVED_LABELS = ["Home", "home", "Work", "Gym", "Mom", "Cafe", "Club", "Park", "Mall", "School", "Office", "Shop"]
+SAVED_ADDRESS = "Stress saved place"
+MAX_SAVED_PLACES = 10  # the backend's cap
+PLACES_BURST_CREATES = 25  # places scenario: creates sent at once by every rider
+PLACES_BURST_SAME_LABEL = 6  # ... and the same label in different cases
+PLACES_RACES = 5  # ... and delete-against-create races per round
+LIMIT_TEXT = "up to 10 places"
+NAME_TAKEN_TEXT = "already have a place with that name"
+HISTORY_PAGE = 20  # chaos: the history walks ask for this many rows at a time
+HISTORY_SAMPLE = 10  # chaos: rides whose fields are compared one by one
 
 # section name in invariants.sql -> (short name, what an offender is, what the count counts, columns of a row)
 INVARIANTS = {
@@ -106,6 +122,7 @@ INVARIANTS = {
         "I22", "ratings", None, ("rating_id", "ride_id", "ride_status", "from_user_id", "to_user_id", "rider_id", "driver_user_id")
     ),
     "pricing_rule_audit_mismatch": ("I23", "rules", None, ("rule_id", "version", "changes", "last_version_after")),
+    "saved_places_invalid": ("I24", "users", None, ("user_id", "role", "places")),
 }
 PRICING_EDIT_INTERVAL_S = 10  # chaos: the admin edits the pricing rule about this often
 PRICING_FIELDS = (
@@ -294,7 +311,7 @@ async def burst(ctx: dict, requests: list[tuple]) -> dict:
 
 async def check_invariants(ctx: dict, seen: dict) -> str:
     """Runs invariants.sql once. Adds every offender to `seen` (this round's record) and returns a text like
-    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I23 ok' when nothing)."""
+    'I1 2 drivers (max 3 offers), I3 1 riders' for everything seen in the round so far ('I1-I24 ok' when nothing)."""
     lines = await sql(ctx, INVARIANTS_FILE.read_text())
     found = {}
     section = None
@@ -307,7 +324,7 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
         else:
             found[section].append(line.split("|"))
     if set(found) != set(INVARIANTS):
-        raise RuntimeError(f"psql output did not contain all twenty-three invariants (got {sorted(found)})")
+        raise RuntimeError(f"psql output did not contain all twenty-four invariants (got {sorted(found)})")
     ctx["checks"] += 1
 
     parts = []
@@ -321,12 +338,13 @@ async def check_invariants(ctx: dict, seen: dict) -> str:
             parts.append(f"{code} {len(offenders)} {who} (max {max(offenders.values())} {what})")
         elif offenders:
             parts.append(f"{code} {len(offenders)} {who}")
-    return ", ".join(parts) or "I1-I23 ok"
+    return ", ".join(parts) or "I1-I24 ok"
 
 
 async def cleanup(ctx: dict) -> None:
     """Cancels every active ride of the stress riders (found in the database, so broken state and leftovers of a
-    crashed run are cleared too), then takes the stress drivers offline.
+    crashed run are cleared too), deletes their saved places through the API (M6.3: without this, runs would leave riders
+    at the limit of 10), then takes the stress drivers offline.
 
     It repeats until a query finds no active ride: requests that were still in flight when a run was stopped are
     finished by the server and create rides after the first listing."""
@@ -337,6 +355,13 @@ async def cleanup(ctx: dict) -> None:
     if ctx["args"].cleanup_only:
         driver_emails = await sql(ctx, f"SELECT email FROM users WHERE email LIKE '{DRIVER_LIKE}' ORDER BY id")
 
+    places = [
+        row.split("|")
+        for row in await sql(
+            ctx,
+            f"SELECT u.email, p.id FROM saved_places p JOIN users u ON u.id = p.user_id WHERE u.email LIKE '{RIDER_LIKE}' ORDER BY p.id",
+        )
+    ]
     cancelled = 0
     for _ in range(CLEANUP_PASSES):
         rows = await sql(
@@ -347,7 +372,7 @@ async def cleanup(ctx: dict) -> None:
         rides = [row.split("|") for row in rows]
 
         # Accounts of an earlier run have no token yet: log in, a few at a time.
-        missing = sorted(({email for email, _ in rides} | set(driver_emails)) - set(ctx["tokens"]))
+        missing = sorted(({email for email, _ in rides} | {email for email, _ in places} | set(driver_emails)) - set(ctx["tokens"]))
         for start in range(0, len(missing), SETUP_CONCURRENCY):
             chunk = missing[start : start + SETUP_CONCURRENCY]
             logins = [api(client, "POST", "/auth/login", None, {"email": e, "password": PASSWORD}) for e in chunk]
@@ -369,13 +394,19 @@ async def cleanup(ctx: dict) -> None:
     else:
         log.warning("cleanup: rides of stress riders are still active after %d passes (an IN_PROGRESS ride cannot be cancelled)", CLEANUP_PASSES)
 
+    # A 404 means the place is already gone: fine.
+    answers = await asyncio.gather(*[api(client, "DELETE", f"/saved-places/{place_id}", ctx["tokens"][email]) for email, place_id in places if email in ctx["tokens"]])
+    deleted = sum(1 for answer in answers if answer.status_code == 204)
+    if any(answer.status_code not in (204, 404) for answer in answers):
+        log.warning("cleanup: some saved places could not be deleted: %s", sorted({answer.status_code for answer in answers}))
+
     online = [email for email in driver_emails if email in ctx["tokens"]]
     answers = await asyncio.gather(*[api(client, "POST", "/drivers/me/offline", ctx["tokens"][email]) for email in online])
     odd = [email for email, answer in zip(online, answers) if answer.status_code not in (200, 404, 409)]
     if odd:
         log.warning("cleanup: taking %s offline failed", odd)
-    if cancelled or ctx["args"].cleanup_only:
-        log.info("cleanup: %d rides cancelled, %d stress drivers taken offline", cancelled, len(online))
+    if cancelled or places or ctx["args"].cleanup_only:
+        log.info("cleanup: %d rides cancelled, %d saved places deleted, %d stress drivers taken offline", cancelled, deleted, len(online))
 
 
 async def scenario_drivers(ctx: dict) -> None:
@@ -550,12 +581,32 @@ async def chaos_rider(ctx: dict, email: str, rng: random.Random, counters: dict,
     """One rider until the deadline: requests a ride (sometimes the same request twice at once), cancels a quarter of
     them after a few seconds, follows the rest to the end (cancelling after 90 s), pauses, and requests again. A completed ride
     is rated (60 percent, after 0 to 5 s, 10 percent of those sent twice at once); a cancelled or driverless one is sometimes
-    rated too (5 percent), which must be refused."""
+    rated too (5 percent), which must be refused. Since M6.3, in 15 percent of the loops it also manages its saved places: lists
+    them, then (4 times in 6) creates one (a name from SAVED_LABELS, near the center), renames a random one to a random name, or deletes a random one."""
     client, token, urls = ctx["api"], ctx["tokens"][email], ctx["args"].api_urls
     ride_id = cancel_at = None
     cancelled = False
     while time.monotonic() < deadline:
         try:
+            if rng.random() < 0.15:
+                listed = await api(client, "GET", rng.choice(urls) + "/saved-places", token)
+                existing = listed.json() if listed.status_code == 200 else []
+                action = rng.choice(["create"] * 4 + ["rename", "delete"])  # creates are favoured, so a rider can reach the cap of 10
+                if action == "create" or not existing:
+                    center_lat, center_lng = ctx["center"]
+                    answer = await api(client, "POST", rng.choice(urls) + "/saved-places", token, {
+                        "label": rng.choice(SAVED_LABELS), "address": SAVED_ADDRESS,
+                        "lat": center_lat + rng.uniform(-0.002, 0.002), "lng": center_lng + rng.uniform(-0.002, 0.002),
+                    })
+                elif action == "rename":
+                    answer = await api(client, "PATCH", rng.choice(urls) + f"/saved-places/{rng.choice(existing)['id']}", token, {"label": rng.choice(SAVED_LABELS)})
+                else:
+                    answer = await api(client, "DELETE", rng.choice(urls) + f"/saved-places/{rng.choice(existing)['id']}", token)
+                counters["saved_actions"] += 1
+                counters["saved_ok"] += answer.status_code in (200, 201, 204)
+                counters["saved_409"] += answer.status_code == 409
+                counters["saved_404"] += answer.status_code == 404  # a rename or delete of a place that is gone: normal
+                counters["saved_limit_409"] += answer.status_code == 409 and LIMIT_TEXT in str(answer.json().get("detail", ""))
             if ride_id is None:
                 pickup, dropoff = rng.choice(ctx["places"])
                 body = {
@@ -842,7 +893,7 @@ async def chaos_admin(ctx: dict, rng: random.Random, counters: dict, deadline: f
 
 
 async def scenario_chaos(ctx: dict) -> None:
-    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I23 every 2 s. Then the agents stop and
+    """Riders and drivers act at random for --chaos-seconds, snapshotting I1 to I24 every 2 s. Then the agents stop and
     the system gets --settle-seconds to finish: no REQUESTED ride and no PENDING offer may be left (those are STUCK).
     Rides legitimately left assigned, arrived, or in progress are not stuck."""
     args = ctx["args"]
@@ -1272,11 +1323,150 @@ async def scenario_chaos(ctx: dict) -> None:
     counters["admin_view_mismatch"] += len(mismatches)
     ctx["admin_view_details"].extend(mismatches[: max(0, 5 - len(ctx["admin_view_details"]))])
 
+    # Saved places and trip history (M6.3), the API against read-only SQL worked out here on its own. Done after the settle period
+    # and before the cleanup removes the saved places. If something differs it is asked once more after 2 s.
+    # (a) saved_view_mismatch: GET /saved-places of every stress rider equals the SQL rows (ids, labels, addresses, in id order),
+    # has at most 10 rows, and no two labels are equal ignoring case.
+    # (b) history_view_mismatch: GET /rides/history of every stress rider and GET /drivers/me/history of every stress driver, walked
+    # page by page, give the same ids as SQL (same order, no gaps, no duplicates); up to HISTORY_SAMPLE rides of this run are
+    # compared field by field; no driver history text holds anything about a stress rider, and no history text holds "otp".
+    finished = "('COMPLETED', 'CANCELLED', 'NO_DRIVER_FOUND')"
+
+    async def walk(path: str, token: str) -> tuple[list[dict], str, str | None]:
+        """Every row of a history list, page by page (limit HISTORY_PAGE, before_id of the last row), the raw text of all the pages
+        and a problem text when a page was not a 200 or the walk did not end."""
+        rows, texts, before_id = [], [], None
+        for _ in range(100000):
+            answer = await api(ctx["api"], "GET", f"{path}?limit={HISTORY_PAGE}" + (f"&before_id={before_id}" if before_id else ""), token)
+            texts.append(answer.text)
+            if answer.status_code != 200:
+                return rows, "".join(texts), f"{path} answered {answer.status_code}"
+            page = answer.json()
+            if not page:
+                return rows, "".join(texts), None
+            rows += page
+            before_id = page[-1]["id"]
+        return rows, "".join(texts), f"{path} did not reach the end of the list"
+
+    for attempt in (1, 2):
+        saved_problems, history_problems = [], []
+        history_rows = 0
+
+        rows = await sql(ctx, f"SELECT u.email, p.id, p.label, p.address FROM saved_places p JOIN users u ON u.id = p.user_id WHERE u.email LIKE '{RIDER_LIKE}' ORDER BY p.id")
+        wanted_places = collections.defaultdict(list)
+        for row in rows:
+            email, place_id, label, address = row.split("|")
+            wanted_places[email].append((int(place_id), label, address))
+        for n in range(1, args.riders + 1):
+            email = RIDER_EMAIL.format(n=n)
+            answer = await api(ctx["api"], "GET", "/saved-places", ctx["tokens"][email])
+            if answer.status_code != 200:
+                saved_problems.append(f"/saved-places of {email} answered {answer.status_code}")
+                continue
+            got = [(place["id"], place["label"], place["address"]) for place in answer.json()]
+            if got != wanted_places[email]:
+                saved_problems.append(f"/saved-places of {email}: api {got} != sql {wanted_places[email]}")
+            if len(got) > MAX_SAVED_PLACES:
+                saved_problems.append(f"/saved-places of {email} has {len(got)} places (the cap is {MAX_SAVED_PLACES})")
+            lowered = [label.lower() for _, label, _ in got]
+            if len(set(lowered)) != len(lowered):
+                saved_problems.append(f"/saved-places of {email} has two labels that are equal ignoring case: {lowered}")
+        ctx["saved_checked"] = {"riders": args.riders, "places": sum(len(places) for places in wanted_places.values())}
+
+        # Riders.
+        rider_users = {
+            row.split("|")[1]: int(row.split("|")[0]) for row in await sql(ctx, f"SELECT id, email FROM users WHERE email LIKE '{RIDER_LIKE}' ORDER BY id")
+        }
+        stress_riders = [RIDER_EMAIL.format(n=n) for n in range(1, args.riders + 1)]
+        wanted_ids = collections.defaultdict(list)
+        for row in await sql(ctx, f"SELECT rider_id, id FROM rides WHERE rider_id IN ({', '.join(str(rider_users[e]) for e in stress_riders)}) AND status IN {finished} ORDER BY id DESC"):
+            rider_id, ride_id = row.split("|")
+            wanted_ids[int(rider_id)].append(int(ride_id))
+        walks = await asyncio.gather(*[walk("/rides/history", ctx["tokens"][email]) for email in stress_riders])
+        rider_rows = {}
+        for email, (got_rows, text, problem) in zip(stress_riders, walks):
+            if problem:
+                history_problems.append(f"{email}: {problem}")
+            ids = [row["id"] for row in got_rows]
+            history_rows += len(ids)
+            rider_rows.update({row["id"]: row for row in got_rows})
+            if ids != wanted_ids[rider_users[email]]:
+                history_problems.append(f"/rides/history of {email}: api {len(ids)} ids != sql {len(wanted_ids[rider_users[email]])} ids (first difference at index "
+                                        f"{next((i for i, (a, b) in enumerate(zip(ids, wanted_ids[rider_users[email]])) if a != b), min(len(ids), len(wanted_ids[rider_users[email]])))})")
+            if '"otp"' in text:
+                history_problems.append(f"/rides/history of {email} contains the word otp")
+        for row in await sql(
+            ctx,
+            "SELECT r.id, COALESCE(r.final_fare::text, ''), r.payment_method, EXISTS (SELECT 1 FROM payments p WHERE p.ride_id = r.id), "
+            "COALESCE((SELECT g.score::text FROM ratings g WHERE g.ride_id = r.id AND g.from_user_id = r.rider_id), ''), du.name "
+            "FROM rides r JOIN drivers d ON d.id = r.driver_id JOIN users du ON du.id = d.user_id "
+            f"WHERE {mine} AND r.status = 'COMPLETED' ORDER BY r.id DESC LIMIT {HISTORY_SAMPLE}",
+        ):
+            ride_id, final_fare, method, has_receipt, my_rating, driver_name = row.split("|")
+            got = rider_rows.get(int(ride_id))
+            want = (int(final_fare) if final_fare else None, method, has_receipt == "t", int(my_rating) if my_rating else None, driver_name)
+            if got is None:
+                history_problems.append(f"completed ride {ride_id} is missing from /rides/history")
+            elif (got["final_fare"], got["payment_method"], got["has_receipt"], got["my_rating"], got["driver_name"]) != want:
+                history_problems.append(f"ride {ride_id}: api final_fare/method/receipt/rating/driver {(got['final_fare'], got['payment_method'], got['has_receipt'], got['my_rating'], got['driver_name'])} != sql {want}")
+            history_rows += 1
+
+        # Drivers.
+        driver_users = [
+            (int(row.split("|")[0]), row.split("|")[1])
+            for row in await sql(ctx, f"SELECT d.id, u.email FROM drivers d JOIN users u ON u.id = d.user_id WHERE u.email LIKE '{DRIVER_LIKE}' ORDER BY d.id")
+        ]
+        stress_drivers = [(driver_id, email) for driver_id, email in driver_users if email in ctx["tokens"]]
+        wanted_ids = collections.defaultdict(list)
+        for row in await sql(ctx, f"SELECT driver_id, id FROM rides WHERE driver_id IN ({', '.join(str(d) for d, _ in stress_drivers)}) AND status IN ('COMPLETED', 'CANCELLED') ORDER BY id DESC"):
+            driver_id, ride_id = row.split("|")
+            wanted_ids[int(driver_id)].append(int(ride_id))
+        walks = await asyncio.gather(*[walk("/drivers/me/history", ctx["tokens"][email]) for _, email in stress_drivers])
+        driver_rows = {}
+        for (driver_id, email), (got_rows, text, problem) in zip(stress_drivers, walks):
+            if problem:
+                history_problems.append(f"{email}: {problem}")
+            ids = [row["id"] for row in got_rows]
+            history_rows += len(ids)
+            driver_rows.update({row["id"]: row for row in got_rows})
+            if ids != wanted_ids[driver_id]:
+                history_problems.append(f"/drivers/me/history of {email}: api {len(ids)} ids != sql {len(wanted_ids[driver_id])} ids (first difference at index "
+                                        f"{next((i for i, (a, b) in enumerate(zip(ids, wanted_ids[driver_id])) if a != b), min(len(ids), len(wanted_ids[driver_id])))})")
+            if '"otp"' in text:
+                history_problems.append(f"/drivers/me/history of {email} contains the word otp")
+            if "stress-rider-" in text or "Stress Rider" in text:
+                history_problems.append(f"/drivers/me/history of {email} contains something about a stress rider")
+        for row in await sql(
+            ctx,
+            "SELECT r.id, COALESCE(r.final_fare::text, ''), COALESCE(e.platform_fee::text, ''), COALESCE(e.driver_earning::text, ''), "
+            "COALESCE((SELECT g.score::text FROM ratings g WHERE g.ride_id = r.id AND g.from_user_id = d.user_id), '') "
+            "FROM rides r JOIN drivers d ON d.id = r.driver_id JOIN users du ON du.id = d.user_id LEFT JOIN ride_earnings e ON e.ride_id = r.id "
+            f"WHERE {mine} AND r.status IN ('COMPLETED', 'CANCELLED') AND du.email LIKE '{DRIVER_LIKE}' ORDER BY r.id DESC LIMIT {HISTORY_SAMPLE}",
+        ):
+            ride_id, final_fare, platform_fee, driver_earning, my_rating = row.split("|")
+            got = driver_rows.get(int(ride_id))
+            want = tuple(int(value) if value else None for value in (final_fare, platform_fee, driver_earning, my_rating))
+            if got is None:
+                history_problems.append(f"ride {ride_id} is missing from /drivers/me/history")
+            elif (got["fare"], got["platform_fee"], got["driver_earning"], got["my_rating"]) != want:
+                history_problems.append(f"ride {ride_id}: api fare/fee/earning/rating {(got['fare'], got['platform_fee'], got['driver_earning'], got['my_rating'])} != sql {want}")
+            history_rows += 1
+        ctx["history_checked"] = {"riders": len(stress_riders), "drivers": len(stress_drivers), "rows": history_rows}
+        if not saved_problems and not history_problems:
+            break
+        if attempt == 1:
+            log.warning("saved places and history: %d + %d mismatches, asking again in 2 s", len(saved_problems), len(history_problems))
+            await asyncio.sleep(2)
+    ctx["saved_view_mismatches"] = saved_problems
+    ctx["history_view_mismatches"] = history_problems
+    counters["saved_view_mismatch"] += len(saved_problems)
+    counters["history_view_mismatch"] += len(history_problems)
+
 
 async def scenario_payments(ctx: dict) -> None:
     """Top-ups and webhooks under repetition (M5.3). Each round, for all riders at once: the same top-up request five times
     (one top-up, one Stripe session), then the signed paid event delivered ten times with one event id plus three times with
-    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I23 are checked after each
+    another (exactly one credit), then three badly signed events (refused, nothing changes). I1 to I24 are checked after each
     round. Needs the backend to talk to simulator/fake_stripe.py: it creates a Checkout Session per rider per round."""
     args = ctx["args"]
     ctx["driver_emails"] = []
@@ -1399,7 +1589,7 @@ async def scenario_ratings(ctx: dict) -> None:
     """One stress driver completes a ride for every rider, one at a time. Then, in ONE burst, every rider rates the driver and
     the driver rates every rider, each request sent RATING_BURST_COPIES times at once: exactly one 201 and the rest 409 for
     every rater, and the summary rows (the driver's takes all the riders' ratings, so it is the hot row) must equal the scores
-    of the winning requests. I1 to I23 are checked after each round."""
+    of the winning requests. I1 to I24 are checked after each round."""
     args = ctx["args"]
     client, urls = ctx["api"], args.api_urls
     ctx["driver_emails"] = [DRIVER_EMAIL.format(n=1)]
@@ -1505,9 +1695,136 @@ async def scenario_ratings(ctx: dict) -> None:
             await cleanup(ctx)
 
 
+async def scenario_places(ctx: dict) -> None:
+    """Saved places under simultaneous requests (M6.3), stress riders only. Each round, for ALL riders at once: (1) PLACES_BURST_CREATES
+    creates with distinct labels: exactly 10 are 201 and the rest 409 with the limit message; (2) the list holds exactly 10 rows;
+    (3) after deleting them all, PLACES_BURST_SAME_LABEL creates with one label in different cases: exactly one 201, the rest 409
+    with the name-taken message; (4) places A and B renamed to Z at once: exactly one 200 and one 409, and the list shows Z and the
+    other name unchanged; (5) with 10 places present, a delete and a create (a new label) at the same moment, PLACES_RACES times:
+    the delete is 204, the create 201 or 409, and the final count is 10 minus the delete plus the create, never above 10;
+    (6) I1 to I24 are snapshotted."""
+    args = ctx["args"]
+    client, urls = ctx["api"], args.api_urls
+    ctx["driver_emails"] = []
+    rider_emails = [RIDER_EMAIL.format(n=n) for n in range(1, args.riders + 1)]
+    started = time.monotonic()
+    await asyncio.gather(*[setup_accounts(ctx, "rider", n) for n in range(1, args.riders + 1)])
+    log.info("setup of %d riders took %.1f s", args.riders, time.monotonic() - started)
+    center_lat, center_lng = ctx["center"]
+    stats = ctx["saved"] = {"creates": 0, "limit_409": 0, "name_409": 0, "renames": 0, "bursts": [], "problems": [], "races": 0}
+
+    def create_request(email: str, label: str) -> tuple:
+        body = {"label": label, "address": SAVED_ADDRESS, "lat": center_lat, "lng": center_lng}
+        return (ctx["tokens"][email], "POST", "/saved-places", body)
+
+    async def list_places(email: str) -> list[dict]:
+        answer = await api(client, "GET", urls[0] + "/saved-places", ctx["tokens"][email])
+        if answer.status_code != 200:
+            raise RuntimeError(f"GET /saved-places of {email} answered {answer.status_code} {answer.text[:120]}")
+        return answer.json()
+
+    async def delete_all() -> None:
+        """Every place of every rider deleted in one burst."""
+        listed = await asyncio.gather(*[list_places(email) for email in rider_emails])
+        fired = await burst(ctx, [(ctx["tokens"][email], "DELETE", f"/saved-places/{place['id']}", None) for email, places in zip(rider_emails, listed) for place in places])
+        if any(result["status"] not in (204, 404) for result in fired["results"]):
+            raise RuntimeError(f"deleting the saved places failed: {fired['summary']}")
+
+    def record(name: str, fired: dict, requests: int) -> None:
+        times = [result["ms"] for result in fired["results"] if result["ms"] is not None]
+        stats["bursts"].append((name, fired["seconds"], statistics.median(times) if times else 0, requests))
+
+    for round_number in range(1, args.rounds + 1):
+        await cleanup(ctx)
+        seen = {}
+        ctx["rounds"].append(seen)
+        problems_before = len(stats["problems"])
+
+        # 1. 25 creates with distinct labels, per rider, all riders at once.
+        fired = await burst(ctx, [create_request(email, f"Place {index}") for email in rider_emails for index in range(PLACES_BURST_CREATES)])
+        record("distinct labels", fired, len(fired["results"]))
+        for number, email in enumerate(rider_emails):
+            results = fired["results"][number * PLACES_BURST_CREATES : (number + 1) * PLACES_BURST_CREATES]
+            codes = sorted(result["status"] for result in results)
+            limited = sum(1 for result in results if result["status"] == 409 and LIMIT_TEXT in str((result["body"] or {}).get("detail", "")))
+            if codes != [201] * MAX_SAVED_PLACES + [409] * (PLACES_BURST_CREATES - MAX_SAVED_PLACES) or limited != PLACES_BURST_CREATES - MAX_SAVED_PLACES:
+                stats["problems"].append(f"round {round_number}: {email} got {collections.Counter(codes)} ({limited} limit messages) from {PLACES_BURST_CREATES} creates, expected 10 x 201 and {PLACES_BURST_CREATES - MAX_SAVED_PLACES} x 409 with the limit message")
+            stats["creates"] += codes.count(201)
+            stats["limit_409"] += limited
+
+        # 2. exactly 10 rows with unique ids.
+        for email in rider_emails:
+            ids = [place["id"] for place in await list_places(email)]
+            if len(ids) != MAX_SAVED_PLACES or len(set(ids)) != len(ids):
+                stats["problems"].append(f"round {round_number}: {email} has {len(ids)} places ({len(set(ids))} different ids) after the burst, expected exactly {MAX_SAVED_PLACES}")
+        invariants = await check_invariants(ctx, seen)
+
+        # 3. the same label in different letter cases: exactly one wins.
+        await delete_all()
+        labels = [("Gym", "gym", "GYM", "gYm", "GyM", "gyM")[index % 6] for index in range(PLACES_BURST_SAME_LABEL)]
+        fired = await burst(ctx, [create_request(email, label) for email in rider_emails for label in labels])
+        record("same label, different cases", fired, len(fired["results"]))
+        for number, email in enumerate(rider_emails):
+            results = fired["results"][number * len(labels) : (number + 1) * len(labels)]
+            codes = sorted(result["status"] for result in results)
+            taken = sum(1 for result in results if result["status"] == 409 and NAME_TAKEN_TEXT in str((result["body"] or {}).get("detail", "")))
+            if codes != [201] + [409] * (len(labels) - 1) or taken != len(labels) - 1:
+                stats["problems"].append(f"round {round_number}: {email} got {collections.Counter(codes)} ({taken} name-taken messages) from {len(labels)} creates of one label, expected one 201 and {len(labels) - 1} x 409 with the name-taken message")
+            stats["creates"] += codes.count(201)
+            stats["name_409"] += taken
+
+        # 4. two places renamed to the same label at once.
+        await delete_all()
+        ids = {}
+        for email in rider_emails:
+            for name in ("A", "B"):
+                answer = await api(client, "POST", urls[0] + "/saved-places", ctx["tokens"][email], create_request(email, name)[3])
+                if answer.status_code != 201:
+                    raise RuntimeError(f"creating place {name} for {email} answered {answer.status_code} {answer.text[:120]}")
+                ids[email, name] = answer.json()["id"]
+        fired = await burst(ctx, [(ctx["tokens"][email], "PATCH", f"/saved-places/{ids[email, name]}", {"label": "Z"}) for email in rider_emails for name in ("A", "B")])
+        record("rename A and B to Z", fired, len(fired["results"]))
+        for number, email in enumerate(rider_emails):
+            codes = sorted(result["status"] for result in fired["results"][number * 2 : number * 2 + 2])
+            labels_now = sorted(place["label"] for place in await list_places(email))
+            if codes != [200, 409] or labels_now not in (["A", "Z"], ["B", "Z"]):
+                stats["problems"].append(f"round {round_number}: {email} renames answered {codes} and the list holds {labels_now}, expected [200, 409] and one Z next to an unchanged A or B")
+            stats["renames"] += codes.count(200)
+
+        # 5. a delete and a create at the same moment, with 10 places present.
+        for race in range(PLACES_RACES):
+            await delete_all()
+            fired = await burst(ctx, [create_request(email, f"Place {index}") for email in rider_emails for index in range(MAX_SAVED_PLACES)])
+            if any(result["status"] != 201 for result in fired["results"]):
+                raise RuntimeError(f"filling the saved places failed: {fired['summary']}")
+            listed = await asyncio.gather(*[list_places(email) for email in rider_emails])
+            delete_first = race % 2 == 0  # alternate which request is sent first
+            requests = []
+            for email, places in zip(rider_emails, listed):
+                pair = [(ctx["tokens"][email], "DELETE", f"/saved-places/{places[0]['id']}", None), create_request(email, "Newcomer")]
+                requests.extend(pair if delete_first else pair[::-1])
+            fired = await burst(ctx, requests)
+            record("delete against create", fired, len(requests))
+            for number, email in enumerate(rider_emails):
+                results = fired["results"][number * 2 : number * 2 + 2]
+                deleted, created = results if delete_first else results[::-1]
+                count = len(await list_places(email))
+                if deleted["status"] != 204 or created["status"] not in (201, 409) or count != MAX_SAVED_PLACES - 1 + (created["status"] == 201) or count > MAX_SAVED_PLACES:
+                    stats["problems"].append(f"round {round_number} race {race + 1}: {email} delete {deleted['status']}, create {created['status']}, final count {count}")
+                stats["creates"] += created["status"] == 201
+                stats["races"] += 1
+
+        # 6. I1 to I24.
+        invariants = await check_invariants(ctx, seen)
+        log.info("places round %d/%d: %s; %d problems this round; %s", round_number, args.rounds, ", ".join(f"{name} {sent} requests in {seconds * 1000:.0f} ms" for name, seconds, _, sent in stats["bursts"][-(3 + PLACES_RACES):]),
+                 len(stats["problems"]) - problems_before, invariants)
+        if not (round_number == args.rounds and args.keep_last_round):
+            await cleanup(ctx)
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Concurrency stress test: fires simultaneous requests and checks database invariants")
-    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos", "payments", "ratings"], default="drivers")
+    parser.add_argument("--scenario", choices=["drivers", "riders", "fleet", "chaos", "payments", "ratings", "places"], default="drivers")
     parser.add_argument("--admin-email", default=os.environ.get("SIM_ADMIN_EMAIL"), help="or env SIM_ADMIN_EMAIL")
     parser.add_argument("--admin-password", default=os.environ.get("SIM_ADMIN_PASSWORD"), help="or env SIM_ADMIN_PASSWORD")
     parser.add_argument("--webhook-secret", default=os.environ.get("STRIPE_WEBHOOK_SECRET"), help="payments scenario: the backend's webhook secret, or env STRIPE_WEBHOOK_SECRET")
@@ -1516,7 +1833,7 @@ async def main() -> int:
     parser.add_argument("--center-lat", type=float, help="default: the city center")
     parser.add_argument("--center-lng", type=float, help="default: the city center")
     parser.add_argument("--rounds", type=int, default=5, help="1 to 50")
-    parser.add_argument("--riders", type=int, help="2 to 100; default 20 (30 for chaos)")
+    parser.add_argument("--riders", type=int, help="2 to 100; default 20 (30 for chaos, 8 and 2 to 20 for places)")
     parser.add_argument("--drivers", type=int, help="1 to 100; default 3 (drivers), 2 x riders (riders), 10 (chaos), unused (fleet)")
     parser.add_argument("--repeat", type=int, default=2, help="riders scenario: the same request this many times at once, 2 to 5")
     parser.add_argument("--spread-m", type=float, default=150, help="pickups are this far from the center at most")
@@ -1552,16 +1869,16 @@ async def main() -> int:
     if not 1 <= args.rounds <= 50:
         parser.error("--rounds must be between 1 and 50")
     if args.riders is None:
-        args.riders = 30 if args.scenario == "chaos" else 20
-    if not 2 <= args.riders <= 100:
-        parser.error("--riders must be between 2 and 100")
+        args.riders = {"chaos": 30, "places": 8}.get(args.scenario, 20)
+    if not 2 <= args.riders <= (20 if args.scenario == "places" else 100):
+        parser.error("--riders must be between 2 and 100 (2 and 20 for the places scenario)")
     if args.drivers is None:
-        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10, "payments": 0, "ratings": 1}[args.scenario]
+        args.drivers = {"drivers": 3, "riders": min(2 * args.riders, 100), "fleet": 0, "chaos": 10, "payments": 0, "ratings": 1, "places": 0}[args.scenario]
     if not 10 <= args.chaos_seconds <= 600:
         parser.error("--chaos-seconds must be between 10 and 600")
     if not 30 <= args.settle_seconds <= 300:
         parser.error("--settle-seconds must be between 30 and 300")
-    if args.scenario not in ("fleet", "payments") and not 1 <= args.drivers <= 100:
+    if args.scenario not in ("fleet", "payments", "places") and not 1 <= args.drivers <= 100:
         parser.error("--drivers must be between 1 and 100")
     if not 2 <= args.repeat <= 5:
         parser.error("--repeat must be between 2 and 5")
@@ -1578,7 +1895,7 @@ async def main() -> int:
     log.info(
         "settings: scenario=%s rounds=%d riders=%d drivers=%s repeat=%s spread=%g m watch=%g s sequential=%s keep_last_round=%s "
         "cleanup_only=%s seed=%s chaos=%s api=%s osrm=%s psql=%s/%s label=%s",
-        args.scenario, args.rounds, args.riders, args.drivers if args.scenario not in ("fleet", "payments") else "n/a",
+        args.scenario, args.rounds, args.riders, args.drivers if args.scenario not in ("fleet", "payments", "places") else "n/a",
         args.repeat if args.scenario == "riders" else "n/a", args.spread_m, args.watch_seconds, args.sequential,
         args.keep_last_round, args.cleanup_only, args.seed,
         f"{args.chaos_seconds} s + settle {args.settle_seconds} s, tolerate_5xx={args.tolerate_5xx}, otp={args.otp}" if args.scenario == "chaos" else "n/a",
@@ -1632,7 +1949,7 @@ async def main() -> int:
 
                 scenario = {
                     "drivers": scenario_drivers, "riders": scenario_riders, "fleet": scenario_fleet, "chaos": scenario_chaos,
-                    "payments": scenario_payments, "ratings": scenario_ratings,
+                    "payments": scenario_payments, "ratings": scenario_ratings, "places": scenario_places,
                 }[args.scenario]
                 task = asyncio.create_task(scenario(ctx))
                 try:
@@ -1761,6 +2078,16 @@ async def main() -> int:
                  checked["rides_walked"], checked["drivers"], checked["details"], counters["admin_view_mismatch"])
         for detail in ctx["admin_view_details"][:5]:
             log.error("  ADMIN VIEW MISMATCH %s", detail)
+        log.info("  saved places: %d actions by riders (%d ok, %d answered 409 of which %d for the limit of %d, %d answered 404: a place already gone, normal)",
+                 counters["saved_actions"], counters["saved_ok"], counters["saved_409"], counters["saved_limit_409"], MAX_SAVED_PLACES, counters["saved_404"])
+        log.info("  saved places and trip history checked against SQL: %d riders' lists (%d places in all), %d rider and %d driver histories walked page by page, "
+                 "%d rows compared; saved_view_mismatch %d, history_view_mismatch %d (both should be 0)",
+                 ctx["saved_checked"]["riders"], ctx["saved_checked"]["places"], ctx["history_checked"]["riders"], ctx["history_checked"]["drivers"],
+                 ctx["history_checked"]["rows"], counters["saved_view_mismatch"], counters["history_view_mismatch"])
+        for mismatch in ctx["saved_view_mismatches"][:5]:
+            log.error("  SAVED VIEW MISMATCH %s", mismatch)
+        for mismatch in ctx["history_view_mismatches"][:5]:
+            log.error("  HISTORY VIEW MISMATCH %s", mismatch)
         restore_status, restore_version, restore_equal = ctx["pricing_restore"]
         log.info("  pricing edits: %d made (rule version %s at the start), %d edits sent twice at once (%d answered exactly 200 and 409, "
                  "pricing_dup_error %d), %d answers were 409, %d single edits answered 409 (should be 0), %d other errors (should be 0)",
@@ -1784,7 +2111,8 @@ async def main() -> int:
                             ("ratings_by_driver", "rating by a driver"), ("rating_dup_pairs", "rating sent twice at once"),
                             ("rating_notcompleted_tried", "rating attempt on a ride that did not complete"),
                             ("pricing_edits", "pricing edit"), ("pricing_dups_sent", "pricing edit sent twice at once"),
-                            ("admin_reads", "admin view read")):
+                            ("admin_reads", "admin view read"), ("saved_actions", "saved places action"),
+                            ("saved_limit_409", "answer 409 for the limit of saved places"), ("saved_409", "answer 409 for a saved place")):
             if not counters[what]:
                 log.warning("  no %s happened in this run: it proves nothing about that case", label)
         problems = [f"{code} in {len(ctx['rounds'][0][name])} offenders" for name, (code, *_rest) in INVARIANTS.items() if ctx["rounds"][0].get(name)]
@@ -1802,6 +2130,10 @@ async def main() -> int:
             problems.append(f"{counters['rating_dup_error']} duplicate rating pairs without exactly one 201")
         if counters["admin_view_mismatch"]:
             problems.append(f"{counters['admin_view_mismatch']} admin view mismatches")
+        if counters["saved_view_mismatch"]:
+            problems.append(f"{counters['saved_view_mismatch']} saved place view mismatches")
+        if counters["history_view_mismatch"]:
+            problems.append(f"{counters['history_view_mismatch']} trip history view mismatches")
         if counters["pricing_dup_error"]:
             problems.append(f"{counters['pricing_dup_error']} pricing edits sent twice that did not answer exactly 200 and 409")
         if counters["pricing_409_unexpected"] or counters["pricing_edit_error"]:
@@ -1842,6 +2174,28 @@ async def main() -> int:
             log.info("RATINGS FOUND PROBLEMS: %s", ", ".join(violated + [f"{len(stats['problems'])} rating problems"] * bool(stats["problems"])))
             return 1
         log.info("RATINGS CLEAN")
+        return 0
+
+    if args.scenario == "places" and not failure:
+        stats = ctx["saved"]
+        log.info("  places created (201): %d; answers 409 for the limit of %d: %d; answers 409 for a taken name: %d; renames that won: %d; delete-against-create races: %d",
+                 stats["creates"], MAX_SAVED_PLACES, stats["limit_409"], stats["name_409"], stats["renames"], stats["races"])
+        groups = collections.defaultdict(list)
+        for name, seconds, median_ms, sent in stats["bursts"]:
+            groups[name].append((seconds, median_ms, sent))
+        for name, group in groups.items():
+            log.info("  bursts '%s': %d checked, duration %.0f ms on average (longest %.0f ms), median latency %.0f ms (%d requests in the largest)",
+                     name, len(group), statistics.mean(seconds for seconds, _, _ in group) * 1000, max(seconds for seconds, _, _ in group) * 1000,
+                     statistics.median(median_ms for _, median_ms, _ in group), max(sent for _, _, sent in group))
+        for problem in stats["problems"][:20]:
+            log.error("  PLACES PROBLEM %s", problem)
+        if ctx["checks"] == 0:
+            log.error("INVARIANTS NOT CHECKED: no snapshot was taken")
+            return 2
+        if violated or stats["problems"]:
+            log.info("PLACES FOUND PROBLEMS: %s", ", ".join(violated + [f"{len(stats['problems'])} place problems"] * bool(stats["problems"])))
+            return 1
+        log.info("PLACES CLEAN")
         return 0
 
     if args.scenario == "payments" and not failure:

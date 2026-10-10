@@ -1,5 +1,5 @@
 -- Database invariants that must always hold (I1 to I4 since M4.1, I5 to I7 since M4.3, I8 to I11 since M5.1, I12 since M5.2,
--- I13 to I18 since M5.3, I19 and I20 since M5.4, I21 and I22 since M6.1, I23 since M6.2). Read-only. One SELECT per invariant, one row per offender:
+-- I13 to I18 since M5.3, I19 and I20 since M5.4, I21 and I22 since M6.1, I23 since M6.2, I24 since M6.3). Read-only. One SELECT per invariant, one row per offender:
 -- an empty result means the invariant holds. Used by simulator/stress.py, and runnable by hand:
 --   docker compose exec -T db psql -U uber -d uber -At -F '|' < simulator/invariants.sql
 -- Statuses are stored as the enum names in upper case (VARCHAR, no CHECK constraint).
@@ -262,3 +262,13 @@ LEFT JOIN pricing_rule_changes c ON c.rule_id = r.id
 GROUP BY r.id, r.version
 HAVING r.version <> 1 + count(c.id) OR (count(c.id) > 0 AND max(c.version_after) <> r.version)
 ORDER BY r.id;
+
+\echo '== saved_places_invalid'
+-- I24: a rider has at most 10 saved places, and only riders have any. The owner-row lock serializes the count and the insert (the
+-- database cannot count), so the cap cannot be exceeded even for an instant. Roles are stored lower-case.
+SELECT p.user_id, u.role, count(*) AS places
+FROM saved_places p
+JOIN users u ON u.id = p.user_id
+GROUP BY p.user_id, u.role
+HAVING count(*) > 10 OR u.role <> 'rider'
+ORDER BY p.user_id;

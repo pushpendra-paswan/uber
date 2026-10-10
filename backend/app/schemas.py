@@ -760,3 +760,73 @@ class StatsResponse(BaseModel):
     users: StatsUsers
     now: StatsNow
     series: list[StatsBucket]
+
+
+# ---- Trip history and saved places (M6.3). No row has an otp field, and the two kinds of row share no person data. ----
+
+# What a rider may know about a past trip: the driver's NAME only (no id, contact data, vehicle, commission or earning), and
+# only the rider's OWN rating. distance_m and duration_s are the tracked values when the trip was settled, else the estimate.
+class RiderTripRow(BaseModel):
+    id: int
+    status: RideStatus
+    created_at: datetime  # the request time
+    ended_at: datetime | None  # the time of the ride's last event
+    pickup_address: str
+    dropoff_address: str
+    distance_m: int | None
+    duration_s: int | None
+    final_fare: int | None  # paise, as stored: null for NO_DRIVER_FOUND and old rides, 0 for a free cancellation
+    payment_method: PaymentMethod
+    driver_name: str | None
+    cancelled_by: Literal["rider", "driver"] | None
+    has_receipt: bool  # a payment row exists
+    my_rating: int | None
+    can_rate: bool
+
+
+# What a driver may know about a past trip: nothing about the rider, and their own fare split.
+class DriverTripRow(BaseModel):
+    id: int
+    status: RideStatus
+    created_at: datetime
+    ended_at: datetime | None
+    pickup_address: str
+    dropoff_address: str
+    distance_m: int | None
+    duration_s: int | None
+    fare: int | None  # the stored final_fare, paise
+    payment_method: PaymentMethod
+    platform_fee: int | None  # null when the ride has no earning row
+    driver_earning: int | None
+    cancelled_by: Literal["rider", "driver"] | None
+    my_rating: int | None
+    can_rate: bool
+
+
+# No control characters in a label or an address (they are shown as text, but a newline would break every list).
+# strict: a number, never a string or a boolean. The range is also checked here, so 91 is a 422 before any lock.
+NO_CONTROL_CHARACTERS = r"^[^\x00-\x1f\x7f]+$"
+
+
+class SavedPlaceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    label: str = Field(min_length=1, max_length=30, pattern=NO_CONTROL_CHARACTERS)
+    address: str = Field(min_length=1, max_length=200, pattern=NO_CONTROL_CHARACTERS)
+    lat: float = Field(strict=True, ge=-90, le=90)
+    lng: float = Field(strict=True, ge=-180, le=180)
+
+
+class SavedPlaceRename(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    label: str = Field(min_length=1, max_length=30, pattern=NO_CONTROL_CHARACTERS)
+
+
+class SavedPlaceResponse(BaseModel):
+    id: int
+    label: str
+    address: str
+    lat: float
+    lng: float
+    created_at: datetime

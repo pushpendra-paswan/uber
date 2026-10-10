@@ -21,6 +21,16 @@
     <p id="message" class="message" role="alert" hidden></p>
     <p id="my-rating" class="note" hidden></p>
 
+    <nav id="view-nav" class="view-nav" aria-label="Pages" hidden>
+      <button type="button" data-view="ride">Ride</button>
+      <button type="button" data-view="trips">My trips</button>
+      <button type="button" data-view="places">Saved places</button>
+    </nav>
+    <p id="busy-banner" class="banner" role="status" hidden>
+      <span id="busy-banner-text"></span>
+      <button id="go-to-ride-button" type="button" data-view="ride">Go to ride</button>
+    </p>
+
     <section id="login-section" hidden>
       <h2>Log in</h2>
       <form id="login-form">
@@ -66,6 +76,49 @@
       <ul id="entry-list" class="plain-list"></ul>
     </section>
 
+    <section id="trips-section" hidden>
+      <h2>My trips</h2>
+      <div class="filter-row">
+        <div>
+          <label for="trip-status">Status</label>
+          <select id="trip-status">
+            <option value="">All</option>
+            <option value="COMPLETED">Completed</option>
+            <option value="CANCELLED">Cancelled</option>
+            <option value="NO_DRIVER_FOUND">No driver found</option>
+          </select>
+        </div>
+        <div>
+          <label for="trip-period">Period</label>
+          <select id="trip-period">
+            <option value="all">All time</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </div>
+      </div>
+      <button id="trips-refresh-button" type="button">Refresh</button>
+      <p id="trips-empty" class="note" hidden>No trips found.</p>
+      <ul id="trip-list" class="trip-list"></ul>
+      <button id="trips-more-button" type="button" hidden>Load more</button>
+    </section>
+
+    <section id="places-section" hidden>
+      <h2>Saved places</h2>
+      <p id="places-count" class="note"></p>
+      <p id="places-empty" class="note" hidden>You have no saved places yet. Choose a pickup or drop-off in the Ride view and press "Save this place".</p>
+      <ul id="places-list" class="plain-list"></ul>
+      <!-- Moved into the row being renamed by render(); the input is written only by the button handlers. -->
+      <form id="rename-form" class="rename-form" hidden>
+        <label for="rename-input">New name</label>
+        <input id="rename-input" type="text" maxlength="30" autocomplete="off">
+        <div class="rename-buttons">
+          <button type="submit">Save</button>
+          <button id="rename-cancel-button" type="button">Cancel</button>
+        </div>
+      </form>
+    </section>
+
     <section id="map-section" hidden>
       <div id="map"></div>
     </section>
@@ -73,6 +126,11 @@
     <section id="request-section" hidden>
       <h2>Request a ride</h2>
       <p class="note">Search for a place and press Enter, or click the map.</p>
+
+      <div id="quick-places-block" hidden>
+        <h3>Saved places</h3>
+        <ul id="quick-places" class="plain-list"></ul>
+      </div>
 
       <form id="pickup-form" class="search-form">
         <label for="pickup-input">Pickup</label>
@@ -82,6 +140,13 @@
         </div>
         <ul id="pickup-results" class="results"></ul>
       </form>
+      <form id="save-pickup-form" class="save-form">
+        <label for="save-pickup-label">Save this pickup as</label>
+        <div class="search-row">
+          <input id="save-pickup-label" type="text" maxlength="30" placeholder="For example Home" autocomplete="off">
+          <button type="submit">Save this place</button>
+        </div>
+      </form>
 
       <form id="dropoff-form" class="search-form">
         <label for="dropoff-input">Drop-off</label>
@@ -90,6 +155,13 @@
           <button type="submit">Search</button>
         </div>
         <ul id="dropoff-results" class="results"></ul>
+      </form>
+      <form id="save-dropoff-form" class="save-form">
+        <label for="save-dropoff-label">Save this drop-off as</label>
+        <div class="search-row">
+          <input id="save-dropoff-label" type="text" maxlength="30" placeholder="For example Work" autocomplete="off">
+          <button type="submit">Save this place</button>
+        </div>
       </form>
 
       <fieldset>
@@ -220,6 +292,7 @@
 
       <button id="cancel-button" type="button" hidden>Cancel ride</button>
       <button id="new-ride-button" type="button" hidden>Request a new ride</button>
+      <button id="back-to-trips-button" type="button" hidden>Back to my trips</button>
 
       <h3>Timeline</h3>
       <div class="table-scroll">

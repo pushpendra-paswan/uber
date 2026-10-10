@@ -359,6 +359,29 @@ class RatingSummary(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class SavedPlace(Base):
+    __tablename__ = "saved_places"
+    __table_args__ = (
+        CheckConstraint("char_length(label) BETWEEN 1 AND 30", name="label_length"),
+        CheckConstraint("char_length(address) BETWEEN 1 AND 200", name="address_length"),
+        CheckConstraint("lat BETWEEN -90 AND 90", name="lat_range"),
+        CheckConstraint("lng BETWEEN -180 AND 180", name="lng_range"),
+        # One label per rider, whatever the letter case. The safety net behind the owner-row lock in services/saved_places.
+        Index("uq_saved_places_user_id_lower_label", "user_id", text("lower(label)"), unique=True),
+        Index("ix_saved_places_user_id_id", "user_id", "id"),
+    )
+
+    # A text snapshot of a place the rider chose: no geocoding, no link to rides (deleting a place never touches a trip).
+    # The cap of 10 per rider cannot be a constraint (the database cannot count); the owner-row lock enforces it.
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    label: Mapped[str] = mapped_column(String(30))
+    address: Mapped[str] = mapped_column(String(200))
+    lat: Mapped[float] = mapped_column(Float)
+    lng: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class PricingRule(Base):
     __tablename__ = "pricing_rules"
     __table_args__ = (

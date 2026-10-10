@@ -47,6 +47,9 @@ const FIT_PADDING = [40, 40];
 const ENTRY_LABEL = { TOPUP: "Added money", RIDE_CHARGE: "Ride payment", ADJUSTMENT: "Adjustment" };
 const TOPUP_MIN_RUPEES = 100;
 const TOPUP_MAX_RUPEES = 10000;
+const TRIPS_PAGE = 20; // rows asked for at a time: the API default (its maximum is 50)
+const MAX_SAVED_PLACES = 10; // enforced by the server; the page only shows "N of 10"
+const SAVED_ADDRESS_MAX_LENGTH = 200; // the limit on the address of a saved place (rides allow 255)
 const money = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }); // money.format(paise / 100)
 
 // "★★★★☆". Built as text, never as markup.
@@ -98,6 +101,14 @@ const state = {
   ratingStatus: null, // answer of GET /rides/{id}/rating for a COMPLETED ride
   ratingKey: null, // the finished ride's id ("none" while there is none) the ratings were loaded for; set before the calls so a failure is not retried every poll
   paymentMethod: "cash", // written only by the radios' change handler
+  view: "ride", // "ride", "trips" or "places"; written only by the view buttons' handler
+  trips: null, // rows of GET /rides/history shown in My trips; null until the view was opened
+  tripsMore: false, // true while the last page was full, so there may be more
+  tripStatus: "", // the status filter ("" is all); written only by its change handler
+  tripPeriod: "all", // "all", "7" or "30" days; written only by its change handler
+  fromTrips: false, // true while the shown finished ride was opened from My trips ("Back to my trips")
+  places: null, // answer of GET /saved-places; null until loaded
+  renamingId: null, // the saved place whose rename form is open
   error: "",
   busy: false,
 };
@@ -208,7 +219,33 @@ const ratingMine = document.getElementById("rating-mine");
 const ratingMineText = document.getElementById("rating-mine-text");
 const ratingMineComment = document.getElementById("rating-mine-comment");
 const ratingClosed = document.getElementById("rating-closed");
+const viewNav = document.getElementById("view-nav");
+const viewButtons = document.querySelectorAll("[data-view]"); // the three nav buttons and "Go to ride"
+const busyBanner = document.getElementById("busy-banner");
+const busyBannerText = document.getElementById("busy-banner-text");
+const tripsSection = document.getElementById("trips-section");
+const tripStatusSelect = document.getElementById("trip-status");
+const tripPeriodSelect = document.getElementById("trip-period");
+const tripsRefreshButton = document.getElementById("trips-refresh-button");
+const tripsEmpty = document.getElementById("trips-empty");
+const tripList = document.getElementById("trip-list");
+const tripsMoreButton = document.getElementById("trips-more-button");
+const placesSection = document.getElementById("places-section");
+const placesCount = document.getElementById("places-count");
+const placesEmpty = document.getElementById("places-empty");
+const placesList = document.getElementById("places-list");
+const renameForm = document.getElementById("rename-form");
+const renameInput = document.getElementById("rename-input");
+const renameCancelButton = document.getElementById("rename-cancel-button");
+const quickPlacesBlock = document.getElementById("quick-places-block");
+const quickPlaces = document.getElementById("quick-places");
+const saveForms = { pickup: document.getElementById("save-pickup-form"), dropoff: document.getElementById("save-dropoff-form") };
+const saveInputs = { pickup: document.getElementById("save-pickup-label"), dropoff: document.getElementById("save-dropoff-label") };
+const saveButtons = { pickup: saveForms.pickup.querySelector("button"), dropoff: saveForms.dropoff.querySelector("button") };
+const backToTripsButton = document.getElementById("back-to-trips-button");
 let shownTopups = null; // the JSON of the top-ups in the DOM, so polling does not rebuild their buttons under a click
+let shownTrips = null; // the same for the trip rows and the saved places (rebuilt only when they change)
+let shownPlaces = null;
 
 // "5.2 km, 14 min". Used by the estimate panel and the ride view. Old rides have null values.
 function formatTrip(distanceM, durationS) {
@@ -223,6 +260,30 @@ async function loadRatings() {
   state.ratingKey = finished === null ? "none" : finished.id;
   state.myRating = await api("GET", "/ratings/me");
   state.ratingStatus = finished !== null && finished.status === "COMPLETED" ? await api("GET", `/rides/${finished.id}/rating`) : null;
+}
+
+// The first page of the trip list (append is false), or the page after the last row shown (append is true). The window comes
+// from the browser's local midnight, so the server needs no timezone. Called when the view opens, on a filter change, on Refresh
+// and on "Load more", never on the poll.
+async function loadTrips(append) {
+  const query = new URLSearchParams({ limit: TRIPS_PAGE });
+  if (state.tripStatus !== "") query.set("status", state.tripStatus);
+  if (state.tripPeriod !== "all") {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setDate(start.getDate() - (Number(state.tripPeriod) - 1));
+    query.set("since", start.toISOString());
+  }
+  if (append) query.set("before_id", state.trips[state.trips.length - 1].id);
+  const rows = await api("GET", `/rides/history?${query}`);
+  state.trips = append ? [...state.trips, ...rows] : rows;
+  state.tripsMore = rows.length === TRIPS_PAGE;
+}
+
+// The saved places: loaded with the page, when the view opens and after every change, never on the poll.
+async function loadPlaces() {
+  state.places = await api("GET", "/saved-places");
+  if (!state.places.some((place) => place.id === state.renamingId)) state.renamingId = null;
 }
 
 async function login(email, password) {
@@ -370,6 +431,9 @@ async function refresh() {
     // Last, like the receipt: a failure here cannot stop the checks above.
     const ratingsFor = state.ride !== null && FINISHED.includes(state.ride.status) ? state.ride.id : "none";
     if (state.ratingKey !== ratingsFor) await loadRatings();
+
+    // The quick-pick list of the request form. Once; after that only a change or opening the view reloads it. Last, like the above.
+    if (state.places === null) await loadPlaces();
   } catch (err) {
     state.error = err.message;
   }
@@ -401,6 +465,15 @@ function setPoint(kind, lat, lng, address) {
   state.estimate = null;
   fetchEstimate();
   render();
+}
+
+// Used by a search result and by a saved place: sets the point, then centers the map on it. (A map click sets the point
+// where the person clicked and does not move the map.)
+function choosePoint(kind, lat, lng, address) {
+  act(async () => {
+    setPoint(kind, lat, lng, address);
+    state.map.setView([lat, lng], PLACE_ZOOM, { animate: false });
+  });
 }
 
 // Asks for the estimate of the chosen points. Used by setPoint and by a refused request (the price may have changed).
@@ -455,7 +528,9 @@ function render() {
   const loggedIn = state.user !== null;
   const isRider = loggedIn && state.user.role === "rider";
   const showRide = isRider && state.ride !== null;
-  const showMap = isRider && state.loaded && state.config !== null;
+  const hasActiveRide = showRide && !FINISHED.includes(state.ride.status);
+  // The map is touched only in the Ride view: Leaflet cannot measure a hidden container, and polling never moves it.
+  const showMap = isRider && state.loaded && state.config !== null && state.view === "ride";
 
   message.hidden = state.error === "";
   message.textContent = state.error;
@@ -466,8 +541,9 @@ function render() {
   wrongRoleSection.hidden = !loggedIn || isRider;
   if (loggedIn) wrongRoleText.textContent = `This account is a ${state.user.role}. Open /${state.user.role}/ instead.`;
 
-  requestSection.hidden = !isRider || !state.loaded || showRide;
-  rideSection.hidden = !showRide;
+  // The views: the header, the message, the rating line and the wallet are in all of them.
+  requestSection.hidden = !isRider || !state.loaded || showRide || state.view !== "ride";
+  rideSection.hidden = !showRide || state.view !== "ride";
   mapSection.hidden = !showMap;
 
   if (showMap) {
@@ -584,12 +660,7 @@ function render() {
         const button = document.createElement("button");
         button.type = "button";
         button.textContent = place.display_name;
-        button.addEventListener("click", () =>
-          act(async () => {
-            setPoint(kind, place.lat, place.lng, place.display_name);
-            state.map.setView([place.lat, place.lng], PLACE_ZOOM, { animate: false });
-          })
-        );
+        button.addEventListener("click", () => choosePoint(kind, place.lat, place.lng, place.display_name));
         row.append(button);
         rows.push(row);
       }
@@ -671,7 +742,7 @@ function render() {
   }
 
   // Only textContent below: the receipt holds addresses and a driver's name, which are plain text.
-  receiptSection.hidden = !isRider || state.receipt === null;
+  receiptSection.hidden = !isRider || state.receipt === null || state.view !== "ride";
   if (!receiptSection.hidden) {
     const receipt = state.receipt;
     receiptNumber.textContent = receipt.receipt_number;
@@ -830,8 +901,147 @@ function render() {
     eventsBody.replaceChildren(...rows);
   }
 
+  // Views, trips and saved places. Only textContent below: addresses, names and labels are plain text. No input is written here.
+  viewNav.hidden = !isRider || !state.loaded;
+  for (const button of viewNav.querySelectorAll("button")) {
+    if (button.dataset.view === state.view) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  busyBanner.hidden = !isRider || !hasActiveRide || state.view === "ride";
+  if (hasActiveRide) busyBannerText.textContent = `You have a ride in progress: ${STATUS_TEXT[state.ride.status]}.`;
+
+  tripsSection.hidden = !isRider || !state.loaded || state.view !== "trips";
+  tripsEmpty.hidden = state.trips === null || state.trips.length > 0;
+  tripsMoreButton.hidden = !state.tripsMore;
+  const tripsJson = JSON.stringify(state.trips);
+  if (tripsJson !== shownTrips) {
+    shownTrips = tripsJson;
+    tripList.replaceChildren(
+      ...(state.trips === null ? [] : state.trips).map((trip) => {
+        const row = document.createElement("li");
+        const cancelledBy = { rider: "You cancelled", driver: "The driver cancelled" }[trip.cancelled_by] || "";
+        let moneyLine = "";
+        if (trip.final_fare !== null) {
+          const amount = money.format(trip.final_fare / 100);
+          if (trip.final_fare === 0) moneyLine = "No charge";
+          else if (trip.status === "COMPLETED") moneyLine = trip.payment_method === "wallet" ? `Paid ${amount} from your wallet` : `Paid ${amount} in cash`;
+          else moneyLine = `Cancellation fee ${amount}`;
+        }
+        const moneyText = [moneyLine, cancelledBy].filter((part) => part !== "").join(". ");
+        const lines = [
+          `${new Date(trip.created_at).toLocaleString()}: ${STATUS_TEXT[trip.status]}`,
+          `${trip.pickup_address} \u2192 ${trip.dropoff_address}`,
+          formatTrip(trip.distance_m, trip.duration_s),
+          moneyText === "" ? "" : `${moneyText}.`,
+          trip.driver_name === null ? "" : `Driver: ${trip.driver_name}`,
+          trip.final_fare !== null && !trip.has_receipt ? "No receipt (no charge)" : "",
+          trip.my_rating !== null ? `You rated ${stars(trip.my_rating)}` : trip.can_rate ? "Rate this trip" : "",
+        ];
+        for (const line of lines.filter((text) => text !== "")) {
+          const paragraph = document.createElement("p");
+          paragraph.textContent = line;
+          row.append(paragraph);
+        }
+        const open = document.createElement("button");
+        open.type = "button";
+        open.textContent = "Open";
+        // The finished-ride view shows one remembered ride, and a ride in progress takes its place, so only one at a time.
+        open.addEventListener("click", () =>
+          act(async () => {
+            if (state.ride !== null && !FINISHED.includes(state.ride.status)) throw new Error("Finish or cancel your current ride first.");
+            const ride = await api("GET", `/rides/${trip.id}`);
+            // refresh() loads everything else for this ride: events, route, driver, receipt and rating, once per ride id.
+            state.ride = ride;
+            state.rideId = ride.id;
+            state.ridePath = null;
+            state.routeRideId = null;
+            state.driver = null;
+            state.driverLocation = null;
+            state.driverKey = null;
+            state.otp = null;
+            state.otpKey = null;
+            state.receipt = null;
+            state.receiptKey = null;
+            state.ratingStatus = null;
+            state.ratingKey = null;
+            ratingForm.reset();
+            state.fromTrips = true;
+            state.view = "ride";
+          })
+        );
+        row.append(open);
+        return row;
+      })
+    );
+  }
+
+  placesSection.hidden = !isRider || !state.loaded || state.view !== "places";
+  quickPlacesBlock.hidden = state.places === null || state.places.length === 0;
+  placesEmpty.hidden = state.places === null || state.places.length > 0;
+  if (state.places !== null) placesCount.textContent = `${state.places.length} of ${MAX_SAVED_PLACES} places saved`;
+  renameForm.hidden = state.renamingId === null;
+  const placesJson = JSON.stringify([state.places, state.renamingId]);
+  if (placesJson !== shownPlaces) {
+    shownPlaces = placesJson;
+    const places = state.places === null ? [] : state.places;
+    quickPlaces.replaceChildren(
+      ...places.map((place) => {
+        const row = document.createElement("li");
+        const text = document.createElement("span");
+        text.textContent = `${place.label}: ${place.address}`;
+        row.append(text);
+        for (const kind of KINDS) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = MARKER_LABEL[kind];
+          button.addEventListener("click", () => choosePoint(kind, place.lat, place.lng, place.address));
+          row.append(button);
+        }
+        return row;
+      })
+    );
+    placesList.replaceChildren(
+      ...places.map((place) => {
+        const row = document.createElement("li");
+        const text = document.createElement("span");
+        text.textContent = `${place.label}: ${place.address}`;
+        const rename = document.createElement("button");
+        rename.type = "button";
+        rename.textContent = "Rename";
+        rename.addEventListener("click", () =>
+          act(async () => {
+            state.renamingId = place.id;
+            renameInput.value = place.label;
+          }).then(() => renameInput.focus())
+        );
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "Delete";
+        remove.addEventListener("click", () => {
+          if (!confirm("Delete this saved place? Your past trips are not changed.")) return;
+          act(async () => {
+            try {
+              await api("DELETE", `/saved-places/${place.id}`);
+            } catch (err) {
+              if (err.status !== 404) throw err; // already gone: just show the list as it is
+            }
+            await loadPlaces();
+          });
+        });
+        row.append(text, rename, remove);
+        // The one rename form moves into the row being renamed, and back out of the list when none is.
+        if (place.id === state.renamingId) row.append(renameForm);
+        return row;
+      })
+    );
+    if (state.renamingId === null) placesSection.append(renameForm);
+  }
+
   for (const button of document.querySelectorAll("button")) button.disabled = state.busy;
+  for (const select of [tripStatusSelect, tripPeriodSelect]) select.disabled = state.busy;
   requestButton.disabled = state.busy || state.points.pickup === null || state.points.dropoff === null || state.estimate === null;
+  for (const kind of KINDS) saveButtons[kind].disabled = state.busy || state.points[kind] === null;
+  backToTripsButton.hidden = !showRide || !state.fromTrips;
 }
 
 loginForm.addEventListener("submit", (event) => {
@@ -1002,32 +1212,110 @@ cancelButton.addEventListener("click", () => {
   });
 });
 
-newRideButton.addEventListener("click", () => {
+// "Request a new ride" and "Back to my trips" forget the finished ride in the same way; Back then opens the list again.
+for (const button of [newRideButton, backToTripsButton]) {
+  button.addEventListener("click", () => {
+    act(async () => {
+      state.ride = null;
+      state.rideId = null;
+      state.events = [];
+      state.points = { pickup: null, dropoff: null };
+      state.results = { pickup: null, dropoff: null };
+      state.estimate = null;
+      state.estimating = false;
+      state.estimateRequest++; // an answer still on its way must not show up
+      state.ridePath = null;
+      state.routeRideId = null;
+      state.driver = null;
+      state.driverLocation = null;
+      state.driverKey = null;
+      state.otp = null;
+      state.otpKey = null;
+      state.receipt = null;
+      state.receiptKey = null;
+      state.ratingStatus = null;
+      state.ratingKey = null; // the next refresh loads your rating again
+      state.fromTrips = false;
+      ratingForm.reset();
+      for (const kind of KINDS) inputs[kind].value = "";
+      pickRadios.pickup.checked = true;
+      if (button === backToTripsButton) {
+        state.view = "trips";
+        await loadTrips(false);
+      }
+    });
+  });
+}
+
+// The view buttons: Ride, My trips, Saved places, and "Go to ride" of the banner. The page keeps polling in every view.
+for (const button of viewButtons) {
+  button.addEventListener("click", () => {
+    act(async () => {
+      state.view = button.dataset.view;
+      if (state.view === "trips") await loadTrips(false);
+      if (state.view === "places") await loadPlaces();
+      if (state.view === "ride") {
+        // The map was hidden and may have been resized meanwhile. Shown first, then measured again once, here.
+        render();
+        if (state.map !== null) state.map.invalidateSize({ animate: false, pan: false });
+      }
+    });
+  });
+}
+
+// The filters and the buttons of My trips. The selects are written by the browser, and read only here.
+tripStatusSelect.addEventListener("change", () => {
+  state.tripStatus = tripStatusSelect.value;
+  act(() => loadTrips(false));
+});
+tripPeriodSelect.addEventListener("change", () => {
+  state.tripPeriod = tripPeriodSelect.value;
+  act(() => loadTrips(false));
+});
+tripsRefreshButton.addEventListener("click", () => act(() => loadTrips(false)));
+tripsMoreButton.addEventListener("click", () => act(() => loadTrips(true)));
+
+// "Save this place" under the pickup and the drop-off: the text of the point as it is now. The label is cleared after a save only.
+for (const kind of KINDS) {
+  saveForms[kind].addEventListener("submit", (event) => {
+    event.preventDefault();
+    act(async () => {
+      const point = state.points[kind];
+      const label = saveInputs[kind].value.trim();
+      if (point === null) throw new Error("Choose the place first");
+      if (label === "") throw new Error("Type a name for this place first");
+      await api("POST", "/saved-places", {
+        label,
+        address: point.address.slice(0, SAVED_ADDRESS_MAX_LENGTH),
+        lat: point.lat,
+        lng: point.lng,
+      });
+      saveInputs[kind].value = "";
+      await loadPlaces();
+    });
+  });
+}
+
+// The rename form is written only by the Rename buttons (above, in render) and read here.
+renameForm.addEventListener("submit", (event) => {
+  event.preventDefault();
   act(async () => {
-    state.ride = null;
-    state.rideId = null;
-    state.events = [];
-    state.points = { pickup: null, dropoff: null };
-    state.results = { pickup: null, dropoff: null };
-    state.estimate = null;
-    state.estimating = false;
-    state.estimateRequest++; // an answer still on its way must not show up
-    state.ridePath = null;
-    state.routeRideId = null;
-    state.driver = null;
-    state.driverLocation = null;
-    state.driverKey = null;
-    state.otp = null;
-    state.otpKey = null;
-    state.receipt = null;
-    state.receiptKey = null;
-    state.ratingStatus = null;
-    state.ratingKey = null; // the next refresh loads your rating again
-    ratingForm.reset();
-    for (const kind of KINDS) inputs[kind].value = "";
-    pickRadios.pickup.checked = true;
+    try {
+      await api("PATCH", `/saved-places/${state.renamingId}`, { label: renameInput.value.trim() });
+      state.renamingId = null;
+    } catch (err) {
+      if (err.status === 404) state.renamingId = null; // deleted meanwhile
+      throw err; // for example "name taken": the form stays open
+    } finally {
+      await loadPlaces();
+    }
   });
 });
+renameCancelButton.addEventListener("click", () =>
+  act(async () => {
+    state.renamingId = null;
+  })
+);
 
 // Polling keeps the page current for now; WebSockets replace this in M3.
 setInterval(async () => {
